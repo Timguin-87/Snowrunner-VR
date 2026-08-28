@@ -1,0 +1,23 @@
+LIBRARY dxgi
+EXPORTS
+    CreateDXGIFactory                 = Proxy_CreateDXGIFactory
+    CreateDXGIFactory1                = Proxy_CreateDXGIFactory1
+    CreateDXGIFactory2                = Proxy_CreateDXGIFactory2
+    DXGIGetDebugInterface1            = Proxy_DXGIGetDebugInterface1
+    DXGIDeclareAdapterRemovalSupport  = Proxy_DXGIDeclareAdapterRemovalSupport
+    ApplyCompatResolutionQuirking     = stub_ApplyCompatResolutionQuirking
+    CompatString                      = stub_CompatString
+    CompatValue                       = stub_CompatValue
+    DXGID3D10CreateDevice             = stub_DXGID3D10CreateDevice
+    DXGID3D10CreateLayeredDevice      = stub_DXGID3D10CreateLayeredDevice
+    DXGID3D10ETWRundown               = stub_DXGID3D10ETWRundown
+    DXGID3D10GetLayeredDeviceSize     = stub_DXGID3D10GetLayeredDeviceSize
+    DXGID3D10RegisterLayers           = stub_DXGID3D10RegisterLayers
+    DXGIDisableVBlankVirtualization   = stub_DXGIDisableVBlankVirtualization
+    DXGIDumpJournal                   = stub_DXGIDumpJournal
+    DXGIReportAdapterConfiguration    = stub_DXGIReportAdapterConfiguration
+    PIXBeginCapture                   = stub_PIXBeginCapture
+    PIXEndCapture                     = stub_PIXEndCapture
+    PIXGetCaptureState                = stub_PIXGetCaptureState
+    SetAppCompatStringPointer         = stub_SetAppCompatStringPointer
+    UpdateHMDEmulationStatus          = stub_UpdateHMDEmulationStatus
