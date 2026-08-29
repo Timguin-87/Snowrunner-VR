@@ -355,7 +355,7 @@ std::atomic<bool> g_warpEnabled{true};   // config is authoritative (WarpEnabled
 // frame is built from, and their failure mode is a warp tracking something
 // other than your head, which is worse than the under-correction it replaces.
 enum WarpType { kWarpHeadset = 0, kWarpGameRot = 1, kWarp6Dof = 2 };
-std::atomic<int> g_warpType{kWarp6Dof};   // config is authoritative
+std::atomic<int> g_warpType{kWarpGameRot};   // config is authoritative
 
 
 // How many times the rendered-camera warp has run vs fallen back to the pose

@@ -834,10 +834,12 @@ void STDMETHODCALLTYPE Detour_OMSetRenderTargets(
     ID3D11DepthStencilView* dsv)
 {
     const bool imm = ctx->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE;
+    PFN_OMSetRenderTargets fn = (imm && real_OMSetRenderTargets_imm) ? real_OMSetRenderTargets_imm
+                              : (real_OMSetRenderTargets_def ? real_OMSetRenderTargets_def : real_OMSetRenderTargets_imm);
     if (t_selfTargets) {
         // Our own bind. Pass it through untouched and record nothing, so the
         // tracked binding still describes the GAME's state when we restore it.
-        (imm ? real_OMSetRenderTargets_imm : real_OMSetRenderTargets_def)(ctx, n, rtvs, dsv);
+        if (fn) fn(ctx, n, rtvs, dsv);
         return;
     }
 
@@ -845,7 +847,7 @@ void STDMETHODCALLTYPE Detour_OMSetRenderTargets(
     ID3D11Texture2D* incoming = dsv_texture(dsv);
     ID3D11Texture2D* previous = swap_bound_depth(ctx, incoming);
 
-    (imm ? real_OMSetRenderTargets_imm : real_OMSetRenderTargets_def)(ctx, n, rtvs, dsv);
+    if (fn) fn(ctx, n, rtvs, dsv);
 
     // Transition away from the scene depth == the scene pass just finished.
     if (previous && previous != incoming)
@@ -863,8 +865,10 @@ void STDMETHODCALLTYPE Detour_OMSetRTAndUAV(
     ID3D11UnorderedAccessView* const* uavs, const UINT* counts)
 {
     const bool imm = ctx->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE;
+    PFN_OMSetRTAndUAV fn = (imm && real_OMSetRTAndUAV_imm) ? real_OMSetRTAndUAV_imm
+                         : (real_OMSetRTAndUAV_def ? real_OMSetRTAndUAV_def : real_OMSetRTAndUAV_imm);
     if (t_selfTargets) {
-        (imm ? real_OMSetRTAndUAV_imm : real_OMSetRTAndUAV_def)(ctx, n, rtvs, dsv, uavStart, numUAVs, uavs, counts);
+        if (fn) fn(ctx, n, rtvs, dsv, uavStart, numUAVs, uavs, counts);
         return;
     }
 
@@ -872,7 +876,7 @@ void STDMETHODCALLTYPE Detour_OMSetRTAndUAV(
     ID3D11Texture2D* incoming = dsv_texture(dsv);
     ID3D11Texture2D* previous = swap_bound_depth(ctx, incoming);
 
-    (imm ? real_OMSetRTAndUAV_imm : real_OMSetRTAndUAV_def)(ctx, n, rtvs, dsv, uavStart, numUAVs, uavs, counts);
+    if (fn) fn(ctx, n, rtvs, dsv, uavStart, numUAVs, uavs, counts);
 
     if (previous && previous != incoming)
         capture_if_pass_ended(ctx, previous);
@@ -925,10 +929,19 @@ bool install_depth_probe(IDXGISwapChain* swapchain)
     ok = hook(vt, kIdxOMSetRenderTargetsAndUAVs, reinterpret_cast<void*>(&Detour_OMSetRTAndUAV),
               reinterpret_cast<void**>(&real_OMSetRTAndUAV_imm), "OMSetRTAndUAV(imm)") && ok;
     if (vtDef) {
-        ok = hook(vtDef, kIdxOMSetRenderTargets, reinterpret_cast<void*>(&Detour_OMSetRenderTargets),
-                  reinterpret_cast<void**>(&real_OMSetRenderTargets_def), "OMSetRenderTargets(def)") && ok;
-        ok = hook(vtDef, kIdxOMSetRenderTargetsAndUAVs, reinterpret_cast<void*>(&Detour_OMSetRTAndUAV),
-                  reinterpret_cast<void**>(&real_OMSetRTAndUAV_def), "OMSetRTAndUAV(def)") && ok;
+        if (vtDef[kIdxOMSetRenderTargets] == vt[kIdxOMSetRenderTargets]) {
+            real_OMSetRenderTargets_def = real_OMSetRenderTargets_imm;
+        } else {
+            ok = hook(vtDef, kIdxOMSetRenderTargets, reinterpret_cast<void*>(&Detour_OMSetRenderTargets),
+                      reinterpret_cast<void**>(&real_OMSetRenderTargets_def), "OMSetRenderTargets(def)") && ok;
+        }
+
+        if (vtDef[kIdxOMSetRenderTargetsAndUAVs] == vt[kIdxOMSetRenderTargetsAndUAVs]) {
+            real_OMSetRTAndUAV_def = real_OMSetRTAndUAV_imm;
+        } else {
+            ok = hook(vtDef, kIdxOMSetRenderTargetsAndUAVs, reinterpret_cast<void*>(&Detour_OMSetRTAndUAV),
+                      reinterpret_cast<void**>(&real_OMSetRTAndUAV_def), "OMSetRTAndUAV(def)") && ok;
+        }
     }
 
     if (!ok || !real_OMSetRenderTargets_imm || !real_OMSetRTAndUAV_imm) {

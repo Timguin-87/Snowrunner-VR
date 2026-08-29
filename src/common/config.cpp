@@ -307,16 +307,9 @@ constexpr float kDefaultVerticalRecenter = 0.0f;
 // exactly as it was, one frame stale, which is the thing this mod exists to
 // avoid -- so off is a measurement ("is the warp what is wrong, or is what it
 // is warping wrong?"), not a way anyone should be playing. It persists anyway:
-// a switch that silently un-flips itself on the next launch is worse than one
-// that can be left in a bad place, because the bad place is at least visible.
 constexpr bool  kDefaultWarpEnabled = true;
-// Stale-eye warp source: the whole ladder, headset + game 6-DoF. It was
-// headset-pose-only for as long as the stronger levels were unproven -- their
-// failure mode is worse ghosting rather than an obvious break, which is a bad
-// thing to have on by default while it is still being got right. That is no
-// longer the state they are in, and in a driving game the camera's own motion
-// is most of what the warp has to account for.
-constexpr int   kDefaultWarpType = 2;   // xr::kWarp6Dof
+// Stale-eye warp source: headset + game rotation (level 1 of the ladder).
+constexpr int   kDefaultWarpType = 1;   // xr::kWarpGameRot (headset + game rotation)
 // The cab band for that reprojection, in view metres. Sized from a cockpit:
 // dashboard ~0.8, windscreen ~1.2, and the nearest world geometry a bumper
 // reaches is a few metres out.
@@ -436,9 +429,11 @@ std::string format_file(const Settings& s)
     char buf[24576];
     const int written = snprintf(buf, sizeof(buf),
         "# Snowrunner_VR_config.txt -- auto-generated. Comments (#) and blank\n"
-        "# lines are ignored. A key with an invalid value resets this whole\n"
-        "# file to defaults on next launch; a key that's simply missing (e.g.\n"
-        "# this file predates a newer setting) only fills in that one default.\n"
+        "# lines are ignored. A key with an invalid value is reported in\n"
+        "# snowrunner_vr.log and falls back to that key's default; a key that is\n"
+        "# simply missing (e.g. this file predates a newer setting) is filled in\n"
+        "# with its default and the file rewritten. Nothing resets the whole\n"
+        "# file except deleting it.\n"
         "\n"
         "# DIBRShift: true, false. Reproject the rendered eye into the other one\n"
         "# using scene depth, instead of leaving that eye to the stale-eye warp\n"
@@ -838,7 +833,12 @@ void init()
         if (kv_find(kv, key, v)) {
             uint64_t probe[hooks::kMaxRoleHashes];
             int got = 0;
-            if (parse_hash_list(v, probe, hooks::kMaxRoleHashes, got) && got >= 1) dst = v;
+            // EMPTY IS VALID and is the normal state: this key holds only what
+            // this install found ON TOP of the baked list, so a fresh install
+            // writes it empty. Treating that as invalid put a false alarm at
+            // the top of the first log anyone attaches to a bug report.
+            if (v.find_first_not_of(" 	") == std::string::npos) dst.clear();
+            else if (parse_hash_list(v, probe, hooks::kMaxRoleHashes, got) && got >= 1) dst = v;
             else note_invalid(key, v);
         } else anyMissing = true;
     }

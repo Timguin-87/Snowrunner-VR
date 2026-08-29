@@ -537,7 +537,9 @@ void STDMETHODCALLTYPE Detour_PSSetShader(
     ID3D11ClassInstance* const* insts, UINT numInsts)
 {
     note_ps_bound(ps);
-    (is_imm(ctx) ? real_PSSetShader_imm : real_PSSetShader_def)(ctx, ps, insts, numInsts);
+    PFN_PSSetShader fn = (is_imm(ctx) && real_PSSetShader_imm) ? real_PSSetShader_imm
+                       : (real_PSSetShader_def ? real_PSSetShader_def : real_PSSetShader_imm);
+    if (fn) fn(ctx, ps, insts, numInsts);
 }
 
 } // namespace
@@ -622,9 +624,14 @@ bool install_shader_cull(IDXGISwapChain* swapchain)
                      reinterpret_cast<void**>(&real_CreatePixelShader));
     ok = hookOn(vtImm, kIdxPSSetShader, reinterpret_cast<void*>(&Detour_PSSetShader),
                reinterpret_cast<void**>(&real_PSSetShader_imm)) && ok;
-    if (vtDef)
-        ok = hookOn(vtDef, kIdxPSSetShader, reinterpret_cast<void*>(&Detour_PSSetShader),
-                   reinterpret_cast<void**>(&real_PSSetShader_def)) && ok;
+    if (vtDef) {
+        if (vtDef[kIdxPSSetShader] == vtImm[kIdxPSSetShader]) {
+            real_PSSetShader_def = real_PSSetShader_imm;
+        } else {
+            ok = hookOn(vtDef, kIdxPSSetShader, reinterpret_cast<void*>(&Detour_PSSetShader),
+                       reinterpret_cast<void**>(&real_PSSetShader_def)) && ok;
+        }
+    }
 
     VRLOG("Shader cull %s -- CreatePixelShader + PSSetShader (imm%s) hooked",
           ok ? "installed" : "FAILED", vtDef ? "+def" : ", NO deferred");

@@ -435,7 +435,10 @@ void capture_glass_depth(ID3D11DeviceContext* ctx, DrawFn&& draw)
 void STDMETHODCALLTYPE Detour_DrawIndexed(ID3D11DeviceContext* ctx, UINT ic, UINT sil, INT bvl)
 {
     note_deferred_draw(ctx);
-    auto call = [&] { (is_imm(ctx) ? real_DrawIndexed_imm : real_DrawIndexed_def)(ctx, ic, sil, bvl); };
+    PFN_DrawIndexed pfn = (is_imm(ctx) && real_DrawIndexed_imm) ? real_DrawIndexed_imm
+                        : (real_DrawIndexed_def ? real_DrawIndexed_def : real_DrawIndexed_imm);
+    if (!pfn) return;
+    auto call = [&] { pfn(ctx, ic, sil, bvl); };
     capture_glass_depth(ctx, call);
     if (redirect_if_smudge(ctx, call)) return;
     if (redirect_if_winch_marker(ctx, call)) return;
@@ -448,7 +451,10 @@ void STDMETHODCALLTYPE Detour_DrawIndexed(ID3D11DeviceContext* ctx, UINT ic, UIN
 void STDMETHODCALLTYPE Detour_Draw(ID3D11DeviceContext* ctx, UINT vc, UINT sv)
 {
     note_deferred_draw(ctx);
-    auto call = [&] { (is_imm(ctx) ? real_Draw_imm : real_Draw_def)(ctx, vc, sv); };
+    PFN_Draw pfn = (is_imm(ctx) && real_Draw_imm) ? real_Draw_imm
+                 : (real_Draw_def ? real_Draw_def : real_Draw_imm);
+    if (!pfn) return;
+    auto call = [&] { pfn(ctx, vc, sv); };
     capture_glass_depth(ctx, call);
     if (redirect_if_smudge(ctx, call)) return;
     if (redirect_if_winch_marker(ctx, call)) return;
@@ -461,7 +467,10 @@ void STDMETHODCALLTYPE Detour_Draw(ID3D11DeviceContext* ctx, UINT vc, UINT sv)
 void STDMETHODCALLTYPE Detour_DrawIndexedInstanced(ID3D11DeviceContext* ctx, UINT ipi, UINT ic, UINT sil, INT bvl, UINT sii)
 {
     note_deferred_draw(ctx);
-    auto call = [&] { (is_imm(ctx) ? real_DrawIndexedInstanced_imm : real_DrawIndexedInstanced_def)(ctx, ipi, ic, sil, bvl, sii); };
+    PFN_DrawIndexedInstanced pfn = (is_imm(ctx) && real_DrawIndexedInstanced_imm) ? real_DrawIndexedInstanced_imm
+                                 : (real_DrawIndexedInstanced_def ? real_DrawIndexedInstanced_def : real_DrawIndexedInstanced_imm);
+    if (!pfn) return;
+    auto call = [&] { pfn(ctx, ipi, ic, sil, bvl, sii); };
     capture_glass_depth(ctx, call);
     if (redirect_if_smudge(ctx, call)) return;
     if (redirect_if_winch_marker(ctx, call)) return;
@@ -474,7 +483,10 @@ void STDMETHODCALLTYPE Detour_DrawIndexedInstanced(ID3D11DeviceContext* ctx, UIN
 void STDMETHODCALLTYPE Detour_DrawInstanced(ID3D11DeviceContext* ctx, UINT vpi, UINT ic, UINT sv, UINT siv)
 {
     note_deferred_draw(ctx);
-    auto call = [&] { (is_imm(ctx) ? real_DrawInstanced_imm : real_DrawInstanced_def)(ctx, vpi, ic, sv, siv); };
+    PFN_DrawInstanced pfn = (is_imm(ctx) && real_DrawInstanced_imm) ? real_DrawInstanced_imm
+                          : (real_DrawInstanced_def ? real_DrawInstanced_def : real_DrawInstanced_imm);
+    if (!pfn) return;
+    auto call = [&] { pfn(ctx, vpi, ic, sv, siv); };
     capture_glass_depth(ctx, call);
     if (redirect_if_smudge(ctx, call)) return;
     if (redirect_if_winch_marker(ctx, call)) return;
@@ -734,14 +746,22 @@ bool install_ui_hook(IDXGISwapChain* swapchain)
                reinterpret_cast<void**>(&real_DrawInstanced_imm)) && ok;
 
     if (vtDef) {
-        ok = hookOn(vtDef, kIdxDrawIndexed, reinterpret_cast<void*>(&Detour_DrawIndexed),
-                   reinterpret_cast<void**>(&real_DrawIndexed_def)) && ok;
-        ok = hookOn(vtDef, kIdxDraw, reinterpret_cast<void*>(&Detour_Draw),
-                   reinterpret_cast<void**>(&real_Draw_def)) && ok;
-        ok = hookOn(vtDef, kIdxDrawIndexedInstanced, reinterpret_cast<void*>(&Detour_DrawIndexedInstanced),
-                   reinterpret_cast<void**>(&real_DrawIndexedInstanced_def)) && ok;
-        ok = hookOn(vtDef, kIdxDrawInstanced, reinterpret_cast<void*>(&Detour_DrawInstanced),
-                   reinterpret_cast<void**>(&real_DrawInstanced_def)) && ok;
+        if (vtDef[kIdxDrawIndexed] == vt[kIdxDrawIndexed]) real_DrawIndexed_def = real_DrawIndexed_imm;
+        else ok = hookOn(vtDef, kIdxDrawIndexed, reinterpret_cast<void*>(&Detour_DrawIndexed),
+                         reinterpret_cast<void**>(&real_DrawIndexed_def)) && ok;
+
+        if (vtDef[kIdxDraw] == vt[kIdxDraw]) real_Draw_def = real_Draw_imm;
+        else ok = hookOn(vtDef, kIdxDraw, reinterpret_cast<void*>(&Detour_Draw),
+                         reinterpret_cast<void**>(&real_Draw_def)) && ok;
+
+        if (vtDef[kIdxDrawIndexedInstanced] == vt[kIdxDrawIndexedInstanced]) real_DrawIndexedInstanced_def = real_DrawIndexedInstanced_imm;
+        else ok = hookOn(vtDef, kIdxDrawIndexedInstanced, reinterpret_cast<void*>(&Detour_DrawIndexedInstanced),
+                         reinterpret_cast<void**>(&real_DrawIndexedInstanced_def)) && ok;
+
+        if (vtDef[kIdxDrawInstanced] == vt[kIdxDrawInstanced]) real_DrawInstanced_def = real_DrawInstanced_imm;
+        else ok = hookOn(vtDef, kIdxDrawInstanced, reinterpret_cast<void*>(&Detour_DrawInstanced),
+                         reinterpret_cast<void**>(&real_DrawInstanced_def)) && ok;
+
         // FinishCommandList is invalid on the immediate context (D3D11 spec),
         // so it only ever needs hooking on the deferred vtable -- one real
         // pointer, no immediate-side counterpart to conflict with.

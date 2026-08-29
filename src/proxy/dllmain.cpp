@@ -3,6 +3,7 @@
 #include "hooks/resolution_hook.h"
 #include "hooks/input_block.h"
 #include "common/log.h"
+#include "common/crash_log.h"
 #include "common/config.h"
 
 // Loading the real dxgi.dll inside DllMain runs under loader lock, which is
@@ -22,6 +23,11 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID)
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(instance);
         vrlog::init(instance);
+        // Before anything else that can fault, including our own init. It only
+        // writes a line and returns EXCEPTION_CONTINUE_SEARCH, so it changes
+        // nothing about how a crash is handled -- it just makes the log say
+        // WHOSE crash it was. See common/crash_log.h.
+        vrlog::install_crash_handler();
         VRLOG("snowrunner_vr proxy attached");
         if (!dxgi_proxy_init()) {
             // Passthrough is impossible without the real DLL; failing the

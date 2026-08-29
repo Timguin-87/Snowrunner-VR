@@ -28,7 +28,7 @@ Two files appear beside it:
 - `snowrunner_vr.log` — truncated each launch.
 - `Snowrunner_VR_config.txt` — The settings.
 
-**The first launch does little but read your headset and requires a restart.** The mod writes your headset's native per-eye resolution into the config and asks you to restart — the engine builds its window once, at startup, and never re-reads the size, I found no way to apply it live.
+**Set the game to windowed mode. The first launch does little but read your headset and requires a restart.** The mod writes your headset's native per-eye resolution into the config and asks you to restart — the engine builds its window once, at startup, and never re-reads the size, I found no way to apply it live.
 
 ## Using it
 
