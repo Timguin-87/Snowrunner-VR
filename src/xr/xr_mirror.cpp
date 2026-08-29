@@ -4626,6 +4626,46 @@ void render_frame(IDXGISwapChain* swapchain)
             }
             pv[e].fov.angleLeft  = -hh;  pv[e].fov.angleRight = hh;
             pv[e].fov.angleUp    =  vh;  pv[e].fov.angleDown  = -vh;
+
+            // FOV asymmetry / off-center projection alignment:
+            // If the runtime reports an asymmetric FOV (e.g. Pimax with parallel projections or canted panels),
+            // the rendered image is symmetric covering [-baseH, +baseH]. We crop the swapchain subImage rect
+            // and declare the exact per-eye asymmetric FOV so that the optical center (0 deg) lines up with the lens.
+            float aspect, baseH;
+            eye_frustum_base((uint32_t)e, aspect, baseH);
+            const float tanBase = std::tan(baseH);
+            if (tanBase > 1.0e-4f) {
+                const float rawL = g.lastView[e].fov.angleLeft;
+                const float rawR = g.lastView[e].fov.angleRight;
+                if (std::fabs(std::fabs(rawL) - std::fabs(rawR)) > 0.01f) {
+                    const float tanL = std::tan(rawL);
+                    const float tanR = std::tan(rawR);
+                    float u0 = (tanL + tanBase) / (2.0f * tanBase);
+                    float u1 = (tanR + tanBase) / (2.0f * tanBase);
+                    u0 = (std::max)(0.0f, (std::min)(1.0f, u0));
+                    u1 = (std::max)(0.0f, (std::min)(1.0f, u1));
+                    if (u1 > u0 + 0.05f) {
+                        const int32_t origX = rect.offset.x;
+                        const int32_t origW = rect.extent.width;
+                        rect.offset.x = origX + (int32_t)std::round((float)origW * u0);
+                        rect.extent.width = (int32_t)std::round((float)origW * (u1 - u0));
+
+                        const float scale = composited_fov_scale();
+                        pv[e].fov.angleLeft  = std::atan(tanL * scale);
+                        pv[e].fov.angleRight = std::atan(tanR * scale);
+
+                        static std::atomic<bool> loggedAsym[2]{false, false};
+                        if (!loggedAsym[e].exchange(true)) {
+                            VRLOG("eye%d FOV asymmetry aligned: raw [%.2f, %.2f] deg -> subImage rect [%d..%d] (width %d of %d), fov [%.2f, %.2f] deg",
+                                  e, rawL * 57.2957795f, rawR * 57.2957795f,
+                                  rect.offset.x, rect.offset.x + rect.extent.width,
+                                  rect.extent.width, origW,
+                                  pv[e].fov.angleLeft * 57.2957795f, pv[e].fov.angleRight * 57.2957795f);
+                        }
+                    }
+                }
+            }
+
             pv[e].subImage.swapchain = g.swapchain[e];
             pv[e].subImage.imageRect = rect;
             pv[e].subImage.imageArrayIndex = 0;
