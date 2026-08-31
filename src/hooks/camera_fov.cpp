@@ -260,9 +260,26 @@ void write_fov()
 {
     const int n = g_found.load(std::memory_order_acquire);
     if (n <= 0) return;
-    const float deg = xr::render_hfov_deg() * g_factor.load(std::memory_order_relaxed);
+    const float factor = g_factor.load(std::memory_order_relaxed);
+    const float deg = xr::render_hfov_deg() * factor;
     if (!(deg > 5.0f && deg < 175.0f)) return;
     const float rad = deg / 57.2957795f;
+
+    // WHAT WE ACTUALLY DECLARED, logged whenever it moves by more than a
+    // degree. Without this the number lived only in the settings UI's status
+    // line, so a log sent in with a bug report could not answer "was the
+    // culling FOV where you think it was" -- and on a wide headset a factor
+    // of 0.5 against a 120 deg render culls the outer half of the world,
+    // which looks exactly like the FOV being wrong. It also pairs with the
+    // PROJ LOCK census: the census prints the FOV the engine BUILT, so the
+    // two lines together show whether the engine took the value verbatim or
+    // clamped it.
+    static float s_lastLogged = 0.0f;
+    if (std::fabs(deg - s_lastLogged) > 1.0f) {
+        s_lastLogged = deg;
+        VRLOG("CAMERA FOV: declaring %.2f deg (rendered %.2f x factor %.2f) "
+              "into %d camera(s)", deg, xr::render_hfov_deg(), factor, n);
+    }
 
     bool stale = false;
     for (int i = 0; i < n && !stale; ++i) {
