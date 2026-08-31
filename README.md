@@ -36,6 +36,22 @@ Open the menu with **Insert**, or **L3+R3** on a gamepad — both rebindable.
 **HOME** recenters, as does the button at the top of the menu: face the
 direction you want as "forward", then press it.
 
+### Mouse cursor
+
+The Windows hardware cursor is not part of the game's D3D11 backbuffer, so the
+mod composites a copy into VR. Normal menus use the UI plane. Winch attachment
+points are drawn in world space and need a cursor in the eye images instead:
+
+- press **F8** before aiming at winch attachment points;
+- press **F8** again to return the cursor to normal menus;
+- **Page Up/Page Down** adjust horizontal cursor alignment;
+- **Shift+Page Up/Page Down** adjust vertical cursor alignment.
+
+The world cursor compensates for headset rotation so it stays on the selected
+attachment point. F8 is currently manual because no reliable game-state signal
+for "selecting a winch point" has been identified. Automatic switching based on
+retained UI draws produced false positives in normal menus.
+
 ### Headsets
 
 Tested with my Quest 3 over Virtual Desktop (VDXR and Steam runtime). Anything with an OpenXR runtime should work. I'm curious to see experiences with canted eye headsets, there are probably issues so let me know.

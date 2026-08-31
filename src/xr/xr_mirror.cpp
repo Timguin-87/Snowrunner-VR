@@ -13,6 +13,7 @@
 #include "render/smudge_layer.hpp"
 #include "render/winch_layer.hpp"
 #include "render/ui_layer.hpp"
+#include "render/cursor_overlay.hpp"
 #include "common/dibr_policy.h"
 #include "common/log.h"
 
@@ -273,6 +274,32 @@ std::atomic<float> g_debugCantDeg{0.0f};
 // parity-advance uses this to detect "no camera active" (menu/loading screen)
 // generically, without needing to identify either state specifically.
 std::atomic<DWORD> g_lastCameraActivity{0};
+std::atomic<bool> g_worldCursorMode{false};
+POINT g_uiCursorSaved{};
+bool g_uiCursorSavedValid = false;
+
+bool winch_cursor_active()
+{
+    return g_worldCursorMode.load();
+}
+
+void update_world_cursor_hotkey()
+{
+    static bool previous = false;
+    const bool down = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+    if (down && !previous) {
+        const bool enabled = !g_worldCursorMode.load();
+        if (enabled) {
+            g_uiCursorSavedValid = GetCursorPos(&g_uiCursorSaved) != FALSE;
+        } else if (g_uiCursorSavedValid) {
+            SetCursorPos(g_uiCursorSaved.x, g_uiCursorSaved.y);
+            g_uiCursorSavedValid = false;
+        }
+        g_worldCursorMode.store(enabled);
+        VRLOG("cursor mode: %s (F8)", enabled ? "world/winch" : "UI");
+    }
+    previous = down;
+}
 
 // Render-resolution shaping. When enabled, the game backbuffer/window is
 // forced to a test size (see desired_render_size_for) instead of the game's
@@ -952,6 +979,7 @@ struct XrState {
     ComPtr<ID3D11Texture2D>       desktopSave;  // last desktop-eye frame (single-eye monitor)
     DXGI_FORMAT desktopSaveFormat = DXGI_FORMAT_UNKNOWN;  // ALWAYS matches the swapchain
     uint32_t desktopSaveW = 0, desktopSaveH = 0;          // backbuffer exactly (raw CopyResource)
+    HWND outputWindow = nullptr;
 
     // Menu overlay quad layer (headset-visible mod GUI): a separate, small XR
     // swapchain distinct from the eye swapchains above. Recreated whenever
@@ -1775,6 +1803,7 @@ bool init(IDXGISwapChain* swapchain)
 
     DXGI_SWAP_CHAIN_DESC scd{};
     swapchain->GetDesc(&scd);
+    g.outputWindow = scd.OutputWindow;
     // REVERTED (2026-07-25): square XR canvas + letterbox split didn't pan out
     // (still not square in headset, UI missing, no quality gain) -- back to
     // the simple 1:1 relationship: whatever the backbuffer actually is, the
@@ -2104,6 +2133,66 @@ void update_head_pose(XrTime displayTime)
     g_headLook = {true, yaw, pitch, roll, off.x, off.y, off.z};
     g_relQuat[0]=rel.x; g_relQuat[1]=rel.y; g_relQuat[2]=rel.z; g_relQuat[3]=rel.w;
     ReleaseSRWLockExclusive(&g_poseLock);
+}
+
+// SnowRunner hit-tests winch points using the desktop cursor. Keep that pixel
+// on the same world direction while the headset rotates. Inactive frames reset
+// the baseline so menus never receive synthetic mouse movement.
+void hold_winch_pointer_against_head(bool active)
+{
+    static bool havePrevious = false;
+    static float previousYaw = 0.0f, previousPitch = 0.0f;
+    static float carryX = 0.0f, carryY = 0.0f;
+    if (!active) {
+        havePrevious = false;
+        carryX = carryY = 0.0f;
+        return;
+    }
+
+    AcquireSRWLockShared(&g_poseLock);
+    const HeadLook head = g_headLook;
+    ReleaseSRWLockShared(&g_poseLock);
+    if (!head.valid) return;
+
+    const float oldYaw = previousYaw, oldPitch = previousPitch;
+    const bool hadPrevious = havePrevious;
+    previousYaw = head.yaw;
+    previousPitch = head.pitch;
+    havePrevious = true;
+    if (!hadPrevious) return;
+
+    float dyaw = head.yaw - oldYaw;
+    while (dyaw > 3.14159265f) dyaw -= 6.28318531f;
+    while (dyaw < -3.14159265f) dyaw += 6.28318531f;
+    const float dpitch = head.pitch - oldPitch;
+    if (std::fabs(dyaw) > 0.35f || std::fabs(dpitch) > 0.35f) {
+        carryX = carryY = 0.0f;
+        return;
+    }
+
+    RECT client{};
+    if (!g.outputWindow || !GetClientRect(g.outputWindow, &client)) return;
+    const float width = static_cast<float>(client.right - client.left);
+    const float height = static_cast<float>(client.bottom - client.top);
+    const XrFovf& fov = g.lastView[0].fov;
+    const float horizontal = fov.angleRight - fov.angleLeft;
+    const float vertical = fov.angleUp - fov.angleDown;
+    if (width < 1.0f || height < 1.0f || horizontal < 0.05f || vertical < 0.05f)
+        return;
+
+    // g_headLook yaw uses the opposite sign from the reference implementation
+    // (atan2(fwd.x, -fwd.z) vs atan2(-fwd.x, -fwd.z)).
+    carryX -= dyaw * width / horizontal;
+    carryY += dpitch * height / vertical;
+    const int stepX = static_cast<int>(carryX);
+    const int stepY = static_cast<int>(carryY);
+    if (!stepX && !stepY) return;
+    carryX -= static_cast<float>(stepX);
+    carryY -= static_cast<float>(stepY);
+
+    POINT point{};
+    if (GetCursorPos(&point))
+        SetCursorPos(point.x + stepX, point.y + stepY);
 }
 
 // The headset's OPTICAL per-eye HORIZONTAL FOV is a fixed hardware property --
@@ -2442,6 +2531,8 @@ bool build_menu_quad_layer(XrCompositionLayerQuad& quad)
     }
 
     hooks::menu_render_to_extra_target(g.menuRtvs[idx].Get(), g.ctx.Get());
+    cursoroverlay::draw(g.device.Get(), g.ctx.Get(), g.menuRtvs[idx].Get(),
+                        g.outputWindow, w, h, false);
 
     XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
     xrReleaseSwapchainImage(g.menuSwapchain, &ri);
@@ -2671,6 +2762,16 @@ bool refresh_ui_quad_image(ID3D11ShaderResourceView* src, uint32_t w, uint32_t h
     ID3D11ShaderResourceView* nullSrv = nullptr;
     g.ctx->PSSetShaderResources(0, 1, &nullSrv);
 
+    // Exactly one VR cursor: UI normally, final eye while the user has selected
+    // manual world/winch mode with F8.
+    if (!hooks::is_menu_open() && !winch_cursor_active()) {
+        const DXGI_FORMAT fmt = static_cast<DXGI_FORMAT>(g.uiSwapFormat);
+        const bool srgb = fmt == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+                          fmt == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+        cursoroverlay::draw(g.device.Get(), g.ctx.Get(), rtv, g.outputWindow,
+                            w, h, srgb);
+    }
+
     xrReleaseSwapchainImage(g.uiSwapchain, &ri);
     return true;
 }
@@ -2875,7 +2976,7 @@ bool build_ui_quad_layer(XrCompositionLayerQuad& quad, XrTime displayTime)
         Quat q{std::sin(vhalf), 0.0f, 0.0f, std::cos(vhalf)};
         Vec3 origin{0.0f, 0.0f, 0.0f};
 
-        // HUNG ON THE CAPTURE EYE, not on the head -- map only.
+        // HUNG ON THE CAPTURE EYE, not on the head.
         //
         // The capture came out of ONE eye (kUiCaptureEye), so the image it
         // holds is that eye's projection and nothing else's. Reproducing it
@@ -2906,12 +3007,13 @@ bool build_ui_quad_layer(XrCompositionLayerQuad& quad, XrTime displayTime)
         // here come from this Present's own locate. Mixing the render instant
         // in would fold a frame of head motion into a constant.
         //
-        // MAP ONLY, deliberately. Lining the plane up with the render is only
-        // meaningful when it subtends the render exactly, which is the map case
-        // and nothing else -- elsewhere the plane is a board of whatever size
-        // the player chose, so there is nothing to line up with, and centring
-        // it on the head beats parking it a few degrees to one side.
-        if (mapView && haveHead) {
+        // This used to be map-only. That left normal menus centred on VIEW
+        // space while their pixels (and the hardware cursor composited into
+        // them) came from kUiCaptureEye. With head translation the two origins
+        // acquired visible parallax. Keep every head-locked UI plane on the
+        // eye that actually produced its texture; size remains an independent
+        // presentation choice, but pose identity no longer changes by screen.
+        if (haveHead) {
             const XrView& ev = g.lastView[kUiCaptureEye];
             const Quat qe{ev.pose.orientation.x, ev.pose.orientation.y,
                           ev.pose.orientation.z, ev.pose.orientation.w};
@@ -3338,6 +3440,15 @@ bool warp_stale_eye(uint32_t stale)
     ID3D11Buffer* wcb = g.warpCb.Get();
     g.ctx->PSSetConstantBuffers(0, 1, &wcb);
     g.ctx->Draw(3, 0);
+    ID3D11ShaderResourceView* wnull = nullptr;
+    g.ctx->PSSetShaderResources(0, 1, &wnull);
+
+    if (!hooks::is_menu_open() && winch_cursor_active()) {
+        cursoroverlay::draw_in_rect(
+            g.device.Get(), g.ctx.Get(), srtv, g.outputWindow,
+            g.width, g.height, svp.TopLeftX, svp.TopLeftY,
+            svp.Width, svp.Height, true);
+    }
 
     XrSwapchainImageReleaseInfo sri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
     xrReleaseSwapchainImage(g.swapchain[stale], &sri);
@@ -3877,6 +3988,8 @@ void render_frame(IDXGISwapChain* swapchain)
         }
     }
 
+    hold_winch_pointer_against_head(winch_cursor_active());
+
     // What DIBR shift published this frame, hoisted so the projection views below can
     // see it. Both eyes of an DIBR shift pair derive from ONE render, which is what
     // makes it safe to declare that render's pose for both -- see the submit
@@ -4314,6 +4427,12 @@ void render_frame(IDXGISwapChain* swapchain)
                 // they are still bound as SRVs when that happens.
                 ID3D11ShaderResourceView* nullSrvs[4] = {};
                 g.ctx->PSSetShaderResources(0, 4, nullSrvs);
+
+                if (!hooks::is_menu_open() && winch_cursor_active()) {
+                    cursoroverlay::draw_in_rect(
+                        g.device.Get(), g.ctx.Get(), rtv, g.outputWindow,
+                        g.width, g.height, vx, vy, vw, vh, true);
+                }
 
                 // Dump what the HEADSET receives, not the source handed in.
                 //
@@ -5247,6 +5366,8 @@ void mirror_on_present(IDXGISwapChain* swapchain)
         }
     }
 
+    update_world_cursor_hotkey();
+
     // Fallback parity advance: normally ONLY the camera hooks (cockpit/orbit)
     // advance the AER eye -- required for correct cockpit behavior and looks
     // better for orbit too, so gameplay must keep driving it exclusively.
@@ -5258,7 +5379,9 @@ void mirror_on_present(IDXGISwapChain* swapchain)
     // either state.
     if (GetTickCount() - g_lastCameraActivity.load() > 250) advance_aer_parity();
 
-    // PageUp (frame-dump burst) is the only binding left here. Everything else
+    // Ctrl+PageUp (frame-dump burst) is the only diagnostic binding left here.
+    // Plain PageUp/PageDown now calibrate the headset cursor; see
+    // render/cursor_overlay.cpp.
     // that used to live at this call site has moved into the in-game settings
     // UI (menu_hook.cpp), which is strictly more capable than a keybind --
     // it shows the current state instead of cycling blind:
@@ -5275,17 +5398,21 @@ void mirror_on_present(IDXGISwapChain* swapchain)
     // happening on screen, and reaching for the menu to start one changes what
     // you were trying to capture. The Advanced tab has the same button for when
     // that does not matter.
-    auto edge = [](int vk, bool& prev){ bool k=(GetAsyncKeyState(vk)&0x8000)!=0; bool e=k&&!prev; prev=k; return e; };
-    static bool pPgUp=false;
-    if (edge(VK_PRIOR, pPgUp)) framedump::request(20);
+    static bool pCtrlPgUp=false;
+    const bool ctrlPgUp = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 &&
+                          (GetAsyncKeyState(VK_PRIOR) & 0x8000) != 0;
+    const bool ctrlPgUpEdge = ctrlPgUp && !pCtrlPgUp;
+    pCtrlPgUp = ctrlPgUp;
+    if (ctrlPgUpEdge) framedump::request(20);
 
     // BEFORE render_frame, which is where both eyes composite it, and after the
     // game's own drawing for this frame -- so a capture-eye frame shows its own
     // markers rather than the previous one's. Outside the `g.running` test on
     // purpose: the capture buffer has to be cleared every Present whether or not
     // an XR frame was built, or the redirected draws would pile up in it.
-    if (g.ctx)
+    if (g.ctx) {
         winchlayer::latch(g.ctx.Get(), present_route_eye() == kWinchCaptureEye);
+    }
 
     poll_events();
     if (g.running) render_frame(swapchain);

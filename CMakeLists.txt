@@ -39,6 +39,7 @@ add_library(dxgi_proxy SHARED
     src/proxy/dxgi_stubs.asm
     src/proxy/dxgi.def
     src/common/log.cpp
+    src/common/crash_log.cpp
     src/common/config.cpp
     src/hooks/pattern_scan.cpp
     src/hooks/swapchain_hook.cpp
@@ -57,6 +58,7 @@ add_library(dxgi_proxy SHARED
     src/render/mirror_mask.cpp
     src/render/rigid_mask.cpp
     src/render/ui_layer.cpp
+    src/render/cursor_overlay.cpp
     src/render/smudge_layer.cpp
     src/render/winch_layer.cpp
     src/render/frame_dump.cpp
@@ -100,5 +102,12 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/dibr_policy_tests.cpp")
     target_include_directories(dibr_policy_tests PRIVATE src)
     target_compile_definitions(dibr_policy_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     add_test(NAME dibr_policy COMMAND dibr_policy_tests)
+endif()
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/cursor_policy_tests.cpp")
+    enable_testing()
+    add_executable(cursor_policy_tests tests/cursor_policy_tests.cpp)
+    target_include_directories(cursor_policy_tests PRIVATE src)
+    add_test(NAME cursor_policy COMMAND cursor_policy_tests)
 endif()
 
