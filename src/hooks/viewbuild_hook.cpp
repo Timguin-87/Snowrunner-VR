@@ -18,9 +18,10 @@ namespace hooks {
 namespace {
 
 // View-matrix builder + the MAIN RENDER camera's build call site (found via
-// call-site cycling: exe+0xA17C2B). Stable code addresses for this game build.
-constexpr uintptr_t kBuilderOffset = 0x1153070;
-constexpr uintptr_t kMainCallSite  = 0xA17C2B;
+// call-site cycling: exe+0xA179FB). Addresses verified against SnowRunner
+// 1.886173.SNOW_DLC_18 (exe SHA-256 FBD3F36C...B4E683).
+constexpr uintptr_t kBuilderOffset = 0x1153390;
+constexpr uintptr_t kMainCallSite  = 0xA179FB;
 
 // Module base, set at install. Defined here rather than beside the camera code
 // because the screen-state detour below needs it to make a return address
@@ -58,15 +59,15 @@ uintptr_t g_moduleBase = 0;
 // The camera COMBINE fn: combine(out=rcx, position=rdx float3, orientation=r8),
 // called for the main camera at +0xA17DF0 (return addr +0xA17DF5). rdx is the
 // eye POSITION — the injection point for stereo/positional translation.
-constexpr uintptr_t kCombineOffset = 0x11525B0;
-constexpr uintptr_t kCombineRet    = 0xA17DF5;
+constexpr uintptr_t kCombineOffset = 0x11528D0;
+constexpr uintptr_t kCombineRet    = 0xA17BC5;
 
 // FnA = fillOrbitView(viewObj=rcx, eye=rdx, target=r8, up=r9). Called for BOTH the
 // orbit CAMERA and the sun/shadow view — so we hook FnA and filter by ITS caller
 // to transform only the camera view (else head-look drags the shadows).
-constexpr uintptr_t kFnAOffset    = 0xDA1C20;
-constexpr uintptr_t kOrbitCamGame = 0x861149;   // in-game orbit camera caller
-constexpr uintptr_t kOrbitCamMenu = 0x88480D;   // main-menu orbit camera caller
+constexpr uintptr_t kFnAOffset    = 0xDA1D20;
+constexpr uintptr_t kOrbitCamGame = 0x860EB9;   // in-game orbit camera caller
+constexpr uintptr_t kOrbitCamMenu = 0x8845AD;   // main-menu orbit camera caller
 
 // Game render FOV: settings obj ptr at [exe+0x2AF4570], FOV percent multipliers
 // at +0x60/+0x64. We scale them each frame to widen the render to fill the HMD.
@@ -110,7 +111,7 @@ constexpr uintptr_t kViewportH = 0x2AA180C;
 // one. Found alongside: the per-frame camera struct has projection at +0x00 and a
 // camera-to-world matrix at +0x40 whose translation row is +0x70 (the eye
 // position), stride 0x140; the struct is copied by camera code at +0x8554C2.
-constexpr uintptr_t kProjBuildOffset = 0x11541B0;
+constexpr uintptr_t kProjBuildOffset = 0x11544D0;
 
 // Camera-struct consumer (CE: entry +0x855310, prologue mov rax,rsp / push
 // rbp,r12..r15 / sub rsp,0x300, loops with r14d over globals at exe+0x2B1F778 and
@@ -133,7 +134,7 @@ constexpr bool kHookCamConsumer = false;
 // measured rendered FOV; sits in the same function region as the orbit camera
 // setup at 0xDA1C20/0xDA1D2B). The other two callers are a 45-deg view and an
 // asymmetric 31.3x11.6 shadow projection -- both must be left alone.
-std::atomic<uintptr_t> g_projOverrideCaller{0xDA1E4E};
+std::atomic<uintptr_t> g_projOverrideCaller{0xDA1F4E};
 
 // --- per-caller FOV probe ---------------------------------------------------
 // Every projection call site EXCEPT the locked one keeps the FOV the game gave
@@ -544,8 +545,8 @@ void* g_projTarget = nullptr;
 // Downstream sibling view-builder: builds the FINAL view (up rebuilt here,
 // after look-angles are folded in). Called at +0xA17F20 (return +0xA17F25).
 // Candidate injection point for ROLL, which the earlier stages discard.
-constexpr uintptr_t kCombine2Offset = 0x11527A0;
-constexpr uintptr_t kCombine2Ret    = 0xA17F25;
+constexpr uintptr_t kCombine2Offset = 0x1152AC0;
+constexpr uintptr_t kCombine2Ret    = 0xA17CF5;
 
 // TEST: while true, the builder rotation is off and we only test translating
 // the eye position at the combine fn.
