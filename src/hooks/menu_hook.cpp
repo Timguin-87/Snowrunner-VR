@@ -948,6 +948,116 @@ void draw_advanced_tab()
 
     ImGui::Separator();
 
+    // OFF-CENTRE PROJECTION. The correct render, and a trade -- see xr_mirror.h.
+    {
+        bool oc = xr::offcenter_projection();
+        if (ImGui::Checkbox("Off-centre projection (exact per-eye FOV)", &oc)) {
+            xr::set_offcenter_projection(oc);
+            vrcfg::save();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Renders each eye at the exact lopsided frustum your runtime@"
+                "reports for it, instead of a symmetric one wide enough to@"
+                "contain it.@"
+                "@"
+                "Strictly more correct, and it stops drawing the surplus: on a@"
+                "wide headset about a third of every frame is currently@"
+                "rendered and then thrown away, so the pixels you keep get@"
+                "sharper for free.@"
+                "@"
+                "THE TRADE, and it is a real one. The two eyes then look at@"
+                "different angles and overlap over only part of their width.@"
+                "DIBR shift builds one eye out of the other, so outside that@"
+                "overlap it has nothing to build from and the outer edge falls@"
+                "back to the stale-eye warp. Best paired with DIBR shift OFF.@"
+                "@"
+                "The warp and the shift are both corrected for the new frustum@"
+                "shape, so this is not expected to break them -- but it is the@"
+                "least-travelled path in the mod. Report what you see.");
+
+        if (oc) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("(FOV asymmetry handled here, not by the crop)");
+        }
+    }
+
+    ImGui::Separator();
+
+    // THE ASYMMETRY DISCRIMINATOR. Not a preference -- see xr_mirror.h.
+    {
+        bool al = xr::fov_asymmetry_align();
+        if (ImGui::Checkbox("Align FOV asymmetry (leave on)", &al)) {
+            xr::set_fov_asymmetry_align(al);
+            vrcfg::save();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Your headset sees further toward the temple than toward the@"
+                "nose; the game is rendered symmetrically. On, the mod submits@"
+                "the sub-rectangle of that render holding exactly the angles@"
+                "each eye really covers, so the image sits on the lens.@"
+                "@"
+                "LEAVE IT ON. The arithmetic is checked -- the rectangle lands@"
+                "on the declared angles to within a fifth of a pixel.@"
+                "@"
+                "Turn it off only as a TEST. It is the one step the mod cannot@"
+                "verify from its own side: whether your runtime honours that@"
+                "sub-rectangle. A runtime that ignores it shows the whole wide@"
+                "image inside a window declared much narrower, and the world@"
+                "reads as far too wide. If turning this off makes the FOV look@"
+                "RIGHT, that is the cause -- say so, because the fix then@"
+                "belongs somewhere else entirely.@"
+                "@"
+                "Off is still geometrically exact for what was rendered; it is@"
+                "simply centred on the eye axis instead of on the lens.");
+    }
+
+    ImGui::Separator();
+
+    // THE RENDER'S VERTICAL FOV. See xr_mirror.h -- it used to come from the
+    // canvas aspect and never from the runtime.
+    {
+        bool mv = xr::match_headset_vfov();
+        if (ImGui::Checkbox("Match headset vertical FOV", &mv)) {
+            xr::set_match_headset_vfov(mv);
+            vrcfg::save();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Renders the vertical FOV your headset actually reports,\n"
+                "instead of deriving it from the shape of the render canvas.\n"
+                "\n"
+                "The canvas is SQUARE, so without this the frame is rendered\n"
+                "as tall as it is wide whatever your panel shows. If the panel\n"
+                "is less tall than wide the surplus is drawn and thrown away,\n"
+                "and the pixels you DO see are spread thinner for it. If it is\n"
+                "taller, the top and bottom have no content at all.\n"
+                "\n"
+                "Both errors grow with the FOV, so this is aimed at wide\n"
+                "headsets -- on a roughly square per-eye FOV it changes almost\n"
+                "nothing, which is why it is off by default.\n"
+                "\n"
+                "Your headset reports %.1f deg vertical against %.1f deg\n"
+                "horizontal. Turning this on renders the first number instead\n"
+                "of the second.",
+                xr::headset_vfov_deg(), xr::headset_hfov_deg());
+
+        const float hv = xr::headset_vfov_deg(), hh = xr::headset_hfov_deg();
+        if (hv > 1.0f && hh > 1.0f) {
+            // The share of the rendered frame the panel can actually show,
+            // which is the number this setting exists to move.
+            const float k = 0.5f * 0.0174532925f;
+            const float tv = std::tan(hv * k), th = std::tan(hh * k);
+            const float shown = mv ? 1.0f : (tv / th);
+            ImGui::TextDisabled("  headset %.1f x %.1f deg -- %.0f%% of the "
+                                "rendered height is displayed", hh, hv,
+                                (shown > 1.0f ? 1.0f : shown) * 100.0f);
+        }
+    }
+
+    ImGui::Separator();
+
     // THE READOUTS. None of these is a control; they are the three places the
     // mod can be wrong about something without saying so on screen.
     ImGui::TextDisabled("Readouts");

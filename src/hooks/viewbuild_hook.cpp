@@ -1509,13 +1509,74 @@ void* detour_projbuild(void* rcx, float fovY, float aspect, float nearZ, float f
                     const float t = std::tan(hfovDeg * 0.5f * 0.0174532925f) * kProjFovMul;
                     if (t > 1.0e-4f) {
                         m[0] = 1.0f / t;
-                        m[5] = m[0] * aspect;
+
+                        // THE VERTICAL. By default it keeps the builder's own
+                        // aspect, which is what a game rendering to a monitor
+                        // means by it -- and on a SQUARE canvas that is 1.0, so
+                        // the frame is rendered as tall as it is wide whatever
+                        // the panel shows. On a 140 deg-wide headset with a
+                        // 115 deg-tall panel that is 43% of the vertical
+                        // tangent span drawn and thrown away; on a narrow-FOV
+                        // setting where the panel is TALLER than it is wide it
+                        // is the reverse, and the top and bottom go empty.
+                        //
+                        // Asking the headset instead fixes both. It MUST be
+                        // matched by eye_frustum_half_angles() -- rendering one
+                        // vertical and declaring another is a stretch, and the
+                        // two branches there mirror the two here.
+                        const float vdeg = xr::match_headset_vfov()
+                                               ? xr::render_vfov_deg() : 0.0f;
+                        const float tv = (vdeg > 1.0f)
+                            ? std::tan(vdeg * 0.5f * 0.0174532925f) * kProjFovMul
+                            : 0.0f;
+                        m[5] = (tv > 1.0e-4f) ? (1.0f / tv) : (m[0] * aspect);
+
+                        // OFF-CENTRE, when asked: build the whole projection
+                        // from the runtime's own bounds for the eye being
+                        // rendered, shear included, rather than a symmetric one
+                        // that merely encloses it.
+                        //
+                        // This matrix is ROW-VECTOR D3D (m[11] = 1, m[15] = 0 --
+                        // see the lean note above), so the off-centre terms are
+                        // m[8]/m[9], the same slots D3DXMatrixPerspectiveOffCenterLH
+                        // puts (l+r)/(l-r) and (t+b)/(b-t) in.
+                        //
+                        // ONLY WRITTEN ON THIS PATH. An earlier version zeroed
+                        // them on the symmetric path as well, to stop a shear
+                        // outliving the setting -- but the game writes those
+                        // slots itself for its own off-centre projections
+                        // (shadow cascades, and a TAA jitter is a sub-pixel
+                        // value in exactly these two), and the fail-safe locks
+                        // every invocation. Clearing them was destroying the
+                        // game's own values on every projection we touch. The
+                        // shear we write is unconditional per frame, so there
+                        // is nothing of ours to inherit anyway.
+                        bool offc = false;
+                        if (xr::offcenter_projection()) {
+                            float tl, tr, tup, tdn;
+                            if (xr::render_eye_frustum_tan(xr::render_eye(),
+                                                           tl, tr, tup, tdn)) {
+                                const float dx = tr - tl, dy = tup - tdn;
+                                if (dx > 1.0e-4f && dy > 1.0e-4f) {
+                                    m[0] = 2.0f / dx;
+                                    m[5] = 2.0f / dy;
+                                    m[8] = (tl + tr) / (tl - tr);
+                                    m[9] = (tdn + tup) / (tdn - tup);
+                                    offc = true;
+                                }
+                            }
+                        }
+
                         static std::atomic<bool> once{false};
                         bool e2 = false;
                         if (once.compare_exchange_strong(e2, true))
                             VRLOG("PROJ LOCK active: was hfov=%.2f -> now %.2f deg "
-                                  "(aspect %.4f preserved)",
-                                  2.0f*std::atan(1.0f/p00)*57.2957795f, hfovDeg, aspect);
+                                  "(vertical %s, aspect %.4f)",
+                                  2.0f*std::atan(1.0f/p00)*57.2957795f, hfovDeg,
+                                  offc ? "off-centre, per eye"
+                                       : ((tv > 1.0e-4f) ? "from the headset"
+                                                         : "from the builder aspect"),
+                                  aspect);
 
                         // Nothing is injected here any more. Mode 6 puts the
                         // head rotation, the lean and the AER +-IPD/2 at the

@@ -746,12 +746,38 @@ void relative_cam_rotation(const float mOld[9], const float mNew[9], bool flipZ,
 
 // Same construction as the quaternion form below, but taking the rotation
 // matrix directly. Kept as one body so the two paths cannot drift.
+// THE WARP'S VIEW OF AN EYE: half-angles of the tangent SPAN (not of the
+// enclosing symmetric frustum -- for an off-centre eye those differ) plus the
+// principal point. Derived from render_eye_frustum_tan() so the warp cannot
+// disagree with what was rendered.
+//
+// Symmetric case: hh == the old half-angle and cx == 0.5 exactly, so this is
+// bit-identical to what the warp used before off-centre existed.
+bool eye_warp_intrinsics(int eye, float& hh, float& vh, float& cx, float& cy)
+{
+    float tl, tr, tup, tdn;
+    if (!render_eye_frustum_tan(eye, tl, tr, tup, tdn)) return false;
+    const float dx = tr - tl, dy = tup - tdn;
+    if (!(dx > 1.0e-4f) || !(dy > 1.0e-4f)) return false;
+    hh = std::atan(dx * 0.5f);
+    vh = std::atan(dy * 0.5f);
+    cx = -tl / dx;
+    cy =  tup / dy;
+    return true;
+}
+
+// cx/cy are the PRINCIPAL POINT in normalised image coords -- where the eye's
+// optical axis lands in the picture. 0.5, 0.5 for a symmetric frustum, which is
+// what these two builders assumed outright until off-centre projection made it
+// possible for the axis to sit somewhere else. Getting it wrong does not shift
+// the image; it rotates it about the wrong point, so the error is zero at the
+// centre and grows toward the edges -- the hardest kind to notice and the
+// easiest to blame on something else.
 Mat3 warp_homography_from_R(const float R[9], float hhOld, float vhOld,
-                            float hhNew, float vhNew)
+                            float hhNew, float vhNew, float cx, float cy)
 {
     const float fxOld = 0.5f / std::tan(hhOld), fyOld = 0.5f / std::tan(vhOld);
     const float fxNew = 0.5f / std::tan(hhNew), fyNew = 0.5f / std::tan(vhNew);
-    constexpr float cx = 0.5f, cy = 0.5f;
     const float Kold[9] = {
         fxOld,  0.0f,   -cx,
         0.0f,  -fyOld,  -cy,
@@ -769,7 +795,8 @@ Mat3 warp_homography_from_R(const float R[9], float hhOld, float vhOld,
 
 Mat3 compute_eye_warp_homography(const float qOld[4], float hhOld, float vhOld,
                                  const float qNew[4], float hhNew, float vhNew,
-                                 float* outRelAngleRad)
+                                 float* outRelAngleRad, float cx = 0.5f,
+                                 float cy = 0.5f)
 {
     Quat qo{qOld[0], qOld[1], qOld[2], qOld[3]};
     Quat qn{qNew[0], qNew[1], qNew[2], qNew[3]};
@@ -792,7 +819,6 @@ Mat3 compute_eye_warp_homography(const float qOld[4], float hhOld, float vhOld,
 
     const float fxOld = 0.5f / std::tan(hhOld), fyOld = 0.5f / std::tan(vhOld);
     const float fxNew = 0.5f / std::tan(hhNew), fyNew = 0.5f / std::tan(vhNew);
-    constexpr float cx = 0.5f, cy = 0.5f;
 
     const float Kold[9] = {
         fxOld,  0.0f,   -cx,
@@ -879,6 +905,11 @@ struct XrState {
     bool        prevEyeValid[2] = {false, false};   // false until that eye's first real render
     float       prevEyeOrient[2][4] = {{0,0,0,1}, {0,0,0,1}};  // orientation AT CAPTURE (lastView[eye].pose.orientation)
     float       prevEyeHalfAngleH[2] = {0, 0}, prevEyeHalfAngleV[2] = {0, 0};  // frustum half-angles AT CAPTURE
+    // Principal point AT CAPTURE, 0.5/0.5 unless the eye was rendered
+    // off-centre. Stored beside the angles because they describe one frustum
+    // between them and a warp built from half of each is a warp about the
+    // wrong point.
+    float       prevEyeCx[2] = {0.5f, 0.5f}, prevEyeCy[2] = {0.5f, 0.5f};
     // The RENDERED camera's world->camera rotation at capture, from the
     // game's own view matrix. Snapshotted alongside the head pose because
     // the stick rotates this without touching the head pose at all -- see
@@ -2281,9 +2312,19 @@ void eye_frustum_half_angles(uint32_t eye, float& hh, float& vh)
     // have no content for those angles, and claiming otherwise is what the old
     // formula did.
     hh = std::atan(std::tan(baseH) * composited_fov_scale());
-    vh = (aspect > 1.0e-4f) ? std::atan(std::tan(hh) / aspect) : hh;
-}
 
+    // THE VERTICAL, from the headset when asked and from the canvas otherwise.
+    //
+    // These two branches MUST stay the mirror of what PROJ LOCK writes into
+    // m[5], or the content is declared under a window it was not drawn for --
+    // which is a stretch, not a crop. The pairing is: headset branch here <->
+    // xr::render_vfov_deg() there; aspect branch here <-> m[0]*aspect there.
+    const float vdeg = match_headset_vfov() ? render_vfov_deg() : 0.0f;
+    if (vdeg > 1.0f)
+        vh = vdeg * 0.5f * 0.0174532925f;
+    else
+        vh = (aspect > 1.0e-4f) ? std::atan(std::tan(hh) / aspect) : hh;
+}
 // THE ONE REFERENCE INSTANT, and the reason there has to be exactly one.
 //
 // Three separate places need to agree about "when is this frame": where the
@@ -3030,9 +3071,37 @@ void retain_eye_for_warp(uint32_t eye, ID3D11Texture2D* src = nullptr)
     const XrQuaternionf q = reference_view_pose(eye).orientation;
     g.prevEyeOrient[eye][0] = q.x; g.prevEyeOrient[eye][1] = q.y;
     g.prevEyeOrient[eye][2] = q.z; g.prevEyeOrient[eye][3] = q.w;
-    eye_frustum_half_angles(eye, g.prevEyeHalfAngleH[eye], g.prevEyeHalfAngleV[eye]);
+    if (!eye_warp_intrinsics((int)eye, g.prevEyeHalfAngleH[eye], g.prevEyeHalfAngleV[eye],
+                             g.prevEyeCx[eye], g.prevEyeCy[eye]))
+        eye_frustum_half_angles(eye, g.prevEyeHalfAngleH[eye], g.prevEyeHalfAngleV[eye]);
     g.prevEyeCamValid[eye] = rendered_cam_rot(g.prevEyeCamRot[eye]);
     g.prevEyeValid[eye] = true;
+}
+
+// THE CONSTANT PART of the src-eye -> dst-eye pixel mapping, for DIBR shift.
+//
+// Zero unless the two eyes were rendered at different frusta, which only
+// off-centre projection does. When they were, the frusta are mirror images with
+// the same tangent span, so they differ by a pure horizontal translation and
+// the shift stays dest_x = src_x + this +/- disparity.
+//
+// A source pixel at tangent T sits at (T - tlSrc) * pxPerTan; the same world
+// direction in the destination frustum sits at (T - tlDst) * pxPerTan. The
+// difference is what this returns, and T drops out of it -- which is the whole
+// reason a constant suffices.
+float dibr_eye_pixel_offset(int srcEye, int dstEye, uint32_t widthPx)
+{
+    if (!offcenter_projection() || widthPx == 0) return 0.0f;
+    float sl, sr, su, sdn, dl, dr, du, ddn;
+    if (!render_eye_frustum_tan(srcEye, sl, sr, su, sdn)) return 0.0f;
+    if (!render_eye_frustum_tan(dstEye, dl, dr, du, ddn)) return 0.0f;
+    const float span = sr - sl;
+    if (!(span > 1.0e-4f)) return 0.0f;
+    // Spans that differ would mean the two eyes also disagree about SCALE, and
+    // a constant could not express that. Not seen on any real headset, but a
+    // silently wrong shift is worse than no shift.
+    if (std::fabs((dr - dl) - span) > 0.01f * span) return 0.0f;
+    return (sl - dl) * ((float)widthPx / span);
 }
 
 // `stale` wasn't rendered this Present -- rotate ITS OWN last real render to
@@ -3105,10 +3174,24 @@ bool warp_homography_for(uint32_t stale, float hhNew, float vhNew,
     const XrQuaternionf qn = reference_view_pose(stale).orientation;
     const float qNew[4] = {qn.x, qn.y, qn.z, qn.w};
 
+    // THE TARGET INTRINSICS, taken here rather than from the caller. Both
+    // callers pass eye_frustum_half_angles(), which describes the SYMMETRIC
+    // enclosing frustum -- the right answer until off-centre projection made
+    // "the frustum this eye is rendered at" a different thing. Overriding here
+    // rather than changing two call sites keeps the one definition in one
+    // place; in the symmetric case it reproduces exactly what was passed.
+    float cx = 0.5f, cy = 0.5f;
+    {
+        float hh = 0.0f, vh = 0.0f, tcx = 0.5f, tcy = 0.5f;
+        if (eye_warp_intrinsics((int)stale, hh, vh, tcx, tcy)) {
+            hhNew = hh; vhNew = vh; cx = tcx; cy = tcy;
+        }
+    }
+
     float poseAngle = 0.0f;
     const Mat3 poseH = compute_eye_warp_homography(
         g.prevEyeOrient[stale], g.prevEyeHalfAngleH[stale], g.prevEyeHalfAngleV[stale],
-        qNew, hhNew, vhNew, &poseAngle);
+        qNew, hhNew, vhNew, &poseAngle, cx, cy);
 
     if (warp_uses_game_rot() && g.prevEyeCamValid[stale]) {
         const bool cockpit = cockpit_camera();
@@ -3125,7 +3208,8 @@ bool warp_homography_for(uint32_t stale, float hhNew, float vhNew,
             relative_cam_rotation(g.prevEyeCamRot[stale], mNew, /*flipZ=*/true,
                                   R, &camAngle);
             outH = warp_homography_from_R(R, g.prevEyeHalfAngleH[stale],
-                                          g.prevEyeHalfAngleV[stale], hhNew, vhNew);
+                                          g.prevEyeHalfAngleV[stale], hhNew, vhNew,
+                                          g.prevEyeCx[stale], g.prevEyeCy[stale]);
             outRelAngleRad = camAngle;
             g_warpCamUsed.fetch_add(1);
             // Not the angle BETWEEN the two rotations (that needs a second
@@ -4155,6 +4239,9 @@ void render_frame(IDXGISwapChain* swapchain)
                     wp.ipd     = dibrIpd;
                     wp.focalPx = 0.5f * (float)g.width * sd.p00;
                     wp.eyeSign = dibrpolicy::eye_sign(ae.offset, kDibrRightIsScreenRight);
+                    // Zero unless the eyes were rendered at different frusta.
+                    wp.eyeOffsetPx = dibr_eye_pixel_offset((int)ae.eye,
+                                                           (int)(ae.eye ^ 1), g.width);
                     // One validated triple -- A and B must come from the SAME
                     // projection, which three independent live reads could not
                     // guarantee.
@@ -4627,6 +4714,33 @@ void render_frame(IDXGISwapChain* swapchain)
             pv[e].fov.angleLeft  = -hh;  pv[e].fov.angleRight = hh;
             pv[e].fov.angleUp    =  vh;  pv[e].fov.angleDown  = -vh;
 
+            // OFF-CENTRE: the render already IS this eye's own frustum, so it
+            // is declared verbatim over the whole image and the asymmetry crop
+            // below has nothing left to do -- there is no surplus to trim.
+            //
+            // Both branches read render_eye_frustum_tan(), which is also what
+            // PROJ LOCK built the matrix from, so the declaration cannot drift
+            // from the render.
+            bool declaredOffcenter = false;
+            if (offcenter_projection()) {
+                float tl, tr, tup, tdn;
+                if (render_eye_frustum_tan((int)e, tl, tr, tup, tdn)) {
+                    pv[e].fov.angleLeft  = std::atan(tl);
+                    pv[e].fov.angleRight = std::atan(tr);
+                    pv[e].fov.angleUp    = std::atan(tup);
+                    pv[e].fov.angleDown  = std::atan(tdn);
+                    declaredOffcenter = true;
+                    static std::atomic<bool> loggedOff[2]{false, false};
+                    if (!loggedOff[e].exchange(true))
+                        VRLOG("eye%d off-centre projection: rendered and declared "
+                              "[%.2f, %.2f] x [%.2f, %.2f] deg over the full image",
+                              (int)e, pv[e].fov.angleLeft * 57.2957795f,
+                              pv[e].fov.angleRight * 57.2957795f,
+                              pv[e].fov.angleDown * 57.2957795f,
+                              pv[e].fov.angleUp * 57.2957795f);
+                }
+            }
+
             // FOV asymmetry / off-center projection alignment:
             // If the runtime reports an asymmetric FOV (e.g. Pimax with parallel projections or canted panels),
             // the rendered image is symmetric covering [-baseH, +baseH]. We crop the swapchain subImage rect
@@ -4634,7 +4748,7 @@ void render_frame(IDXGISwapChain* swapchain)
             float aspect, baseH;
             eye_frustum_base((uint32_t)e, aspect, baseH);
             const float tanBase = std::tan(baseH);
-            if (tanBase > 1.0e-4f) {
+            if (tanBase > 1.0e-4f && fov_asymmetry_align() && !declaredOffcenter) {
                 const float rawL = g.lastView[e].fov.angleLeft;
                 const float rawR = g.lastView[e].fov.angleRight;
                 if (std::fabs(std::fabs(rawL) - std::fabs(rawR)) > 0.01f) {
@@ -5113,6 +5227,132 @@ void head_orientation(float q[4])
     ReleaseSRWLockShared(&g_poseLock);
 }
 
+// MATCH THE HEADSET'S VERTICAL FOV. Off by default because it changes the
+// shape of every rendered frame, and the setup it was written for (a very wide
+// headset on a square canvas) is not the one most people have.
+std::atomic<bool> g_matchVfov{false};
+
+// THE ASYMMETRY ALIGNMENT, and the reason it is switchable at all.
+//
+// The render is symmetric; the headset's frustum is not. So a sub-rectangle of
+// the rendered image is declared, holding exactly the angles the eye really
+// covers. That is arithmetic, and it has been checked: the rect maps onto the
+// declared angles to within a fifth of a pixel, and the pixels-per-tangent
+// agree on both axes, so there is no stretch in it.
+//
+// What CANNOT be checked from here is whether the runtime honours a projection
+// layer's subImage.imageRect. A runtime that ignores it shows the whole
+// symmetric image under a window declared ~1.5x narrower, and the world reads
+// as badly over-wide -- the exact complaint, on the exact hardware where the
+// asymmetry is large enough for it to matter. Turning this off declares the
+// symmetric frustum over the full image instead: geometrically exact for what
+// was rendered, and not aligned to the lens, which is what it was added to fix.
+//
+// So it is a discriminator, not a preference. If the FOV comes right with this
+// off, the crop is not being honoured and the fix belongs somewhere else.
+std::atomic<bool> g_alignAsym{true};
+
+// OFF-CENTRE PROJECTION. Render each eye at the frustum the runtime actually
+// reports for it, shear and all, instead of a symmetric one that encloses it.
+//
+// This is the correct thing to do and it is not the default, because under AER
+// it costs something real. The two eyes then look at genuinely different
+// angular regions -- on a Pimax at wide FOV, eye0 covers [-70, +42] and eye1
+// [-42, +70], overlapping over only about half their width. DIBR shift
+// synthesizes one eye from the other, so outside that overlap it has no source
+// and the outer wedge falls to the stale-eye warp instead. With a symmetric
+// render both eyes cover the union, so the shift can reach all of it.
+//
+// So: sharper and lens-exact, at the cost of the shift's outer coverage. Worth
+// having as a choice rather than a decision made for everybody.
+std::atomic<bool> g_offcenter{false};
+
+bool offcenter_projection() { return g_offcenter.load(std::memory_order_relaxed); }
+
+void set_offcenter_projection(bool on)
+{
+    if (g_offcenter.exchange(on, std::memory_order_relaxed) == on) return;
+    VRLOG("OFF-CENTRE PROJECTION -> %s", on ? "ON (per-eye asymmetric frustum)"
+                                            : "off (symmetric enclosing frustum)");
+}
+
+bool fov_asymmetry_align() { return g_alignAsym.load(std::memory_order_relaxed); }
+
+void set_fov_asymmetry_align(bool on)
+{
+    if (g_alignAsym.exchange(on, std::memory_order_relaxed) == on) return;
+    VRLOG("FOV ASYMMETRY ALIGN -> %s", on ? "ON (subImage crop, lens-aligned)"
+                                          : "off (symmetric, full image)");
+}
+
+bool match_headset_vfov() { return g_matchVfov.load(std::memory_order_relaxed); }
+
+void set_match_headset_vfov(bool on)
+{
+    if (g_matchVfov.exchange(on, std::memory_order_relaxed) == on) return;
+    VRLOG("MATCH HEADSET VFOV -> %s (headset V %.2f deg, H %.2f deg)",
+          on ? "ON" : "off", headset_vfov_deg(), headset_hfov_deg());
+}
+
+// The scaled vertical, the twin of render_hfov_deg(). Scale in TANGENT space
+// for the same reason spelled out there: eye_frustum_half_angles() applies the
+// identical factor when it builds the window we submit, and an angle-space
+// scale here would silently disagree with it for any scale != 1.
+float render_vfov_deg()
+{
+    const float vfov = headset_vfov_deg();
+    if (vfov <= 0.0f) return 0.0f;
+    const float s = composited_fov_scale();
+    if (s == 1.0f) return vfov;
+    float halfRad = vfov * 0.5f * 0.0174532925f;
+    if (halfRad > 1.5533f) halfRad = 1.5533f;   // 89 deg; keep tan() finite
+    return 2.0f * std::atan(std::tan(halfRad) * s) * 57.2957795f;
+}
+
+// THE FRUSTUM THIS EYE IS ACTUALLY RENDERED AT, as tangent bounds.
+//
+// THE single definition, and everything that has to agree about the shape of a
+// frame reads it: PROJ LOCK for the matrix it writes, the submission for the
+// angles it declares, the warp for its intrinsics, and DIBR shift for the
+// offset between the two eyes. They used to derive their own from half-angles,
+// which was fine while every frustum was symmetric and is exactly the kind of
+// agreement that rots the moment one is not.
+//
+// Tangents rather than angles because that is the space all four work in, and
+// because it is the space composited_fov_scale() multiplies in -- see
+// render_hfov_deg() for why that matters.
+//
+// Symmetric unless off-centre projection is on, in which case it is the
+// runtime's own per-eye frustum. False when no frustum has been reported yet.
+bool render_eye_frustum_tan(int eye, float& tl, float& tr, float& tu, float& td)
+{
+    if (eye < 0 || eye > 1) return false;
+
+    if (offcenter_projection()) {
+        const XrFovf& f = g.lastView[eye].fov;
+        if (std::fabs(f.angleLeft) + std::fabs(f.angleRight) > 0.01f) {
+            const float s = composited_fov_scale();
+            tl = std::tan(f.angleLeft)  * s;
+            tr = std::tan(f.angleRight) * s;
+            tu = std::tan(f.angleUp)    * s;
+            td = std::tan(f.angleDown)  * s;
+            return (tr - tl) > 1.0e-4f && (tu - td) > 1.0e-4f;
+        }
+        // No frustum yet: fall through to the symmetric answer rather than
+        // report failure, so a caller cannot end up with no projection at all.
+    }
+
+    float hh = 0.0f, vh = 0.0f;
+    eye_frustum_half_angles((uint32_t)eye, hh, vh);   // already scaled
+    if (!(hh > 1.0e-4f) || !(vh > 1.0e-4f)) return false;
+    tr = std::tan(hh); tl = -tr;
+    tu = std::tan(vh); td = -tu;
+    return true;
+}
+
+// Which eye this Present is rendering for real -- the other one is synthesized.
+// Needed by the projection builder, which has to know whose frustum to write.
+int render_eye() { return present_route_eye(); }
 float debug_eye_cant_deg() { return g_debugCantDeg.load(); }
 
 void set_debug_eye_cant_deg(float deg)
@@ -5120,6 +5360,37 @@ void set_debug_eye_cant_deg(float deg)
     if (deg < -15.0f) deg = -15.0f;
     if (deg >  15.0f) deg =  15.0f;
     g_debugCantDeg.store(deg);
+}
+
+// THE HEADSET'S OWN VERTICAL, by the same rule as the horizontal below.
+//
+// It exists because the vertical was never asked of the runtime at all: the
+// render's vertical half-angle came from the CANVAS ASPECT, so a square canvas
+// declared vh == hh whatever the panel actually shows. That is wrong in both
+// directions and the error grows with the FOV:
+//
+//   Pimax 8KX, wide     H half 70.14, V half 57.78  -> 43% of the vertical
+//                       tangent span rendered and never displayed
+//   Pimax 8KX, narrow   H half 50.14, V half 57.78  -> the opposite; the top
+//                       and bottom of the panel have no content at all
+//
+// Reported as the widest half x2, the same enclosing rule headset_hfov_deg()
+// documents below -- so a headset with an asymmetric vertical (most have more
+// panel below the optical axis than above) is covered rather than clipped.
+float headset_vfov_deg()
+{
+    float widestHalf = 0.0f;
+    int   valid = 0;
+    for (int e = 0; e < 2; ++e) {
+        const float up   = std::fabs(g.lastView[e].fov.angleUp);
+        const float down = std::fabs(g.lastView[e].fov.angleDown);
+        if (up + down > 0.01f) {
+            widestHalf = (std::max)(widestHalf, (std::max)(up, down));
+            ++valid;
+        }
+    }
+    if (valid == 0) return 0.0f;
+    return widestHalf * 2.0f * 57.2957795f;
 }
 
 float headset_hfov_deg()

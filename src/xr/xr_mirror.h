@@ -310,6 +310,58 @@ void  set_debug_eye_cant_deg(float deg);
 // frame locates the views. This is the raw headset HFOV.
 float headset_hfov_deg();
 
+// The same for the VERTICAL, which nothing used to ask for -- the render's
+// vertical half-angle came from the canvas aspect instead, so a square canvas
+// declared vh == hh whatever the panel showed. On a wide headset that renders
+// tens of degrees of vertical nobody sees; on a tall one it leaves the top and
+// bottom of the panel empty. 0 until the runtime has reported a frustum.
+float headset_vfov_deg();
+
+// Whether the render's VERTICAL FOV is taken from the headset (above) instead
+// of from the canvas aspect. Off by default: it changes the shape of every
+// rendered frame, and the case it was written for -- a very wide per-eye FOV on
+// a square canvas -- is not the common one.
+//
+// Both halves of the pair read this: PROJ LOCK for what it renders, and
+// eye_frustum_half_angles() for what it declares. Config file / Advanced tab.
+// Whether the per-eye FOV asymmetry is declared by cropping the submitted
+// subImage to the part of the symmetric render the eye actually covers.
+//
+// ON is correct and is what ships. It is switchable because it is the one link
+// in the FOV chain this side cannot verify: the arithmetic is checked, but
+// whether a runtime honours subImage.imageRect on a projection layer is the
+// runtime's business, and one that ignores it shows the whole image under a
+// window declared much narrower -- an over-wide world. Off declares the
+// symmetric frustum over the full image: exact for what was rendered, but not
+// aligned to the lens. See the note at g_alignAsym in xr_mirror.cpp.
+// OFF-CENTRE PROJECTION: render each eye at the runtime's own asymmetric
+// frustum instead of a symmetric one that encloses it. Correct, and off by
+// default because under AER it costs DIBR shift its outer coverage -- the two
+// eyes then overlap over only part of their width, and outside that overlap the
+// shift has no source. See the note at g_offcenter in xr_mirror.cpp.
+bool offcenter_projection();
+void set_offcenter_projection(bool on);
+
+// THE frustum this eye is rendered at, as tangent bounds, already scaled by
+// composited_fov_scale(). Every consumer that has to agree about the shape of a
+// frame reads this one function: PROJ LOCK, the layer submission, the warp's
+// intrinsics and DIBR shift's inter-eye offset. False before the first frustum.
+bool render_eye_frustum_tan(int eye, float& tl, float& tr, float& tu, float& td);
+
+// Which eye this Present renders for real; the other is synthesized.
+int render_eye();
+
+bool fov_asymmetry_align();
+void set_fov_asymmetry_align(bool on);
+
+bool match_headset_vfov();
+void set_match_headset_vfov(bool on);
+
+// headset_vfov_deg() with composited_fov_scale() applied in tangent space --
+// the vertical twin of render_hfov_deg(), and what PROJ LOCK builds m[5] from
+// when the option above is on.
+float render_vfov_deg();
+
 // Render-plane horizontal FOV in degrees, after the render-size shrink.
 // This is the frustum actually submitted to the compositor -- the FOV cone the
 // game content must fill for a geometrically correct VR image.

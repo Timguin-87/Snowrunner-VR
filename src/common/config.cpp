@@ -331,6 +331,20 @@ constexpr bool kDefaultTruckYawLock   = false;
 constexpr int  kDefaultForceResW = 0;
 constexpr int  kDefaultForceResH = 0;
 
+// The render's vertical FOV from the headset rather than from the canvas
+// aspect. OFF, because it changes the shape of every rendered frame and the
+// setup it was written for -- a very wide per-eye FOV on a square canvas -- is
+// not the common one. See xr_mirror.h.
+constexpr bool kDefaultMatchHeadsetVfov = false;
+// The subImage crop that aligns the submitted FOV with the lens. ON: it is
+// correct, and it is the shipping behaviour. See xr_mirror.h for why it is a
+// switch at all -- it is the one link in the FOV chain this side cannot verify.
+constexpr bool kDefaultAlignFovAsymmetry = true;
+// Per-eye off-centre projection. OFF: it is the more correct render, and under
+// AER it costs DIBR shift its outer coverage, so it is a trade rather than an
+// improvement. See xr_mirror.h.
+constexpr bool kDefaultOffcenterProjection = false;
+
 constexpr bool kDefaultCullShaders = false;
 // The cab glass, skipped by default. It refracts the scene behind it but writes
 // no depth, so it is wrong under any reprojection and awkward in stereo even
@@ -350,6 +364,9 @@ struct Settings {
     float    mapWindowShrink    = kDefaultMapWindowShrink;
     bool     hideHud            = kDefaultHideHud;
     float    verticalRecenter   = kDefaultVerticalRecenter;
+    bool     offcenterProjection = kDefaultOffcenterProjection;
+    bool     alignFovAsymmetry  = kDefaultAlignFovAsymmetry;
+    bool     matchHeadsetVfov   = kDefaultMatchHeadsetVfov;
     bool     warpEnabled        = kDefaultWarpEnabled;
     int      warpType           = kDefaultWarpType;
     float    debugEyeCantDeg    = kDefaultDebugEyeCantDeg;
@@ -476,6 +493,32 @@ std::string format_file(const Settings& s)
         "MapWindowShrink=%.2f\n"
         "# VerticalRecenter: pose-pitch vertical image recenter, radians (-0.5 - 0.5)\n"
         "VerticalRecenter=%.4f\n"
+        "# OffcenterProjection: true, false. Render each eye at the exact\n"
+        "# asymmetric frustum the runtime reports for it, instead of a\n"
+        "# symmetric one wide enough to contain it. Strictly more correct and\n"
+        "# it stops rendering the surplus -- on a wide headset that is a third\n"
+        "# of every frame drawn and thrown away.\n"
+        "# THE TRADE: the two eyes then cover different angles, overlapping\n"
+        "# over only part of their width, and DIBR shift synthesizes one eye\n"
+        "# from the other -- so outside that overlap it has no source and the\n"
+        "# outer edge falls to the stale-eye warp. Best with DIBR shift off.\n"
+        "OffcenterProjection=%s\n"
+        "# AlignFovAsymmetry: true, false. Your headset's per-eye frustum is\n"
+        "# asymmetric (more FOV toward the temple than the nose); the render is\n"
+        "# symmetric. TRUE declares a sub-rectangle of the render holding\n"
+        "# exactly the angles that eye covers, so the image lines up with the\n"
+        "# lens. Leave it TRUE -- the arithmetic is verified. Turn it FALSE\n"
+        "# only to test a runtime that may be ignoring the sub-rectangle: if\n"
+        "# the world stops looking too wide with this off, that is the cause.\n"
+        "AlignFovAsymmetry=%s\n"
+        "# MatchHeadsetVerticalFov: true, false. Take the rendered VERTICAL\n"
+        "# FOV from the headset instead of from the render canvas aspect. On a\n"
+        "# square canvas the canvas says vh == hh, so a headset whose panel is\n"
+        "# not as tall as it is wide has the surplus rendered and thrown away,\n"
+        "# and one that is TALLER gets empty bands top and bottom. Both grow\n"
+        "# with the FOV, so this matters most on wide headsets. Off leaves the\n"
+        "# behaviour exactly as it was.\n"
+        "MatchHeadsetVerticalFov=%s\n"
         "# WarpEnabled: true, false. Bring the eye that was NOT rendered this\n"
         "# frame to the current instant, rather than resubmitting it a frame\n"
         "# stale. Off is a diagnostic: if a judder survives with this false,\n"
@@ -588,6 +631,9 @@ std::string format_file(const Settings& s)
         s.uiPlaneDistance,
         s.renderFovScale, s.mapWindowShrink,
         s.verticalRecenter,
+        s.offcenterProjection ? "true" : "false",
+        s.alignFovAsymmetry ? "true" : "false",
+        s.matchHeadsetVfov ? "true" : "false",
         s.warpEnabled ? "true" : "false",
         wtKey,
         s.debugEyeCantDeg,
@@ -760,6 +806,24 @@ void init()
         if (parse_float(v, f) && f >= -0.5f && f <= 0.5f) s.verticalRecenter = f; else note_invalid("VerticalRecenter", v);
     } else anyMissing = true;
 
+    if (kv_find(kv, "OffcenterProjection", v)) {
+        if (_stricmp(v.c_str(), "true") == 0 || v == "1")       s.offcenterProjection = true;
+        else if (_stricmp(v.c_str(), "false") == 0 || v == "0") s.offcenterProjection = false;
+        else note_invalid("OffcenterProjection", v);
+    } else anyMissing = true;
+
+    if (kv_find(kv, "AlignFovAsymmetry", v)) {
+        if (_stricmp(v.c_str(), "true") == 0 || v == "1")       s.alignFovAsymmetry = true;
+        else if (_stricmp(v.c_str(), "false") == 0 || v == "0") s.alignFovAsymmetry = false;
+        else note_invalid("AlignFovAsymmetry", v);
+    } else anyMissing = true;
+
+    if (kv_find(kv, "MatchHeadsetVerticalFov", v)) {
+        if (_stricmp(v.c_str(), "true") == 0 || v == "1")       s.matchHeadsetVfov = true;
+        else if (_stricmp(v.c_str(), "false") == 0 || v == "0") s.matchHeadsetVfov = false;
+        else note_invalid("MatchHeadsetVerticalFov", v);
+    } else anyMissing = true;
+
     if (kv_find(kv, "WarpEnabled", v)) {
         if (_stricmp(v.c_str(), "true") == 0 || v == "1")       s.warpEnabled = true;
         else if (_stricmp(v.c_str(), "false") == 0 || v == "0") s.warpEnabled = false;
@@ -877,6 +941,9 @@ void init()
     xr::set_render_fov_scale(s.renderFovScale);
     xr::set_map_window_shrink(s.mapWindowShrink);
     xr::set_vertical_recenter(s.verticalRecenter);
+    xr::set_offcenter_projection(s.offcenterProjection);
+    xr::set_fov_asymmetry_align(s.alignFovAsymmetry);
+    xr::set_match_headset_vfov(s.matchHeadsetVfov);
     xr::set_warp_enabled(s.warpEnabled);
     xr::set_warp_type(s.warpType);
     xr::set_debug_eye_cant_deg(s.debugEyeCantDeg);
@@ -946,6 +1013,9 @@ void save()
     s.renderFovScale  = xr::render_fov_scale();
     s.mapWindowShrink = xr::map_window_shrink();
     s.verticalRecenter = xr::vertical_recenter();
+    s.offcenterProjection = xr::offcenter_projection();
+    s.alignFovAsymmetry = xr::fov_asymmetry_align();
+    s.matchHeadsetVfov = xr::match_headset_vfov();
     s.warpEnabled      = xr::warp_enabled();
     s.warpType         = xr::warp_type();
     s.debugEyeCantDeg = xr::debug_eye_cant_deg();

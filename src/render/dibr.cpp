@@ -56,13 +56,13 @@ cbuffer Params : register(b0)
     float  focalPx;
     float  ipd;
     float  eyeSign;
+    float  eyeOffsetPx;
     float  projA;
     float  projB;
     float  maxSplat;
     float  fillMode;
     float  hasFill;      // is FillTex bound and meaningful this frame
     float  hasMirror;    // is MirrorTex bound this frame
-    float  _pad;
 };
 
 SamplerState        LinSmp   : register(s0);
@@ -120,8 +120,11 @@ void CS_Scatter(uint3 tid : SV_DispatchThreadID)
     float disp  = disparity_at(tid.xy);
     float dispN = (tid.x + 1 < (uint)texSize.x) ? disparity_at(uint2(tid.x + 1, tid.y)) : disp;
 
-    int x0 = (int)round((float)tid.x + eyeSign * disp);
-    int x1 = (int)round((float)(tid.x + 1) + eyeSign * dispN);
+    // eyeOffsetPx is the constant part of the mapping (zero unless the two
+    // eyes were rendered at different, off-centre frusta); the disparity is
+    // the part that depends on depth.
+    int x0 = (int)round((float)tid.x + eyeOffsetPx + eyeSign * disp);
+    int x1 = (int)round((float)(tid.x + 1) + eyeOffsetPx + eyeSign * dispN);
 
     // Only splat across the span when this pixel and its neighbour lie on the
     // SAME surface. Across a silhouette the two disparities differ wildly, and
@@ -380,15 +383,16 @@ struct CB {
     float focalPx;
     float ipd;
     float eyeSign;
+    float eyeOffsetPx;
     float projA;
     float projB;
     float maxSplat;
     float fillMode;
     float hasFill;
     float hasMirror;
-    // 11 live floats = 44 bytes; pad to the next 16-byte multiple. The HLSL
-    // side rounds its own cbuffer up the same way, so only the 11 matter.
-    float pad[1];
+    // 12 live floats = 48 bytes, already a 16-byte multiple. MUST stay in the
+    // same order as the HLSL cbuffer above -- a mismatch here does not fail to
+    // compile, it silently feeds every field the neighbouring one's value.
 };
 // D3D11 rejects a constant buffer whose ByteWidth is not a multiple of 16.
 // Getting this wrong fails CreateBuffer silently and leaves a null CB behind.
@@ -659,6 +663,7 @@ ID3D11Texture2D* warp(ID3D11DeviceContext* ctx,
     cb->focalPx = p.focalPx;
     cb->ipd     = p.ipd;
     cb->eyeSign = p.eyeSign;
+    cb->eyeOffsetPx = p.eyeOffsetPx;
     cb->projA   = p.projA;
     cb->projB   = p.projB;
     cb->maxSplat = 48.0f;

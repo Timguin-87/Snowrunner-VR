@@ -39,6 +39,7 @@ add_library(dxgi_proxy SHARED
     src/proxy/dxgi_stubs.asm
     src/proxy/dxgi.def
     src/common/log.cpp
+    src/common/crash_log.cpp
     src/common/config.cpp
     src/hooks/pattern_scan.cpp
     src/hooks/swapchain_hook.cpp
@@ -71,6 +72,10 @@ add_library(dxgi_proxy SHARED
 )
 
 set_target_properties(dxgi_proxy PROPERTIES OUTPUT_NAME "dxgi" PREFIX "")
+# A LINKER MAP, because the crash handler reports module+offset (see
+# common/crash_log.h) and this is what turns an offset from somebody else's log
+# back into a function. Keep the map for any build that is given out.
+target_link_options(dxgi_proxy PRIVATE /MAP)
 target_include_directories(dxgi_proxy PRIVATE src ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
 target_compile_definitions(dxgi_proxy PRIVATE
     WIN32_LEAN_AND_MEAN NOMINMAX

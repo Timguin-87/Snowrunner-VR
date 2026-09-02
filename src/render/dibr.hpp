@@ -31,6 +31,20 @@ struct WarpParams {
     // synthesized sits at -offset, so the direction is settled by definition
     // rather than by a chain of tuned conventions.
     float eyeSign  = 1.0f;
+    // CONSTANT pixel offset between the two eyes' frusta, added to the shift.
+    //
+    // Zero for the whole life of this file, and it had to be: the header above
+    // says the two eyes differ by a pure lateral offset with IDENTICAL frusta,
+    // which makes the mapping a pure depth-dependent disparity. Off-centre
+    // projection breaks that half of the assumption -- each eye is then
+    // rendered at its own sheared frustum -- but not the useful half: the two
+    // frusta are mirror images with the same tangent span, so they still differ
+    // by a pure horizontal translation, just no longer a zero one.
+    //
+    // So the mapping stays dest_x = src_x + const +/- disparity, and this is
+    // the const. Set from the difference between the eyes' frustum centres; see
+    // dibr_eye_pixel_offset() in xr_mirror.cpp.
+    float eyeOffsetPx = 0.0f;
     float projA    = 0.0f;     // depth row A  (z_ndc = A + B/z_view)
     float projB    = 0.1f;     // depth row B  == near plane
     // How disocclusions are filled:

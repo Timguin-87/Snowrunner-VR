@@ -1129,8 +1129,18 @@ void depth_probe_on_present(IDXGISwapChain* swapchain)
     // A frame with no capture means the warp would reuse the previous frame's
     // depth -- the WRONG EYE. Surface that rather than letting it degrade
     // silently into flickering disocclusions.
+    //
+    // COUNTED ONLY WHEN SOMETHING WANTS THE DEPTH. capture_if_pass_ended()
+    // returns immediately unless DIBR shift or the 6-DoF warp is on, so with
+    // both off nothing is ever captured -- and this used to report that as
+    // "600/600 frames MISSED" every ten seconds. A clean 100% is the signature
+    // this file elsewhere teaches you to read as a broken comparison, so the
+    // line was not merely noise: it accused the acquisition path of failing in
+    // exactly the configuration where it was correctly doing nothing, in the
+    // logs people attach to bug reports.
+    const bool wanted = depth_capture_wanted();
     const int total = g_totalFrames.fetch_add(1) + 1;
-    if (!g_capturedThisFrame.load()) g_missedFrames.fetch_add(1);
+    if (wanted && !g_capturedThisFrame.load()) g_missedFrames.fetch_add(1);
     if (g_depthMixed.load()) g_mixedFrames.fetch_add(1);
     if ((total % 600) == 0) {
         const int missed = g_missedFrames.exchange(0);
