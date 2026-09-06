@@ -291,6 +291,8 @@ constexpr float kDefaultUiPlaneSize     = 8.00f;
 constexpr int   kDefaultUiPlaneMode     = xr::kUiPlaneForward;
 constexpr float kDefaultUiPlaneDistance = 7.00f;
 constexpr float kDefaultRenderFovScale  = 1.0f;
+// Defaults to disabled, because it is an experimental feauture right now.
+constexpr bool  kDefaultWorldMarkerFix  = false;
 // The map/garage window, as a fraction of the render size. Small enough to sit
 // inside the sweet spot of the lenses rather than needing eye movement to read
 // its corners -- it is a flat screen being looked AT, not a view being looked
@@ -361,6 +363,7 @@ struct Settings {
     int      uiPlaneMode        = kDefaultUiPlaneMode;
     float    uiPlaneDistance    = kDefaultUiPlaneDistance;
     float    renderFovScale     = kDefaultRenderFovScale;
+    bool     worldMarkerFix     = kDefaultWorldMarkerFix;
     float    mapWindowShrink    = kDefaultMapWindowShrink;
     bool     hideHud            = kDefaultHideHud;
     float    verticalRecenter   = kDefaultVerticalRecenter;
@@ -491,6 +494,10 @@ std::string format_file(const Settings& s)
         "# MapWindowShrink: map/garage window size as a fraction of the render\n"
         "# size above (0.0 - 1.0) -- not of the headset native FOV.\n"
         "MapWindowShrink=%.2f\n"
+        "# WorldMarkerFix: keeps world-projected markers (waypoints, building icons)\n"
+        "# correctly positioned in the scene instead of pinned flat to the HUD plane.\n"
+        "# Experimental right now. Will cause other UI Elements to flicker.\n"
+        "WorldMarkerFix=%s\n"
         "# VerticalRecenter: pose-pitch vertical image recenter, radians (-0.5 - 0.5)\n"
         "VerticalRecenter=%.4f\n"
         "# OffcenterProjection: true, false. Render each eye at the exact\n"
@@ -630,6 +637,7 @@ std::string format_file(const Settings& s)
         s.uiPlaneMode == xr::kUiPlaneForward ? "forward" : "headlocked",
         s.uiPlaneDistance,
         s.renderFovScale, s.mapWindowShrink,
+        s.worldMarkerFix ? "true" : "false",
         s.verticalRecenter,
         s.offcenterProjection ? "true" : "false",
         s.alignFovAsymmetry ? "true" : "false",
@@ -801,6 +809,12 @@ void init()
         if (parse_float(v, f) && f >= 0.05f && f <= 1.0f) s.mapWindowShrink = f; else note_invalid("MapWindowShrink", v);
     } else anyMissing = true;
 
+    if (kv_find(kv, "WorldMarkerFix", v)) {
+        if (_stricmp(v.c_str(), "true") == 0 || v == "1")      s.worldMarkerFix = true;
+        else if (_stricmp(v.c_str(), "false") == 0 || v == "0") s.worldMarkerFix = false;
+        else note_invalid("WorldMarkerFix", v);
+    }
+
     if (kv_find(kv, "VerticalRecenter", v)) {
         float f;
         if (parse_float(v, f) && f >= -0.5f && f <= 0.5f) s.verticalRecenter = f; else note_invalid("VerticalRecenter", v);
@@ -940,6 +954,7 @@ void init()
     xr::set_ui_plane_distance(s.uiPlaneDistance);
     xr::set_render_fov_scale(s.renderFovScale);
     xr::set_map_window_shrink(s.mapWindowShrink);
+    hooks::set_world_marker_fix_enabled(s.worldMarkerFix);
     xr::set_vertical_recenter(s.verticalRecenter);
     xr::set_offcenter_projection(s.offcenterProjection);
     xr::set_fov_asymmetry_align(s.alignFovAsymmetry);
@@ -1012,6 +1027,7 @@ void save()
     s.uiPlaneDistance = xr::ui_plane_distance();
     s.renderFovScale  = xr::render_fov_scale();
     s.mapWindowShrink = xr::map_window_shrink();
+    s.worldMarkerFix = hooks::world_marker_fix_enabled();
     s.verticalRecenter = xr::vertical_recenter();
     s.offcenterProjection = xr::offcenter_projection();
     s.alignFovAsymmetry = xr::fov_asymmetry_align();

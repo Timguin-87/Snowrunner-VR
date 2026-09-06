@@ -754,6 +754,17 @@ void draw_settings_tab()
                           "behaviour). Forward: stays where you put it in the\n"
                           "world, so you can look away from it.");
 
+    // World Marker Fix Checkbox
+    bool worldMarkerFix = hooks::world_marker_fix_enabled();
+    if (ImGui::Checkbox("World marker fix (experimental)", &worldMarkerFix)) {
+        hooks::set_world_marker_fix_enabled(worldMarkerFix);
+        vrcfg::save();
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Keeps world-projected markers (waypoints, building icons)\n"
+                          "correctly positioned in the scene instead of pinned flat to the HUD plane.\n"
+                          "Experimental right now. Will cause other UI Elements to flicker.");
+
     ImGui::Separator();
 
     // BASE render size. Shrinks the rendered FOV and the compositor window
