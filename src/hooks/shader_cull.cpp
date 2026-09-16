@@ -378,6 +378,18 @@ std::atomic<uint64_t> g_roleHash[kCullRoleCount][kMaxRoleHashes] = {
       std::atomic<uint64_t>{0x24F466B2EBC03458ull}, std::atomic<uint64_t>{0xAA11C50599F72059ull}, std::atomic<uint64_t>{0x9B5B633B013DFF9Cull}
     },
     // kCullWinchMarker -- the winch anchor-point icons, found 2026-08-24.
+    //
+    // POSSIBLY STALE (found while testing an unrelated feature, 2026-09-06):
+    // these five hashes appear to no longer match any pixel shader the winch
+    // markers currently use. Two independent tests pointed at this --
+    // (1) moving them into kCullUi and removing the real kCullUi hashes left
+    // the winch icons uncaught (nothing fell through to the plane the way a
+    // real match would), and (2) with the array back to stock, the winch
+    // markers show visible DIBR-shift depth-reprojection artifacts, which
+    // redirect_if_winch_marker()'s capture-and-recomposite is specifically
+    // there to prevent -- i.e. the protection is not engaging. Not
+    // investigated further; a re-run of the shader search (see the "Shader
+    // Cull" tab / role_of_hash()) would be the way to find the current ones.
     { std::atomic<uint64_t>{0xEDF24FDD6650E8FDull},
       std::atomic<uint64_t>{0xB7DE76615CE84794ull},
       std::atomic<uint64_t>{0xA8B2A29B050BD59Cull},

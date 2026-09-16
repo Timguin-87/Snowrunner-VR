@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 #include <unordered_set>
+#include <unordered_map>
 #include <vector>
 
 #include <MinHook.h>
@@ -23,9 +24,10 @@ using Microsoft::WRL::ComPtr;
 namespace hooks {
 namespace {
 
-constexpr int kIdxMap                = 14;  // ID3D11DeviceContext vtable
-constexpr int kIdxUnmap              = 15;
-constexpr int kIdxUpdateSubresource  = 48;
+constexpr int kIdxMap                    = 14;  // ID3D11DeviceContext vtable
+constexpr int kIdxUnmap                  = 15;
+constexpr int kIdxPSSetConstantBuffers   = 16;
+constexpr int kIdxUpdateSubresource      = 48;
 constexpr int kIdxUpdateSubresource1 = 116; // ID3D11DeviceContext1 vtable (verified against
                                              // the SDK header: FinishCommandList=114,
                                              // CopySubresourceRegion1=115, UpdateSubresource1=116.
@@ -49,6 +51,8 @@ constexpr int kCamCBSize      = 352;
 std::atomic<bool> g_hooked{false};
 std::atomic<bool> g_dumped{false};
 
+std::atomic<bool> g_worldMarkerFix{true};   // config is authoritative
+
 // Snapshot of the last main-camera CB (DIBR shift needs the projection to turn
 // reverse-Z depth into view-space Z; proj = viewProj * inverse(view)).
 SRWLOCK g_camSnapLock = SRWLOCK_INIT;
@@ -60,7 +64,11 @@ std::atomic<bool> g_camSnapValid{false};
 using PFN_UpdateSubresource = void(STDMETHODCALLTYPE*)(
     ID3D11DeviceContext*, ID3D11Resource*, UINT, const D3D11_BOX*,
     const void*, UINT, UINT);
-PFN_UpdateSubresource real_UpdateSubresource = nullptr;
+// Immediate/deferred split -- confirmed necessary: the UI is written on a
+// deferred context, so a single "real" pointer from the immediate context
+// alone left the marker CB's writes completely unhooked.
+PFN_UpdateSubresource real_UpdateSubresource_imm = nullptr;
+PFN_UpdateSubresource real_UpdateSubresource_def = nullptr;
 
 // How far a constant buffer's eye may sit from the logic-camera eye and still
 // be the player camera. Wide (5 units) on purpose: the engine renders several
@@ -151,6 +159,182 @@ bool is_cam352(ID3D11Resource* res)
     (cam ? g_camBufs : g_notCam).insert(res);
     ReleaseSRWLockExclusive(&g_cacheLock);
     return cam;
+}
+
+// --- known marker constant-buffer tracking --------------------------------
+// Identifies CB_DYNAMIC_UI (the per-draw UI transform buffer -- confirmed via
+// D3DReflect to be 144 bytes, bound at PS slot 4) by CORRELATION rather than
+// by size: size alone collides with CB_INSTANCE (vehicle physics), which
+// happens to also be 144 bytes. Instead we tag a buffer the moment it is
+// bound at slot 4 while one of our two known world-marker pixel shaders is
+// the active one.
+constexpr uint64_t kMarkerHashes[] = { 0x182934D7084AB9D8ull, 0xC8C30095AB7B056Dull };
+constexpr int kUiCbSlot = kMarkerCbSlot;
+
+bool is_marker_hash(uint64_t h)
+{
+    for (uint64_t k : kMarkerHashes) if (k == h) return true;
+    return false;
+}
+
+struct MarkerCbEntry {
+    uint64_t hash = 0;
+    float x = 0.0f;
+    float y = 0.0f;
+    uint64_t lastSeenFrame = 0;
+};
+
+uint64_t g_markerCbFrame = 0;
+constexpr uint64_t kMarkerCbMaxAgeFrames = 300;   // ~5s at 60fps -- memory hygiene only,
+                                                    // NOT relied on for correctness (see
+                                                    // marker_cb_position's freshness check).
+std::unordered_map<void*, MarkerCbEntry> g_markerCbMap;
+SRWLOCK g_markerCbLock = SRWLOCK_INIT;
+
+void register_marker_cb(void* buf, uint64_t hash)
+{
+    if (!buf) return;
+    AcquireSRWLockExclusive(&g_markerCbLock);
+    MarkerCbEntry& e = g_markerCbMap[buf];
+    e.hash = hash;
+    e.lastSeenFrame = g_markerCbFrame;
+    ReleaseSRWLockExclusive(&g_markerCbLock);
+}
+
+bool marker_cb_hash(void* buf, uint64_t& outHash)
+{
+    if (!buf) return false;
+    AcquireSRWLockExclusive(&g_markerCbLock);
+    auto it = g_markerCbMap.find(buf);
+    bool found = (it != g_markerCbMap.end());
+    if (found) outHash = it->second.hash;
+    ReleaseSRWLockExclusive(&g_markerCbLock);
+    return found;
+}
+
+// --- static vs dynamic position classification ----------------------------
+// Byte offsets 12/28 (float index 3/7) within the 144-byte CB_DYNAMIC_UI
+// buffer are the screen X/Y -- confirmed for one clean sample, but later,
+// broader logging (2026-09-05) also showed the SAME shaders occasionally
+// carrying values in the tens of thousands, and even NaN/absurd bit patterns
+// -- almost certainly a different use of the same generic buffer/shader
+// (view-space data, or reads racing a write), not a real screen position.
+// kUiPosPlausibleMin/Max reject those before they ever reach the position
+// tables: a real screen coordinate on this canvas is comfortably within a
+// few thousand pixels either side of zero, nothing like 10s of thousands.
+constexpr int kUiPosXFloatIdx = 3;
+constexpr int kUiPosYFloatIdx = 7;
+constexpr float kUiPosEpsilon = 0.05f;   // guards against harmless float noise, not real movement
+constexpr float kUiPosPlausibleMin = -256.0f;   // small negative margin (off-screen edges)
+constexpr float kUiPosPlausibleMax = 4096.0f;   // canvas is 3072x3072 -- generous headroom
+
+bool is_plausible_ui_pos(float x, float y, float f2)
+{
+	//return f2 == 0.0f && std::isfinite(x) && std::isfinite(y) && std::isfinite(x) && std::isfinite(y) && x > kUiPosPlausibleMin && x < kUiPosPlausibleMax && y > kUiPosPlausibleMin && y < kUiPosPlausibleMax;
+    return std::isfinite(x) && std::isfinite(y) && x > kUiPosPlausibleMin && x < kUiPosPlausibleMax && y > kUiPosPlausibleMin && y < kUiPosPlausibleMax;
+}
+
+void note_marker_cb_position(void* buf, float x, float y)
+{
+    AcquireSRWLockExclusive(&g_markerCbLock);
+    auto it = g_markerCbMap.find(buf);
+    if (it != g_markerCbMap.end()) {   // must already be registered via PSSetConstantBuffers
+        it->second.x = x;
+        it->second.y = y;
+        it->second.lastSeenFrame = g_markerCbFrame;
+    }
+    ReleaseSRWLockExclusive(&g_markerCbLock);
+}
+
+bool marker_cb_position(void* buf, float& x, float& y)
+{
+    AcquireSRWLockExclusive(&g_markerCbLock);
+    auto it = g_markerCbMap.find(buf);
+    bool found = (it != g_markerCbMap.end());
+    if (found) { x = it->second.x; y = it->second.y; }
+    ReleaseSRWLockExclusive(&g_markerCbLock);
+    return found;
+}
+
+void evict_stale_marker_cbs()
+{
+    AcquireSRWLockExclusive(&g_markerCbLock);
+    for (auto it = g_markerCbMap.begin(); it != g_markerCbMap.end(); ) {
+        if (g_markerCbFrame - it->second.lastSeenFrame > kMarkerCbMaxAgeFrames)
+            it = g_markerCbMap.erase(it);
+        else
+            ++it;
+    }
+    ReleaseSRWLockExclusive(&g_markerCbLock);
+}
+
+constexpr int kMaxUiPositions = 4096; // per Swap
+struct PosSet {
+    float x[kMaxUiPositions];
+    float y[kMaxUiPositions];
+    int   count = 0;
+};
+PosSet g_uiPosPrev, g_uiPosCur;
+SRWLOCK g_uiPosLock = SRWLOCK_INIT;
+
+void note_ui_position_this_frame(float x, float y)
+{
+    AcquireSRWLockExclusive(&g_uiPosLock);
+    if (g_uiPosCur.count < kMaxUiPositions) {
+        g_uiPosCur.x[g_uiPosCur.count] = x;
+        g_uiPosCur.y[g_uiPosCur.count] = y;
+        ++g_uiPosCur.count;
+    }
+    ReleaseSRWLockExclusive(&g_uiPosLock);
+}
+
+bool position_was_static(float x, float y)
+{
+    AcquireSRWLockShared(&g_uiPosLock);
+    if (g_uiPosPrev.count == 0) {
+        // No comparison data yet (first frame(s), or a gap where
+        // in_gameplay() was false) -- default to the safe direction
+        // (today's behaviour) rather than "everything looks dynamic".
+        ReleaseSRWLockShared(&g_uiPosLock);
+        return true;
+    }
+    bool found = false;
+    for (int i = 0; i < g_uiPosPrev.count; ++i) {
+        if (std::fabs(g_uiPosPrev.x[i] - x) < kUiPosEpsilon &&
+            std::fabs(g_uiPosPrev.y[i] - y) < kUiPosEpsilon) { found = true; break; }
+    }
+    ReleaseSRWLockShared(&g_uiPosLock);
+    return found;
+}
+
+// PSSetConstantBuffers hook: catches WHICH buffer is bound, while
+// shader_cull.cpp's PSSetShader hook (already installed elsewhere) tells us
+// WHICH shader is currently active via hooks::current_draw_hash(). Same
+// immediate/deferred vtable split as every other hook in this codebase --
+// the UI is recorded on a deferred context, so a hook on the immediate
+// vtable alone would miss it entirely. Gated to in_gameplay(): the menu/
+// loading screen alone rebinds this slot constantly.
+using PFN_PSSetConstantBuffers = void(STDMETHODCALLTYPE*)(
+    ID3D11DeviceContext*, UINT, UINT, ID3D11Buffer* const*);
+PFN_PSSetConstantBuffers real_PSSetConstantBuffers_imm = nullptr;
+PFN_PSSetConstantBuffers real_PSSetConstantBuffers_def = nullptr;
+
+void STDMETHODCALLTYPE Detour_PSSetConstantBuffers(
+    ID3D11DeviceContext* ctx, UINT startSlot, UINT numBuffers, ID3D11Buffer* const* buffers)
+{
+    PFN_PSSetConstantBuffers fn = (ctx->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE)
+        ? real_PSSetConstantBuffers_imm
+        : (real_PSSetConstantBuffers_def ? real_PSSetConstantBuffers_def : real_PSSetConstantBuffers_imm);
+    fn(ctx, startSlot, numBuffers, buffers);
+
+    if (!hooks::in_gameplay()) return;
+    if ((int)startSlot > kUiCbSlot || (int)(startSlot + numBuffers) <= kUiCbSlot) return;
+    ID3D11Buffer* buf = buffers[kUiCbSlot - startSlot];
+    if (!buf) return;
+
+    const uint64_t h = hooks::current_draw_hash();
+    if (!is_marker_hash(h)) return;
+    register_marker_cb((void*)buf, h);
 }
 
 // Both our own rotations are OFF: we now inject the HMD look into the game's
@@ -421,6 +605,10 @@ void STDMETHODCALLTYPE Detour_UpdateSubresource(
     ID3D11DeviceContext* ctx, ID3D11Resource* dst, UINT sub, const D3D11_BOX* box,
     const void* src, UINT rowPitch, UINT depthPitch)
 {
+    PFN_UpdateSubresource real = (ctx->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE)
+        ? real_UpdateSubresource_imm
+        : (real_UpdateSubresource_def ? real_UpdateSubresource_def : real_UpdateSubresource_imm);
+
     if (is_cam352(dst) && src) {
         const bool mainCam = is_main_cam(src, kCamCBSize);
         note_camera_commit(ctx, mainCam);
@@ -431,11 +619,31 @@ void STDMETHODCALLTYPE Detour_UpdateSubresource(
             alignas(16) float copy[kCamCBSize/4];
             std::memcpy(copy, src, kCamCBSize);
             apply_rotation(copy, "UpdateSubresource");
-            real_UpdateSubresource(ctx, dst, sub, box, copy, rowPitch, depthPitch);
+            real(ctx, dst, sub, box, copy, rowPitch, depthPitch);
             return;
         }
     }
-    real_UpdateSubresource(ctx, dst, sub, box, src, rowPitch, depthPitch);
+
+    // Marker CB write. Confirmed this is the ONLY path CB_DYNAMIC_UI is ever
+    // written through for our two marker shaders -- Map/Unmap and
+    // UpdateSubresource1 never see it. Byte offsets 12 (X) and 28 (Y) within
+    // the 144-byte buffer are the screen-position floats -- IF plausible;
+    // see is_plausible_ui_pos() for why that check exists.
+    uint64_t uiHash = 0;
+    if (src && marker_cb_hash((void*)dst, uiHash) && hooks::in_gameplay()) {
+        const float* f = reinterpret_cast<const float*>(src);
+        const float x = f[kUiPosXFloatIdx];
+        const float y = f[kUiPosYFloatIdx];
+        if (is_plausible_ui_pos(x, y, f[2])) {
+            note_marker_cb_position((void*)dst, x, y);
+            note_ui_position_this_frame(x, y);
+        }
+        // else: not a real screen position (garbage/other use of this
+        // buffer/shader) -- skip. marker_cb_position() then stays at
+        // whatever it last validly held, or "not found" if never valid.
+    }
+
+    real(ctx, dst, sub, box, src, rowPitch, depthPitch);
 }
 
 // --- UpdateSubresource1 (ID3D11DeviceContext1) — the engine uses this heavily ---
@@ -502,6 +710,13 @@ void STDMETHODCALLTYPE Detour_Unmap(ID3D11DeviceContext* ctx, ID3D11Resource* re
 }
 
 } // namespace
+
+bool marker_cb_position_is_dynamic(void* buf)
+{
+    float x = 0.0f, y = 0.0f;
+    if (!marker_cb_position(buf, x, y)) return false;   // not a tracked marker CB
+    return !position_was_static(x, y);
+}
 
 bool main_camera_matrices(float view[16], float viewProj[16])
 {
@@ -622,13 +837,21 @@ void install_cbuffer_hook(IDXGISwapChain* swapchain)
 
     void** vt = *reinterpret_cast<void***>(ctx.Get());
 
+    // Deferred-context vtable, for PSSetConstantBuffers and UpdateSubresource
+    // -- the UI is recorded on a deferred context, so a hook on the
+    // immediate vtable alone would miss every UI-related bind/write.
+    ComPtr<ID3D11DeviceContext> defProbe;
+    dev->CreateDeferredContext(0, &defProbe);
+    void** vtDef = defProbe ? *reinterpret_cast<void***>(defProbe.Get()) : nullptr;
+    if (!vtDef) VRLOG("cbuffer hook: CreateDeferredContext FAILED -- deferred-side hooks skipped");
+
     // Idempotent: MH_ERROR_ALREADY_CREATED/MH_ERROR_ENABLED mean a PRIOR call
     // already hooked this address successfully -- still live and working, not
     // a failure. Without this, a retry (install_cbuffer_hook is effectively
     // called every Present) would treat its own earlier success as fresh
     // failure, permanently reset g_hooked, and spam-retry forever.
-    auto hook = [&](int idx, void* detour, void** orig, const char* name) -> bool {
-        void* target = vt[idx];
+    auto hook = [&](void** vtable, int idx, void* detour, void** orig, const char* name) -> bool {
+        void* target = vtable[idx];
         MH_STATUS c = MH_CreateHook(target, detour, orig);
         if (c != MH_OK && c != MH_ERROR_ALREADY_CREATED) {
             VRLOG("%s hook FAILED", name);
@@ -642,18 +865,51 @@ void install_cbuffer_hook(IDXGISwapChain* swapchain)
         return true;
     };
 
-    bool ok = hook(kIdxUpdateSubresource, &Detour_UpdateSubresource,
-                   reinterpret_cast<void**>(&real_UpdateSubresource), "UpdateSubresource");
-    ok = hook(kIdxMap,   &Detour_Map,   reinterpret_cast<void**>(&real_Map),   "Map")   && ok;
-    ok = hook(kIdxUnmap, &Detour_Unmap, reinterpret_cast<void**>(&real_Unmap), "Unmap") && ok;
+    bool ok = hook(vt, kIdxUpdateSubresource, &Detour_UpdateSubresource,
+                   reinterpret_cast<void**>(&real_UpdateSubresource_imm), "UpdateSubresource(imm)");
+    if (vtDef) {
+        if (vtDef[kIdxUpdateSubresource] == vt[kIdxUpdateSubresource]) {
+            real_UpdateSubresource_def = real_UpdateSubresource_imm;
+        } else {
+            ok = hook(vtDef, kIdxUpdateSubresource, &Detour_UpdateSubresource,
+                      reinterpret_cast<void**>(&real_UpdateSubresource_def), "UpdateSubresource(def)") && ok;
+        }
+    }
+    ok = hook(vt, kIdxMap,   &Detour_Map,   reinterpret_cast<void**>(&real_Map),   "Map")   && ok;
+    ok = hook(vt, kIdxUnmap, &Detour_Unmap, reinterpret_cast<void**>(&real_Unmap), "Unmap") && ok;
+
+    ok = hook(vt, kIdxPSSetConstantBuffers, reinterpret_cast<void*>(&Detour_PSSetConstantBuffers),
+              reinterpret_cast<void**>(&real_PSSetConstantBuffers_imm), "PSSetConstantBuffers(imm)") && ok;
+    if (vtDef) {
+        if (vtDef[kIdxPSSetConstantBuffers] == vt[kIdxPSSetConstantBuffers]) {
+            real_PSSetConstantBuffers_def = real_PSSetConstantBuffers_imm;
+        } else {
+            ok = hook(vtDef, kIdxPSSetConstantBuffers, reinterpret_cast<void*>(&Detour_PSSetConstantBuffers),
+                      reinterpret_cast<void**>(&real_PSSetConstantBuffers_def), "PSSetConstantBuffers(def)") && ok;
+        }
+    }
 
     // UpdateSubresource1 lives on the ID3D11DeviceContext1 vtable (same object).
     ComPtr<ID3D11DeviceContext1> ctx1;
     if (SUCCEEDED(ctx->QueryInterface(__uuidof(ID3D11DeviceContext1), (void**)&ctx1)))
-        hook(kIdxUpdateSubresource1, &Detour_US1, reinterpret_cast<void**>(&real_US1), "UpdateSubresource1");
+        hook(vt, kIdxUpdateSubresource1, &Detour_US1, reinterpret_cast<void**>(&real_US1), "UpdateSubresource1");
 
     if (!ok) { g_hooked = false; return; }
-    VRLOG("camera CB hooks installed (UpdateSubresource[1] + Map/Unmap)");
+    VRLOG("camera CB hooks installed (UpdateSubresource[1] + Map/Unmap + PSSetConstantBuffers)");
 }
+
+void cbuffer_hook_on_present()
+{
+    AcquireSRWLockExclusive(&g_uiPosLock);
+    g_uiPosPrev = g_uiPosCur;
+    g_uiPosCur.count = 0;
+    ReleaseSRWLockExclusive(&g_uiPosLock);
+
+    evict_stale_marker_cbs();
+    ++g_markerCbFrame;
+}
+
+bool world_marker_fix_enabled() { return g_worldMarkerFix.load(); }
+void set_world_marker_fix_enabled(bool on) { g_worldMarkerFix.store(on); }
 
 } // namespace hooks

@@ -154,6 +154,7 @@ HRESULT STDMETHODCALLTYPE Detour_Present(IDXGISwapChain* sc, UINT sync, UINT fla
     hooks::viewbuild_on_present();
     hooks::camera_fov_on_present();
     hooks::ui_hook_on_present(sc);
+    hooks::cbuffer_hook_on_present();
     // Menu update runs BEFORE mirror_on_present() -- it builds this Present's
     // ImGui draw data (NewFrame/Render) without touching any render target
     // yet, so mirror_on_present() can, while it's building the XR frame,

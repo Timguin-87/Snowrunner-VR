@@ -2,6 +2,8 @@
 #include <dxgi.h>
 #include <cstdint>
 
+struct ID3D11Resource;   // forward decl -- avoids pulling <d3d11.h> into every TU that includes this header
+
 // CB_GLOBAL_CAMERA INTERCEPTION, at the point the engine uploads it.
 //
 // The render view matrix is not reachable through the CPU logic camera, so the
@@ -74,4 +76,25 @@ bool     imm_camera_is_main();
 // guard above can never do anything.
 uint32_t non_main_camera_commits();
 
+// The PS constant-buffer slot CB_DYNAMIC_UI is bound at, confirmed via
+// D3DReflect and PSSetConstantBuffers logging. Shared with ui_hook.cpp so
+// both sides agree on the same slot number.
+constexpr int kMarkerCbSlot = 4;
+
+// True if the given constant-buffer pointer (whatever is CURRENTLY bound at
+// kMarkerCbSlot -- fetch it live with PSGetConstantBuffers, don't cache) is
+// one of the two known marker shaders' CBs AND its last-written screen
+// position differs from anything seen last frame. False (today's behaviour)
+// if the pointer isn't a tracked marker CB at all, or its position matches.
+bool marker_cb_position_is_dynamic(void* buf);
+
+// Promotes this frame's observed marker positions to "previous frame" for
+// the next comparison, and clears the current set. Call once per Present.
+void cbuffer_hook_on_present();
+
+// Toggle for the whole static/dynamic marker classification. OFF reverts
+// redirect_if_ui() to stock behaviour -- every kCullUi draw goes to the
+// plane unconditionally, exactly as before this feature existed.
+bool world_marker_fix_enabled();
+void set_world_marker_fix_enabled(bool on);
 } // namespace hooks

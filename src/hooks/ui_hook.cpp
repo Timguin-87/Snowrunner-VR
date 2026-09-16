@@ -338,6 +338,31 @@ bool redirect_if_ui(ID3D11DeviceContext* ctx, DrawFn&& draw)
     if (hooks::current_draw_role() != hooks::kCullUi || !uilayer::active())
         return false;
     if (ui_copy_excluded(hooks::current_draw_hash())) return false;
+
+    if (hooks::world_marker_fix_enabled()) {
+        ID3D11Buffer* uiCb = nullptr;
+        ctx->PSGetConstantBuffers(hooks::kMarkerCbSlot, 1, &uiCb);
+        const bool dynamic = uiCb && hooks::marker_cb_position_is_dynamic((void*)uiCb);
+        if (uiCb) uiCb->Release();   // PSGetConstantBuffers AddRefs -- must release
+        if (dynamic) {
+            // World-projected marker: under DIBR shift it would otherwise get
+            // depth-reprojected using whatever's BEHIND it (wrong disparity) --
+            // the exact problem winch markers have, same fix -- capture it
+            // into the winch layer and composite back with zero disparity.
+            // Without DIBR shift, winchlayer::active() is false, so this is a
+            // no-op and falls through to the plain scene draw below, which is
+            // already correct in that mode (see the notes above
+            // redirect_if_winch_marker).
+            winchlayer::Saved saved;
+            if (winchlayer::active() && winchlayer::begin_capture(ctx, saved)) {
+                draw();
+                winchlayer::end_capture(ctx, saved);
+                return true;
+            }
+            return false;   // DIBR off (or capture unavailable) -- fall through into the scene
+        }
+    }
+
     uilayer::Saved saved;
     if (!uilayer::begin_capture(ctx, saved)) return false;
     draw();
