@@ -43,11 +43,14 @@ void release_all()
 
 bool build(ID3D11Device* dev, uint32_t w, uint32_t h)
 {
-    // Plain UNORM, not _SRGB -- a format that decodes on read and re-encodes on
-    // write round-trips through gamma twice. Same reasoning as ui_layer.cpp.
+    // TYPELESS with UNORM RTV and UNORM_SRGB SRV -- matches ui_layer.cpp.
+    // WRITE side is UNORM so game UI shaders emit gamma-encoded values without
+    // double sRGB encoding.
+    // READ side is UNORM_SRGB so sampling decodes sRGB to linear space to match
+    // the blit shader's linear color pipeline.
     D3D11_TEXTURE2D_DESC d{};
     d.Width = w; d.Height = h; d.MipLevels = 1; d.ArraySize = 1;
-    d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    d.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
     d.SampleDesc.Count = 1;
     d.Usage = D3D11_USAGE_DEFAULT;
     d.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
@@ -56,8 +59,16 @@ bool build(ID3D11Device* dev, uint32_t w, uint32_t h)
             VRLOG("winch layer: CreateTexture2D %ux%u FAILED", w, h);
             return false;
         }
-        if (FAILED(dev->CreateRenderTargetView(b.tex.Get(), nullptr, &b.rtv)) ||
-            FAILED(dev->CreateShaderResourceView(b.tex.Get(), nullptr, &b.srv))) {
+        D3D11_RENDER_TARGET_VIEW_DESC rd{};
+        rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+        D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
+        sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        sd.Texture2D.MipLevels = 1;
+
+        if (FAILED(dev->CreateRenderTargetView(b.tex.Get(), &rd, &b.rtv)) ||
+            FAILED(dev->CreateShaderResourceView(b.tex.Get(), &sd, &b.srv))) {
             VRLOG("winch layer: view creation FAILED");
             return false;
         }
