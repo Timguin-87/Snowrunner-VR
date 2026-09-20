@@ -108,7 +108,12 @@ std::atomic<float> g_renderFovScale{1.00f};
 float composited_fov_scale()
 {
     float s = g_renderFovScale.load();
-    if (hooks::in_map_view()) s *= g_mapWindowShrink.load();
+    // NOT IN 2D. The shrink scales the render FOV and the submitted window
+    // together, so in 3D it reads as a smaller window with the same content. On
+    // a flat panel the panel size comes from the UI slider instead, so all the
+    // shrink would do is render a narrower slice of the map into the same
+    // panel -- i.e. crop and magnify it. Its 40% default would do that hard.
+    if (hooks::in_map_view() && !flat_screen_active()) s *= g_mapWindowShrink.load();
     return s;
 }
 // (A rendered_fov_scale() helper used to live here, returning
@@ -2816,13 +2821,304 @@ bool refresh_ui_quad_image(ID3D11ShaderResourceView* src, uint32_t w, uint32_t h
     xrReleaseSwapchainImage(g.uiSwapchain, &ri);
     return true;
 }
+// PLACING A QUAD ON THE UI PLANE -- pinned in the world or head-locked, at the
+// UI distance, hung on the capture eye so its pixels overlay that eye's render
+// exactly.
+//
+// SHARED, and it has to be. In 2D screen mode the scene plane and the game's UI
+// plane are submitted as two quads at the SAME pose and size, and the UI only
+// sits on the screen because the two cannot drift. Two copies of this that
+// agreed today would stop agreeing the first time one was touched.
+//
+// headLocked forces the head-locked branch: the 3D map needs it, because its
+// markers are screen-space and only line up while the plane tracks the render.
+void place_ui_plane_quad(XrCompositionLayerQuad& quad, XrTime displayTime,
+                         bool headLocked)
+{
+    const float dist = g_uiPlaneDistM.load();
+
+    // THE VERTICAL PITCH, used by both placements below.
+    //
+    // It is there because the projection layer declares every eye at
+    // (eyePose * pitch(voff)), so a quad left at identity sits voff off the
+    // image it is drawn over. Head-locked applies it as a LOCAL rotation in
+    // viewSpace; the pinned branch has to conjugate it about the head, which is
+    // where the small residual roll comes from -- see the note there.
+    //
+    // ZERO ON A FLAT SCREEN, because in 2D there IS no projection layer -- the
+    // scene is a quad too and pv[] is never submitted. Nothing is displaced, so
+    // correcting for it would just push the panel off the forward you are
+    // actually looking down, and roll it on the way.
+    const float vpitchRad = flat_screen_active() ? 0.0f : submitted_vertical_pitch();
+
+    // THE HEAD, located once for both placements below. The world-pinned one
+    // needs it every frame to follow the vertical-recenter displacement; the
+    // map's eye-relative one needs it to express the capture eye in the quad's
+    // own space. Without it both fall back to plain head-centred placement.
+    XrSpaceLocation loc{XR_TYPE_SPACE_LOCATION};
+    constexpr XrSpaceLocationFlags kNeedLoc =
+        XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT;
+    const bool haveHead =
+        XR_SUCCEEDED(xrLocateSpace(g.viewSpace, g.space, displayTime, &loc)) &&
+        (loc.locationFlags & kNeedLoc) == kNeedLoc;
+    const Quat qh{loc.pose.orientation.x, loc.pose.orientation.y,
+                  loc.pose.orientation.z, loc.pose.orientation.w};
+
+
+    // WORLD-PINNED. Never when the caller demands head-locking (the 3D map, to
+    // stay aligned with the render), and never before a pin has been taken.
+    bool pinned = false;
+    if (!headLocked && g_uiPlaneMode.load() == kUiPlaneForward) {
+        // No head pose, no world pin: fall through to head-locked for this
+        // frame rather than submit a placement built on a stale one.
+        int pinReq = g_uiPinRequest.exchange(kUiPinNone);
+        if (haveHead && (pinReq != kUiPinNone || !g_uiPinValid)) {
+            // Never pinned and nobody asked: the plane still has to go
+            // somewhere, and the runtime's forward is the same answer startup
+            // gives the game's forward.
+            if (pinReq == kUiPinNone) pinReq = kUiPinToRuntimeForward;
+            // Identity IS the runtime's forward, and it is level by
+            // construction -- no pitch to inherit from where the head was held.
+            const Quat lq = (pinReq == kUiPinToView) ? level_look(qh)
+                                                     : Quat{0.0f, 0.0f, 0.0f, 1.0f};
+            AcquireSRWLockExclusive(&g_uiPinLock);
+            g_uiPinPose.orientation = {lq.x, lq.y, lq.z, lq.w};
+            g_uiPinPose.position = loc.pose.position;
+            g_uiPinValid = true;
+            ReleaseSRWLockExclusive(&g_uiPinLock);
+            VRLOG("ui plane: pinned %s at %.2f %.2f %.2f",
+                  pinReq == kUiPinToView ? "to the head's look" : "to runtime forward (level)",
+                  loc.pose.position.x, loc.pose.position.y, loc.pose.position.z);
+        }
+
+        AcquireSRWLockShared(&g_uiPinLock);
+        const bool have = haveHead && g_uiPinValid;
+        const Quat qp{g_uiPinPose.orientation.x, g_uiPinPose.orientation.y,
+                      g_uiPinPose.orientation.z, g_uiPinPose.orientation.w};
+        const XrVector3f pivot = g_uiPinPose.position;
+        ReleaseSRWLockShared(&g_uiPinLock);
+
+        if (have) {
+            // Straight out along the pinned gaze, from where the head was when
+            // the pin was taken. Distance is read live so the slider still
+            // moves the plane along that ray after pinning.
+            const Vec3 off = rotate(qp, {0.0f, 0.0f, -dist});
+            const Vec3 pp{pivot.x + off.x, pivot.y + off.y, pivot.z + off.z};
+
+            // THE WORLD IS NOT WHERE THE RUNTIME THINKS IT IS, and a plane
+            // pinned in the runtime's space has to be moved to match.
+            //
+            // The vertical recenter is faked by DECLARING each eye at
+            // (eyePose * pitch(voff)) while rendering from the true one, so the
+            // projection layer's whole world is displayed rotated by voff. Quad
+            // layers do not use that declared pose -- the compositor locates
+            // them itself -- so a truthfully placed quad sits voff off the world
+            // it is drawn over. Rotating the quad by R = qh * pitch(voff) *
+            // qh^-1 about the head cancels that. voff = 0 makes R identity and
+            // this whole block a no-op.
+            //
+            // THE RESIDUAL IS A SMALL YAW-DEPENDENT ROLL, and it is ACCEPTED.
+            // R's axis is the head's current right axis, so it swings as the
+            // head turns; on a world-pinned plane that is a roll about the
+            // plane's own normal, worst where you are turned furthest from it.
+            // Visible as the intro logos rolling slightly when you look left
+            // and right, because there the plane is the only thing on screen.
+            //
+            // MEASURED 2026-09-20, all three arrangements, so none of them gets
+            // tried again:
+            //
+            //   R on BOTH (this)     small roll, one direction   <- kept
+            //   R on POSITION only   MUCH worse -- the two are one rigid
+            //                        rotation of the plane about the head, and
+            //                        half of it slides the panel around you
+            //                        without turning it to face you
+            //   R on NEITHER         rolls the OPPOSITE way
+            //
+            // That last result is the informative one: removing R does not
+            // remove the roll, it reverses it. So R is not the source -- it is
+            // very nearly the right correction and overshoots slightly, and
+            // something of opposite sign is in the chain with it. The remaining
+            // error is smaller than either extreme, which is why this is where
+            // it stays.
+            //
+            // The real fix is upstream and is NOT in this block: stop faking the
+            // vertical centring through the eye pose, and fold it into the
+            // projection instead. Then nothing downstream needs compensating and
+            // both branches lose the problem rather than trading its symptoms.
+            //
+            // The per-eye debug cant is deliberately NOT folded in: it differs
+            // between the eyes, and one quad has only one pose. It is a test
+            // knob that sits at 0 on real hardware.
+            const float vhalf = vpitchRad * 0.5f;
+            const Quat  pv{std::sin(vhalf), 0.0f, 0.0f, std::cos(vhalf)};
+            const Quat  R = mul(mul(qh, pv), conj(qh));
+            const Vec3  rel{pp.x - loc.pose.position.x,
+                            pp.y - loc.pose.position.y,
+                            pp.z - loc.pose.position.z};
+            const Vec3  rot = rotate(R, rel);
+            const Quat  qs = mul(R, qp);
+
+            quad.space = g.space;
+            quad.pose.orientation = {qs.x, qs.y, qs.z, qs.w};
+            quad.pose.position = {loc.pose.position.x + rot.x,
+                                  loc.pose.position.y + rot.y,
+                                  loc.pose.position.z + rot.z};
+            pinned = true;
+        }
+    }
+
+    if (!pinned) {
+        // HEAD-LOCKED, following the vertical recenter for the same reason the
+        // menu quad does: the projection layer pitches every eye pose by that
+        // angle, so a quad left at identity sits wherever the UNPITCHED forward
+        // pointed -- off centre by exactly the recenter amount. On the map that
+        // is not cosmetic, it is the alignment.
+        const float vhalf = vpitchRad * 0.5f;
+        Quat q{std::sin(vhalf), 0.0f, 0.0f, std::cos(vhalf)};
+        Vec3 origin{0.0f, 0.0f, 0.0f};
+
+        // HUNG ON THE CAPTURE EYE, not on the head.
+        //
+        // The capture came out of ONE eye (kUiCaptureEye), so the image it
+        // holds is that eye's projection and nothing else's. Reproducing it
+        // exactly therefore means reproducing that eye: centre the plane on the
+        // eye's POSITION, aim it along the eye's AXIS, and let it subtend the
+        // eye's frustum. Do that and the capture eye sees the plane overlaying
+        // its own render pixel for pixel, at any distance at all.
+        //
+        // Two errors disappear together here, which is why it is one expression
+        // rather than two corrections:
+        //
+        //   CANT. On outward-angled panels the eye's axis is head*cant, so an
+        //   element at the centre of that render sits degrees off the head's
+        //   forward. A quad on the head's forward is rotated by the cant
+        //   against the image it came from.
+        //
+        //   THE HEAD/VIEW OFFSET. VIEW space is not the mid-eye -- measured on
+        //   this runtime as a ~1.66 deg rotation common to both eyes (see
+        //   latch_eye_cant, which had to switch to a mid-eye reference for
+        //   exactly this reason). Correcting only for cant would leave that
+        //   behind.
+        //
+        // conj(head) * eye carries both by construction, so neither has to be
+        // named or measured separately.
+        //
+        // g.lastView, not reference_view_pose(): eye-to-head is rigid hardware,
+        // so it only has to be read from ONE consistent instant, and both terms
+        // here come from this Present's own locate. Mixing the render instant
+        // in would fold a frame of head motion into a constant.
+        //
+        // This used to be map-only. That left normal menus centred on VIEW
+        // space while their pixels (and the hardware cursor composited into
+        // them) came from kUiCaptureEye. With head translation the two origins
+        // acquired visible parallax. Keep every head-locked UI plane on the
+        // eye that actually produced its texture; size remains an independent
+        // presentation choice, but pose identity no longer changes by screen.
+        if (haveHead) {
+            const XrView& ev = g.lastView[kUiCaptureEye];
+            const Quat qe{ev.pose.orientation.x, ev.pose.orientation.y,
+                          ev.pose.orientation.z, ev.pose.orientation.w};
+            const Vec3 pe{ev.pose.position.x - loc.pose.position.x,
+                          ev.pose.position.y - loc.pose.position.y,
+                          ev.pose.position.z - loc.pose.position.z};
+            q      = mul(mul(conj(qh), qe), q);
+            origin = rotate(conj(qh), pe);
+        }
+
+        quad.space = g.viewSpace;
+        quad.pose.orientation = {q.x, q.y, q.z, q.w};
+        // Straight out along whatever that orientation faces, from whatever it
+        // is hung on -- reduces to the old (0, d sin, -d cos) exactly when the
+        // eye term is absent.
+        const Vec3 off = rotate(q, {0.0f, 0.0f, -dist});
+        quad.pose.position = {origin.x + off.x, origin.y + off.y, origin.z + off.z};
+    }
+}
+
 
 // Builds (and renders) the game UI's own composition layer. Head-locked or
 // pinned in the world, sized as a fraction of the render's own angular extent
 // -- except on the map, which is forced to the full extent so screen-space
 // markers line up with the map underneath them.
+// THE SCENE, ON A PLANE. 2D mode's whole substance: the frame that would have
+// gone to the eye projection is shown on a quad instead, and the projection is
+// not submitted at all.
+//
+// NO COPY AND NO SWAPCHAIN OF ITS OWN. The quad points straight at the eye
+// swapchain the blit just released, with that eye's blitRect as the subImage --
+// the runtime keeps presenting the last released image, exactly as the UI quad
+// relies on. So a flat screen costs one more layer and nothing else.
+//
+// MONO by construction: one image, both eyes. That is what makes it 2D, and it
+// is why eye_side_offset() has to read zero here -- see the note there.
+//
+// SIZED AND PLACED LIKE THE UI PLANE, because the UI is submitted as a second
+// quad on top and the two have to coincide. Same size expression, same
+// place_ui_plane_quad() call, never head-locked: on a panel the map's markers
+// ride the panel rather than the render.
+bool build_scene_quad_layer(XrCompositionLayerQuad& quad, XrTime displayTime)
+{
+    if (!flat_screen_active()) return false;
+
+    const uint32_t eye = (uint32_t)present_route_eye();
+    if (eye > 1 || g.swapchain[eye] == XR_NULL_HANDLE || !g.eyeEverRendered[eye])
+        return false;
+
+    const XrRect2Di rect = g.blitRect[eye];
+    if (rect.extent.width <= 0 || rect.extent.height <= 0)
+        return false;
+
+    float hh = 0.0f, vh = 0.0f;
+    eye_frustum_half_angles(eye, hh, vh);
+    if (hh <= 1.0e-4f || vh <= 1.0e-4f)
+        return false;
+
+    quad.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
+    // OPAQUE, unlike the two quads above it: this is the background, not an
+    // overlay. Blending it against the void would show the void through it.
+    quad.layerFlags = 0;
+    quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+    quad.subImage.swapchain = g.swapchain[eye];
+    quad.subImage.imageRect = rect;
+    quad.subImage.imageArrayIndex = 0;
+
+    const float widthM = g_uiPlaneSizeM.load();
+    quad.size = {widthM, widthM * (std::tan(vh) / std::tan(hh))};
+
+    place_ui_plane_quad(quad, displayTime, false);
+    return true;
+}
+
 bool build_ui_quad_layer(XrCompositionLayerQuad& quad, XrTime displayTime)
 {
+    // THE MAP'S UI REDIRECT, reported once on the first map entry.
+    //
+    // WHAT IT CAN TELL YOU: whether the redirect ran at all this frame, and
+    // whether the UI shaders this build KNOWS ABOUT are being seen.
+    //
+    // WHAT IT CANNOT: whether the set is complete. A shader that SHOULD be UI
+    // but is in no role is not counted by anything here -- "7 of 7 recognised"
+    // is equally true when an eighth is drawing into the render unnoticed. Read
+    // it as "the machinery is running", never as "nothing is missing".
+    //
+    // Why the map is where it shows: the map applies the AER eye offset as a
+    // projection SHEAR, so a UI draw left in the render is pushed sideways by
+    // opposite amounts in the two eyes and each loses the far side of it. World
+    // markers keep working, because for geometry at depth that shear is the
+    // correct stereo -- and that asymmetry is the real diagnostic.
+    if (hooks::in_map_view()) {
+        static std::atomic<bool> s_logged{false};
+        if (!s_logged.exchange(true))
+            VRLOG("map UI: redirect %s -- ui layer %s this frame, %d of %d KNOWN "
+                  "UI shaders seen (this cannot see a UI shader that is in no "
+                  "role at all -- if part of the UI is split between the eyes, "
+                  "look for a missing one in the Shader Cull tab)",
+                  uilayer::drew_this_frame() ? "ran" : "did NOT capture",
+                  uilayer::active() ? "active" : "inactive",
+                  hooks::cull_role_seen_count(hooks::kCullUi),
+                  hooks::cull_role_hash_count(hooks::kCullUi));
+    }
+
     uint32_t w = 0, h = 0;
     if (!uilayer::active() || !uilayer::size(w, h)) {
         g.uiQuadImageValid = false;
@@ -2887,22 +3183,6 @@ bool build_ui_quad_layer(XrCompositionLayerQuad& quad, XrTime displayTime)
         }
     }
 
-    const bool mapView = hooks::in_map_view();
-    const float dist   = g_uiPlaneDistM.load();
-
-    // THE HEAD, located once for both placements below. The world-pinned one
-    // needs it every frame to follow the vertical-recenter displacement; the
-    // map's eye-relative one needs it to express the capture eye in the quad's
-    // own space. Without it both fall back to plain head-centred placement.
-    XrSpaceLocation loc{XR_TYPE_SPACE_LOCATION};
-    constexpr XrSpaceLocationFlags kNeedLoc =
-        XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT;
-    const bool haveHead =
-        XR_SUCCEEDED(xrLocateSpace(g.viewSpace, g.space, displayTime, &loc)) &&
-        (loc.locationFlags & kNeedLoc) == kNeedLoc;
-    const Quat qh{loc.pose.orientation.x, loc.pose.orientation.y,
-                  loc.pose.orientation.z, loc.pose.orientation.w};
-
     quad.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
     quad.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
     quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
@@ -2920,159 +3200,19 @@ bool build_ui_quad_layer(XrCompositionLayerQuad& quad, XrTime displayTime)
     // is what the game drew into, so tan(vh)/tan(hh) is the shape that keeps
     // the UI unstretched.
     //
-    // The MAP is the exception, and not a matter of taste: it is sized to
-    // subtend exactly the rendered view so a screen-space marker still points
-    // at the map feature under it. Neither slider applies there.
-    const float shape = std::tan(vh) / std::tan(hh);
-    const float widthM = mapView ? (2.0f * dist * std::tan(hh))
-                                 : g_uiPlaneSizeM.load();
+    // THE MAP'S 3D SIZING IS NOT A MATTER OF TASTE: it subtends exactly the
+    // rendered view so a screen-space marker still points at the map feature
+    // under it, and neither slider applies. In 2D that reasoning is gone --
+    // the scene is on a plane of its own and the UI has to match THAT, so both
+    // planes take the UI size and the markers line up on the panel instead.
+    const bool  mapLocked = hooks::in_map_view() && !flat_screen_active();
+    const float dist   = g_uiPlaneDistM.load();
+    const float shape  = std::tan(vh) / std::tan(hh);
+    const float widthM = mapLocked ? (2.0f * dist * std::tan(hh))
+                                   : g_uiPlaneSizeM.load();
     quad.size = {widthM, widthM * shape};
 
-    // WORLD-PINNED. Never on the map (it has to track the head to stay aligned
-    // with the render), and never before a pin has actually been taken.
-    bool pinned = false;
-    if (!mapView && g_uiPlaneMode.load() == kUiPlaneForward) {
-        // No head pose, no world pin: fall through to head-locked for this
-        // frame rather than submit a placement built on a stale one.
-        int pinReq = g_uiPinRequest.exchange(kUiPinNone);
-        if (haveHead && (pinReq != kUiPinNone || !g_uiPinValid)) {
-            // Never pinned and nobody asked: the plane still has to go
-            // somewhere, and the runtime's forward is the same answer startup
-            // gives the game's forward.
-            if (pinReq == kUiPinNone) pinReq = kUiPinToRuntimeForward;
-            // Identity IS the runtime's forward, and it is level by
-            // construction -- no pitch to inherit from where the head was held.
-            const Quat lq = (pinReq == kUiPinToView) ? level_look(qh)
-                                                     : Quat{0.0f, 0.0f, 0.0f, 1.0f};
-            AcquireSRWLockExclusive(&g_uiPinLock);
-            g_uiPinPose.orientation = {lq.x, lq.y, lq.z, lq.w};
-            g_uiPinPose.position = loc.pose.position;
-            g_uiPinValid = true;
-            ReleaseSRWLockExclusive(&g_uiPinLock);
-            VRLOG("ui plane: pinned %s at %.2f %.2f %.2f",
-                  pinReq == kUiPinToView ? "to the head's look" : "to runtime forward (level)",
-                  loc.pose.position.x, loc.pose.position.y, loc.pose.position.z);
-        }
-
-        AcquireSRWLockShared(&g_uiPinLock);
-        const bool have = haveHead && g_uiPinValid;
-        const Quat qp{g_uiPinPose.orientation.x, g_uiPinPose.orientation.y,
-                      g_uiPinPose.orientation.z, g_uiPinPose.orientation.w};
-        const XrVector3f pivot = g_uiPinPose.position;
-        ReleaseSRWLockShared(&g_uiPinLock);
-
-        if (have) {
-            // Straight out along the pinned gaze, from where the head was when
-            // the pin was taken. Distance is read live so the slider still
-            // moves the plane along that ray after pinning.
-            const Vec3 off = rotate(qp, {0.0f, 0.0f, -dist});
-            const Vec3 pp{pivot.x + off.x, pivot.y + off.y, pivot.z + off.z};
-
-            // THE WORLD IS NOT WHERE THE RUNTIME THINKS IT IS, and a plane
-            // pinned in the runtime's space has to be moved to match.
-            //
-            // The vertical recenter is faked by DECLARING each eye at
-            // (eyePose * pitch(voff)) while rendering from the true one -- so
-            // the whole scene is displayed rotated by voff about the eye's own
-            // right axis. That axis is head-relative, so as the head yaws or
-            // rolls the displacement swings with it: relative to a truthfully
-            // placed quad, the world slides. Head-locked placement never saw
-            // this because it carries the same pitch(voff) and rides along.
-            //
-            // Applying the identical displacement here -- rotate by
-            // R = qh * pitch(voff) * qh^-1 about the head -- puts the plane in
-            // the same displaced world the eyes are showing, so the two stop
-            // moving against each other. voff = 0 makes R identity and this
-            // whole block a no-op.
-            //
-            // The per-eye debug cant is deliberately NOT folded in: it differs
-            // between the eyes, and one quad has only one pose. It is a test
-            // knob that sits at 0 on real hardware.
-            const float vhalf = submitted_vertical_pitch() * 0.5f;
-            const Quat  pv{std::sin(vhalf), 0.0f, 0.0f, std::cos(vhalf)};
-            const Quat  R = mul(mul(qh, pv), conj(qh));
-            const Vec3  rel{pp.x - loc.pose.position.x,
-                            pp.y - loc.pose.position.y,
-                            pp.z - loc.pose.position.z};
-            const Vec3  rot = rotate(R, rel);
-            const Quat  qs = mul(R, qp);
-
-            quad.space = g.space;
-            quad.pose.orientation = {qs.x, qs.y, qs.z, qs.w};
-            quad.pose.position = {loc.pose.position.x + rot.x,
-                                  loc.pose.position.y + rot.y,
-                                  loc.pose.position.z + rot.z};
-            pinned = true;
-        }
-    }
-
-    if (!pinned) {
-        // HEAD-LOCKED, following the vertical recenter for the same reason the
-        // menu quad does: the projection layer pitches every eye pose by that
-        // angle, so a quad left at identity sits wherever the UNPITCHED forward
-        // pointed -- off centre by exactly the recenter amount. On the map that
-        // is not cosmetic, it is the alignment.
-        const float vpitch = submitted_vertical_pitch();
-        const float vhalf  = vpitch * 0.5f;
-        Quat q{std::sin(vhalf), 0.0f, 0.0f, std::cos(vhalf)};
-        Vec3 origin{0.0f, 0.0f, 0.0f};
-
-        // HUNG ON THE CAPTURE EYE, not on the head.
-        //
-        // The capture came out of ONE eye (kUiCaptureEye), so the image it
-        // holds is that eye's projection and nothing else's. Reproducing it
-        // exactly therefore means reproducing that eye: centre the plane on the
-        // eye's POSITION, aim it along the eye's AXIS, and let it subtend the
-        // eye's frustum. Do that and the capture eye sees the plane overlaying
-        // its own render pixel for pixel, at any distance at all.
-        //
-        // Two errors disappear together here, which is why it is one expression
-        // rather than two corrections:
-        //
-        //   CANT. On outward-angled panels the eye's axis is head*cant, so an
-        //   element at the centre of that render sits degrees off the head's
-        //   forward. A quad on the head's forward is rotated by the cant
-        //   against the image it came from.
-        //
-        //   THE HEAD/VIEW OFFSET. VIEW space is not the mid-eye -- measured on
-        //   this runtime as a ~1.66 deg rotation common to both eyes (see
-        //   latch_eye_cant, which had to switch to a mid-eye reference for
-        //   exactly this reason). Correcting only for cant would leave that
-        //   behind.
-        //
-        // conj(head) * eye carries both by construction, so neither has to be
-        // named or measured separately.
-        //
-        // g.lastView, not reference_view_pose(): eye-to-head is rigid hardware,
-        // so it only has to be read from ONE consistent instant, and both terms
-        // here come from this Present's own locate. Mixing the render instant
-        // in would fold a frame of head motion into a constant.
-        //
-        // This used to be map-only. That left normal menus centred on VIEW
-        // space while their pixels (and the hardware cursor composited into
-        // them) came from kUiCaptureEye. With head translation the two origins
-        // acquired visible parallax. Keep every head-locked UI plane on the
-        // eye that actually produced its texture; size remains an independent
-        // presentation choice, but pose identity no longer changes by screen.
-        if (haveHead) {
-            const XrView& ev = g.lastView[kUiCaptureEye];
-            const Quat qe{ev.pose.orientation.x, ev.pose.orientation.y,
-                          ev.pose.orientation.z, ev.pose.orientation.w};
-            const Vec3 pe{ev.pose.position.x - loc.pose.position.x,
-                          ev.pose.position.y - loc.pose.position.y,
-                          ev.pose.position.z - loc.pose.position.z};
-            q      = mul(mul(conj(qh), qe), q);
-            origin = rotate(conj(qh), pe);
-        }
-
-        quad.space = g.viewSpace;
-        quad.pose.orientation = {q.x, q.y, q.z, q.w};
-        // Straight out along whatever that orientation faces, from whatever it
-        // is hung on -- reduces to the old (0, d sin, -d cos) exactly when the
-        // eye term is absent.
-        const Vec3 off = rotate(q, {0.0f, 0.0f, -dist});
-        quad.pose.position = {origin.x + off.x, origin.y + off.y, origin.z + off.z};
-    }
+    place_ui_plane_quad(quad, displayTime, mapLocked);
     return true;
 }
 
@@ -4934,10 +5074,19 @@ void render_frame(IDXGISwapChain* swapchain)
     const bool haveUiQuad = validTime &&
                             build_ui_quad_layer(uiQuad, fs.predictedDisplayTime);
 
-    const XrCompositionLayerBaseHeader* layers[3];
+    // 2D SCREEN MODE: the scene on a plane, INSTEAD of the eye projection. Not
+    // as well as -- submitting both would leave the stereo world behind the
+    // panel, which is neither of the two things the setting offers.
+    XrCompositionLayerQuad sceneQuad{};
+    const bool haveSceneQuad = submitLayer &&
+                               build_scene_quad_layer(sceneQuad, fs.predictedDisplayTime);
+
+    const XrCompositionLayerBaseHeader* layers[4];
     uint32_t layerCount = 0;
-    if (submitLayer)
+    if (submitLayer && !haveSceneQuad)
         layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&proj);
+    if (haveSceneQuad)
+        layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&sceneQuad);
     if (haveUiQuad)
         layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&uiQuad);
     if (haveMenuQuad)
@@ -4969,6 +5118,23 @@ void render_frame(IDXGISwapChain* swapchain)
 
 HeadLook head_look()
 {
+    // NO HEAD INPUT ON A FLAT SCREEN. The panel is a fixed window onto the
+    // game, so the game's camera has to be the game's own: leave head tracking
+    // in and moving your head would pan the world while the panel stayed put,
+    // which is the one thing a screen must never do.
+    //
+    // Reported as "no head pose" rather than as a zeroed one, because that is
+    // what it is, and because all five injection sites in viewbuild_hook.cpp
+    // already branch on it -- it is the same state they sit in before the
+    // headset comes up, so this needs no new path anywhere.
+    //
+    // THE PANEL ITSELF STILL FOLLOWS YOUR HEAD, and that is a different
+    // mechanism: place_ui_plane_quad() puts the quad head-locked or world-
+    // pinned per the UI setting, which the compositor honours whatever the
+    // game's camera is doing. Head-locked, the screen comes with you; pinned,
+    // you can look away from it. Neither moves the view inside it.
+    if (flat_screen_active()) return HeadLook{};
+
     AcquireSRWLockShared(&g_poseLock);
     HeadLook h = g_headLook;
     Quat rel{g_relQuat[0], g_relQuat[1], g_relQuat[2], g_relQuat[3]};
@@ -5073,7 +5239,11 @@ bool render_canvas_wh(uint32_t& w, uint32_t& h)
     return w > 0 && h > 0;
 }
 
-float eye_side_offset() { return g_eyeSide.load(); }
+// ZERO IN 2D, and this is not optional. A flat panel is one image shown to both
+// eyes, but AER still alternates the camera by +/-IPD/2 every frame -- so the
+// panel would shake left and right at half the frame rate. There is no stereo
+// to keep on a mono quad, so the offset simply stops being applied.
+float eye_side_offset() { return flat_screen_active() ? 0.0f : g_eyeSide.load(); }
 
 
 std::atomic<uint64_t> g_appliedEye{0};
@@ -5339,37 +5509,46 @@ void advance_aer_parity()
     // pipeline delay=1 is confirmed stable, no longer needs a heartbeat.
 }
 
-void head_orientation(float q[4])
-{
-    AcquireSRWLockShared(&g_poseLock);
-    q[0]=g_relQuat[0]; q[1]=g_relQuat[1]; q[2]=g_relQuat[2]; q[3]=g_relQuat[3];
-    ReleaseSRWLockShared(&g_poseLock);
-}
-
 // MATCH THE HEADSET'S VERTICAL FOV. Off by default because it changes the
 // shape of every rendered frame, and the setup it was written for (a very wide
 // headset on a square canvas) is not the one most people have.
 std::atomic<bool> g_matchVfov{false};
 
-// THE ASYMMETRY ALIGNMENT, and the reason it is switchable at all.
+// THE ASYMMETRY ALIGNMENT. OFF BY DEFAULT since 2026-09-20 -- measured, on a
+// Quest 3, and the numbers are the whole argument.
 //
-// The render is symmetric; the headset's frustum is not. So a sub-rectangle of
-// the rendered image is declared, holding exactly the angles the eye really
-// covers. That is arithmetic, and it has been checked: the rect maps onto the
-// declared angles to within a fifth of a pixel, and the pixels-per-tangent
-// agree on both axes, so there is no stretch in it.
+// WHAT IT DOES. The render is symmetric; a headset's per-eye frustum is not.
+// So a sub-rectangle of the rendered image is declared, holding exactly the
+// angles that eye really covers, which puts the image on the LENS rather than
+// on the boresight. The arithmetic is sound and was checked: the rect lands on
+// the declared angles to within a fifth of a pixel, pixels-per-tangent agree on
+// both axes, and composited_fov_scale() cancels out of the crop fractions so it
+// stays right at any render scale.
 //
-// What CANNOT be checked from here is whether the runtime honours a projection
-// layer's subImage.imageRect. A runtime that ignores it shows the whole
-// symmetric image under a window declared ~1.5x narrower, and the world reads
-// as badly over-wide -- the exact complaint, on the exact hardware where the
-// asymmetry is large enough for it to matter. Turning this off declares the
-// symmetric frustum over the full image instead: geometrically exact for what
-// was rendered, and not aligned to the lens, which is what it was added to fix.
+// WHY IT IS OFF ANYWAY. It was added for Pimax, but it is not Pimax-specific --
+// it fires on ANY asymmetric frustum, and a Quest 3 reports 14 degrees of it:
 //
-// So it is a discriminator, not a preference. If the FOV comes right with this
-// off, the crop is not being honoured and the fix belongs somewhere else.
-std::atomic<bool> g_alignAsym{true};
+//     eye0 raw L-54.00 R40.00  ->  subImage [0..2472] of 3072
+//     eye1 raw L-40.00 R54.00  ->  subImage [600..3072] of 3072
+//
+// That is 600 px of 3072 dropped per eye -- 19.5% of the width, on opposite
+// sides -- leaving 1872 px of binocular overlap, 61%. In the headset that reads
+// as the two eyes agreeing only in the middle with a fifth of each image
+// unmatched at the outer edge, which is precisely how it was reported.
+//
+// So this is a trade, not an improvement: lens-accurate placement against a
+// fifth of each eye going monocular. On hardware with a small asymmetry the
+// first is nearly free; at 14 degrees it is not, and the second wins.
+//
+// WHAT OFF MEANS. The symmetric frustum is declared over the whole image:
+// geometrically exact for what was rendered, both eyes showing the same angular
+// range, centred on the eye axis instead of the lens.
+//
+// THE ACTUAL FIX IS NEITHER. Render each eye at its own asymmetric frustum and
+// nothing needs cropping, because nothing is surplus -- see
+// offcenter_projection(). It costs DIBR shift its outer coverage, which is why
+// it is not simply the default either.
+std::atomic<bool> g_alignAsym{false};
 
 // OFF-CENTRE PROJECTION. Render each eye at the frustum the runtime actually
 // reports for it, shear and all, instead of a symmetric one that encloses it.
@@ -5386,7 +5565,78 @@ std::atomic<bool> g_alignAsym{true};
 // having as a choice rather than a decision made for everybody.
 std::atomic<bool> g_offcenter{false};
 
+// 2D SCREEN MODES. The map and the garage can each be shown as a flat panel
+// instead of a stereo world: the frame is put on a quad on the UI plane and the
+// eye projection is not submitted at all.
+//
+// WHAT "GARAGE" REALLY COVERS, because the dropdown cannot say it. The garage
+// is not identifiable -- it shares its interface with the menus and its world
+// with gameplay, so no marker list can name it, and SnowRunner does not tick
+// DRIVE_CAMERA there so the engine's own mode enum is unreadable (camera_hook.h,
+// shader_cull.cpp). kScreenGarage is the FALLBACK bucket: "not the map, and the
+// drive camera is not running". That is the garage, the main menu, every pause
+// menu, loading screens and the level fly-in. Setting it to 2D flattens all of
+// them. That is not a bug to be fixed later -- it is the resolution the
+// classifier has, and pretending otherwise would mean inventing a garage test
+// that has been looked for and does not exist.
+std::atomic<int> g_mapRender{kScreenRender3D};
+std::atomic<int> g_garageRender{kScreenRender3D};
+
+// THE MAP, by whichever classifier is selected. Separate from on_static_screen()
+// because that one deliberately answers a different question (is the world being
+// played), and folds the garage in with it.
+bool on_map_screen()
+{
+    return hooks::screen_gate_direct()
+               ? (hooks::direct_screen() == hooks::kScreenMap)
+               : hooks::in_map_view();
+}
+
 bool offcenter_projection() { return g_offcenter.load(std::memory_order_relaxed); }
+
+// TRUE while the screen we are on is set to 2D. Read by everything that has to
+// change shape for it: the fov scale, the eye offset, both quads and the layer
+// list. Map first -- in_gameplay() already reads false there, so the garage
+// bucket would otherwise swallow it.
+bool flat_screen_active()
+{
+    if (on_map_screen())
+        return g_mapRender.load(std::memory_order_relaxed) == kScreenRender2D;
+    if (!hooks::in_gameplay())
+        return g_garageRender.load(std::memory_order_relaxed) == kScreenRender2D;
+    return false;
+}
+
+int map_render_mode()    { return g_mapRender.load(std::memory_order_relaxed); }
+int garage_render_mode() { return g_garageRender.load(std::memory_order_relaxed); }
+
+void set_map_render_mode(int mode)
+{
+    const int m = (mode == kScreenRender2D) ? kScreenRender2D : kScreenRender3D;
+    if (g_mapRender.exchange(m, std::memory_order_relaxed) == m) return;
+    VRLOG("RENDER MAP -> %s", m == kScreenRender2D ? "2D (flat panel)" : "3D");
+}
+
+void set_garage_render_mode(int mode)
+{
+    const int m = (mode == kScreenRender2D) ? kScreenRender2D : kScreenRender3D;
+    if (g_garageRender.exchange(m, std::memory_order_relaxed) == m) return;
+    VRLOG("RENDER GARAGE -> %s (also the menus and the fly-in -- see g_garageRender)",
+          m == kScreenRender2D ? "2D (flat panel)" : "3D");
+}
+
+const char* screen_render_mode_key(int mode)
+{
+    return (mode == kScreenRender2D) ? "2D" : "3D";
+}
+
+bool screen_render_mode_from_key(const char* key, int& out)
+{
+    if (!key) return false;
+    if (_stricmp(key, "3D") == 0) { out = kScreenRender3D; return true; }
+    if (_stricmp(key, "2D") == 0) { out = kScreenRender2D; return true; }
+    return false;
+}
 
 void set_offcenter_projection(bool on)
 {

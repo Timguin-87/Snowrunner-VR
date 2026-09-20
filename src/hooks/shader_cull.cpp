@@ -336,6 +336,16 @@ std::atomic<uint64_t> g_roleHash[kCullRoleCount][kMaxRoleHashes] = {
       std::atomic<uint64_t>{0xF2A7D0285C830F6Aull} },  // kCullWindowSmudge
     // Confirmed by direct testing to cover the HUD, the pause menu, the map,
     // the garage and the main menu -- i.e. all of it, not just gameplay.
+    //
+    // A SYMPTOM WORTH KNOWING, whatever turns out to cause it: if part of the
+    // UI is split between the eyes on the MAP -- right eye missing the left of
+    // it, left eye the right -- that is a UI draw left in the SCENE render. The
+    // map applies the AER eye offset as a projection shear, which slides the
+    // image by opposite amounts per eye, so screen-space content in the render
+    // loses opposite edges while world markers stay correct (for geometry at
+    // depth that shear is the right stereo). A candidate shader was proposed
+    // for this on 2026-09-20 and NOT confirmed -- see the note on the search
+    // tool in menu_hook.cpp before trusting a result from it.
     { std::atomic<uint64_t>{0x3412C7480D335085ull},
       std::atomic<uint64_t>{0x182934D7084AB9D8ull},
       std::atomic<uint64_t>{0x08CAF81F835F85CEull},

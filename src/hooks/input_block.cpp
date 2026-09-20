@@ -296,29 +296,59 @@ struct DevRec {
     DWORD povOfs[8]{};
     int   povCount = 0;
     bool  centresResolved = false;
+    // When this record was last looked up. A device being polled is looked up
+    // every frame, so this separates the live ones from the released ones
+    // without having to ask DirectInput anything. See rec_for().
+    DWORD lastUsed = 0;
 };
 
-// A RING, not a fixed pool. The game creates and releases keyboard/mouse
+// A CACHE, not a fixed pool. The game creates and releases keyboard/mouse
 // device pairs repeatedly -- a dozen of them in the first thirty seconds, and
 // it visibly recycles the addresses (the same pointer shows up later as a
 // different device type). A pool that only ever grew ran out after eight, and
 // every device created past that had no record, which made GetDeviceState fall
 // through to "pass the real state" -- i.e. DirectInput silently stopped being
 // blocked at all a few seconds into the session.
+//
+// EVICT THE COLDEST, not the oldest, and that distinction is the whole bug.
+//
+// Round-robin eviction only asks which record was WRITTEN longest ago, so a
+// device created once and kept forever is guaranteed to be thrown out by
+// churn -- it just takes kMaxDevices creations instead of eight. The gamepad
+// is exactly that device: the game makes it once and holds it, while the
+// keyboard and mouse pair is recreated over and over. Once its record went, so
+// did the only thing that knew where its axes were, and GetDeviceState fell
+// into the same "pass the real state through" branch as before. The menu stayed
+// open and the pad stayed live.
+//
+// Least-recently-USED cannot do that. A device being polled is looked up on
+// every one of its own GetDeviceState calls, so a live one is never the coldest
+// entry; a released one goes cold the moment the game stops asking about it.
+//
+// Unsynchronised, as it always was: input arrives on more than one thread, and
+// the worst case is two creations picking the same victim, which costs one
+// re-capture. A lock on this path would be a lock in the game's input loop.
 constexpr int kMaxDevices = 32;
 DevRec g_dev[kMaxDevices]{};
-std::atomic<unsigned> g_devNext{0};
 
 DevRec* rec_for(IDirectInputDevice8W* dev, bool create)
 {
+    const DWORD now = GetTickCount();
     for (int i = 0; i < kMaxDevices; ++i)
-        if (g_dev[i].dev == dev) return &g_dev[i];
+        if (g_dev[i].dev == dev) { g_dev[i].lastUsed = now; return &g_dev[i]; }
     if (!create) return nullptr;
-    // Recycled addresses land on their existing entry via the scan above, so
-    // this only allocates for genuinely new ones; the oldest is evicted.
-    const unsigned slot = g_devNext.fetch_add(1) % kMaxDevices;
+
+    // An empty slot first, then the one nobody has asked about for longest.
+    // Recycled addresses never reach here -- the scan above already found them.
+    int slot = 0;
+    for (int i = 0; i < kMaxDevices; ++i) {
+        if (!g_dev[i].dev) { slot = i; break; }
+        if ((DWORD)(now - g_dev[i].lastUsed) > (DWORD)(now - g_dev[slot].lastUsed))
+            slot = i;
+    }
     g_dev[slot] = DevRec{};
     g_dev[slot].dev = dev;
+    g_dev[slot].lastUsed = now;
     return &g_dev[slot];
 }
 
@@ -403,6 +433,122 @@ HRESULT STDMETHODCALLTYPE Detour_SetDataFormat(IDirectInputDevice8W* dev, LPCDID
     return hr;
 }
 
+// --- the keyboard, via the EXE's import table ------------------------------
+//
+// WHY THIS EXISTS AT ALL. Blocking XInput and DirectInput covers the pad only
+// while the pad arrives as a pad. Steam Input does not have to deliver it that
+// way: a Steam Controller has no native XInput, and a common mapping turns its
+// buttons into KEYSTROKES. The game then reads them the way it reads the
+// keyboard -- GetAsyncKeyState -- and neither of the other two blocks sees a
+// thing. Measured 2026-09-20: XInput blocked, DirectInput neutralised, no
+// joystick device in the session at all, and the pad still drove the game.
+//
+// AN IAT HOOK, NOT AN INLINE PATCH, and that is the whole point. Detouring
+// GetAsyncKeyState with MinHook was tried three times and crashed the game on
+// startup every time -- silently, with MinHook reporting success, which points
+// at a conflict with another inline patch on the same very hot, very
+// heavily-instrumented export (RTSS is confirmed present in this process).
+// Rewriting the EXE's import slot touches no code anywhere: user32 is left
+// exactly as it is, every other hooker's patch is left exactly as it is, and
+// nothing but this one binary's own calls are redirected.
+//
+// IT ALSO REMOVES A PROBLEM RATHER THAN ADDING ONE. Because only the exe's
+// imports are redirected, the mod's own ::GetAsyncKeyState calls -- the menu
+// toggle, the rebind capture, HOME, PageUp -- resolve through OUR import table
+// and are untouched by construction. No return-address test, no thread-local
+// flag, no way for the menu to silence itself.
+//
+// INSTALLED AT THE FIRST PRESENT, not from DllMain. This DLL is loaded while
+// the exe's own imports are still being resolved, and the Steam DRM unpacks
+// after that -- so a slot written too early is a slot that gets overwritten.
+using PFN_GetAsyncKeyState = SHORT(WINAPI*)(int);
+using PFN_GetKeyState      = SHORT(WINAPI*)(int);
+PFN_GetAsyncKeyState real_GetAsyncKeyState = nullptr;
+PFN_GetKeyState      real_GetKeyState      = nullptr;
+
+SHORT WINAPI Detour_GetAsyncKeyState(int vk)
+{
+    if (is_menu_open()) return 0;
+    return real_GetAsyncKeyState ? real_GetAsyncKeyState(vk) : ::GetAsyncKeyState(vk);
+}
+
+SHORT WINAPI Detour_GetKeyState(int vk)
+{
+    // Paired with the one above because they are two faces of one question and
+    // a game that finds one silenced will happily use the other.
+    if (is_menu_open()) return 0;
+    return real_GetKeyState ? real_GetKeyState(vk) : ::GetKeyState(vk);
+}
+
+// Redirects one named import of one DLL in `module`'s import table. Returns the
+// original through `orig`. Walks by NAME rather than by address so it is
+// immune to the export already being detoured by somebody else -- which it
+// very likely is.
+bool hook_iat(HMODULE module, const char* dllName, const char* fnName,
+              void* detour, void** orig)
+{
+    auto* base = reinterpret_cast<uint8_t*>(module);
+    auto* dos  = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+
+    const IMAGE_DATA_DIRECTORY& dir =
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!dir.VirtualAddress || !dir.Size) return false;
+
+    auto* imp = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress);
+    for (; imp->Name; ++imp) {
+        const char* dll = reinterpret_cast<const char*>(base + imp->Name);
+        if (_stricmp(dll, dllName) != 0) continue;
+
+        // OriginalFirstThunk holds the NAMES, FirstThunk holds the live
+        // pointers. A bound import has no OFT, in which case the names are not
+        // recoverable and this import is left alone rather than guessed at.
+        if (!imp->OriginalFirstThunk) continue;
+        auto* names = reinterpret_cast<IMAGE_THUNK_DATA64*>(base + imp->OriginalFirstThunk);
+        auto* slots = reinterpret_cast<IMAGE_THUNK_DATA64*>(base + imp->FirstThunk);
+
+        for (int i = 0; names[i].u1.AddressOfData; ++i) {
+            if (IMAGE_SNAP_BY_ORDINAL64(names[i].u1.Ordinal)) continue;
+            auto* imn = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(
+                base + names[i].u1.AddressOfData);
+            if (strcmp(reinterpret_cast<const char*>(imn->Name), fnName) != 0) continue;
+
+            void** slot = reinterpret_cast<void**>(&slots[i].u1.Function);
+            DWORD old = 0;
+            if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old))
+                return false;
+            if (orig) *orig = *slot;
+            *slot = detour;
+            VirtualProtect(slot, sizeof(void*), old, &old);
+            return true;
+        }
+    }
+    return false;
+}
+
+void install_keyboard_block()
+{
+    static std::atomic<bool> s_done{false};
+    bool expected = false;
+    if (!s_done.compare_exchange_strong(expected, true))
+        return;
+
+    HMODULE exe = GetModuleHandleW(nullptr);
+    if (!exe) { s_done.store(false); return; }
+
+    const bool a = hook_iat(exe, "USER32.dll", "GetAsyncKeyState",
+                            reinterpret_cast<void*>(&Detour_GetAsyncKeyState),
+                            reinterpret_cast<void**>(&real_GetAsyncKeyState));
+    const bool k = hook_iat(exe, "USER32.dll", "GetKeyState",
+                            reinterpret_cast<void*>(&Detour_GetKeyState),
+                            reinterpret_cast<void**>(&real_GetKeyState));
+    VRLOG("input block: keyboard IAT %s (GetAsyncKeyState %s, GetKeyState %s) -- "
+          "this is what silences a Steam Input pad mapped to keys",
+          (a || k) ? "hooked" : "NOT hooked", a ? "ok" : "absent", k ? "ok" : "absent");
+}
+
 std::atomic<bool> g_loggedFirstDiBlock{false};
 
 HRESULT STDMETHODCALLTYPE Detour_GetDeviceState(IDirectInputDevice8W* dev, DWORD cbData, LPVOID lpvData)
@@ -442,6 +588,16 @@ HRESULT STDMETHODCALLTYPE Detour_GetDeviceState(IDirectInputDevice8W* dev, DWORD
     } else if (haveReal) {
         // No data format seen for this device, so nothing can be neutralised
         // safely -- pass the real state through rather than invent one.
+        //
+        // LOGGED, because this is the one branch where input genuinely reaches
+        // the game with the menu open, and it was silent. It should now be
+        // unreachable for any live device (see rec_for), so a line here means
+        // either a device whose SetDataFormat we never saw, or the cache
+        // thrashing again -- and either way it names the device to look at.
+        static std::atomic<int> s_loggedPassThrough{0};
+        if (s_loggedPassThrough.fetch_add(1) < 4)
+            VRLOG("input block: device %p has NO captured data format -- its real "
+                  "state PASSES THROUGH while the menu is open", (void*)dev);
         memcpy(lpvData, realState, cbData);
     }
 
@@ -588,11 +744,33 @@ DWORD xinput_poll_self(DWORD userIndex, XINPUT_STATE* state)
     ++t_passThrough;
     const DWORD r = ::XInputGetState(userIndex, state);
     --t_passThrough;
+
+    // CAN THE MOD SEE A PAD AT ALL. Logged on transition only, so it costs
+    // nothing per frame and still catches a pad appearing or vanishing.
+    //
+    // This is the line that separates the two failures that look identical
+    // from the outside. "The gamepad does not work in the menu" can mean the
+    // BLOCK is leaking (the game gets input it should not), or that the mod
+    // cannot READ the pad (the menu gets nothing to navigate with). They call
+    // for opposite fixes, and only this says which one is happening.
+    //
+    // Steam Input is the reason it can be the second one: it captures the
+    // physical pad and re-presents it, and what it presents -- a virtual pad,
+    // keystrokes, or nothing at all to callers other than the game -- is a
+    // per-controller setting on Steam's side, not something visible from here.
+    static std::atomic<DWORD> s_lastResult{0xFFFFFFFFu};
+    if (userIndex == 0 && s_lastResult.exchange(r) != r)
+        VRLOG("input block: our own pad poll -> %s (XInputGetState returned %lu)",
+              r == ERROR_SUCCESS ? "PAD PRESENT, menu navigable"
+                                 : "NO PAD -- the menu has nothing to read",
+              (unsigned long)r);
     return r;
 }
 
 void input_block_on_present()
 {
+    install_keyboard_block();
+
     // The game resolves XInput at runtime, so the DLL it uses may not have
     // been loaded yet at DllMain. Keep looking until at least one hook lands,
     // then stop -- this runs per frame and must cost nothing once satisfied.

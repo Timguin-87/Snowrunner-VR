@@ -8,9 +8,13 @@
 //  - The exe has NO XInput import, yet blocking XInput is what stops the
 //    gamepad reaching the game -- so it resolves XInput at runtime, which is
 //    invisible to the import table.
-//  - It binds DINPUT8.dll and creates DirectInput devices constantly, but only
-//    ever KEYBOARD and MOUSE ones -- never a joystick. So DirectInput carries
-//    the keyboard, not the pad.
+//  - It binds DINPUT8.dll and creates DirectInput devices constantly. That was
+//    KEYBOARD and MOUSE only when this was written, which is why the note used
+//    to say DirectInput carried the keyboard and not the pad. NO LONGER TRUE:
+//    the game now also creates a JOYSTICK device (logged 2026-09-20 as 164
+//    objects / 272 bytes / 24 absolute axes / 4 POVs, i.e. DIJOYSTATE2), so the
+//    pad comes through here as well. That is what made the device cache's
+//    eviction policy matter -- see rec_for() in input_block.cpp.
 //  - The mod's own menu polling also goes through XInput, so a blocked call
 //    has to be told apart from ours. That CANNOT be done by looking at the
 //    return address: the Steam overlay hooks XInputGetState too, and hooked it

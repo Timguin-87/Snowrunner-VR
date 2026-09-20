@@ -704,12 +704,64 @@ void draw_settings_tab()
         vrcfg::save();
     }
 
+    // --- flat screens --------------------------------------------------------
+    // Directly above the UI plane controls because that is what they follow:
+    // in 2D the scene goes on a plane placed and sized by exactly those three.
+    {
+        const char* modeLabels[2] = { "3D", "2D" };
+
+        int mapMode = xr::map_render_mode();
+        ImGui::SetNextItemWidth(120.0f);
+        if (ImGui::Combo("Render map", &mapMode, modeLabels, 2)) {
+            xr::set_map_render_mode(mapMode);
+            vrcfg::save();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "3D shows the map as the stereo world it is drawn as.@"
+                "@"
+                "2D puts it on a flat panel instead -- one image, both eyes,@"
+                "placed and sized by the UI plane settings below. Head locked@"
+                "or pinned, whichever you have set there.@"
+                "@"
+                "Map screen size does not apply in 2D: the panel is the UI@"
+                "size, so shrinking the render would only crop the map.");
+
+        int garageMode = xr::garage_render_mode();
+        ImGui::SetNextItemWidth(120.0f);
+        if (ImGui::Combo("Render garage", &garageMode, modeLabels, 2)) {
+            xr::set_garage_render_mode(garageMode);
+            vrcfg::save();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Same flat panel, for the garage.@"
+                "@"
+                "THIS IS WIDER THAN ITS NAME, and the setting cannot help it.@"
+                "The garage cannot be told apart from the menus -- it shares@"
+                "its interface with them and its world with gameplay, and the@"
+                "game does not tick the drive camera there either, so there is@"
+                "nothing left to identify it by.@"
+                "@"
+                "So 2D here also flattens the main menu, pause menus, loading@"
+                "screens and the fly-in when a level loads. If you like the@"
+                "menus flat, that is a bonus; if not, leave this on 3D.");
+
+        if (garageMode == xr::kScreenRender2D)
+            ImGui::TextDisabled("  also the menus, loading screens and the fly-in");
+    }
+
+    ImGui::Separator();
+
     // --- UI plane -----------------------------------------------------------
     // The game's HUD/menus/map are no longer rendered into the eye images at
     // all: they are captured to their own layer and submitted as a quad, which
-    // is what these three controls place. The MAP ignores all of them by
-    // design -- it is forced head-locked at full size so its screen-space
-    // markers stay on the map features they point at.
+    // is what these three controls place.
+    //
+    // The MAP ignores all three in 3D -- it is forced head-locked at full size
+    // so its screen-space markers stay on the map features they point at. In 2D
+    // it follows them like everything else, because there the markers ride the
+    // panel rather than the render (see place_ui_plane_quad).
     ImGui::TextDisabled("UI plane");
 
     // First, because it is the switch for whether the other three place
@@ -995,33 +1047,33 @@ void draw_advanced_tab()
 
     ImGui::Separator();
 
-    // THE ASYMMETRY DISCRIMINATOR. Not a preference -- see xr_mirror.h.
+    // THE ASYMMETRY CROP. Off by default -- see the measurement in xr_mirror.cpp.
     {
         bool al = xr::fov_asymmetry_align();
-        if (ImGui::Checkbox("Align FOV asymmetry (leave on)", &al)) {
+        if (ImGui::Checkbox("Align FOV asymmetry to the lens", &al)) {
             xr::set_fov_asymmetry_align(al);
             vrcfg::save();
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip(
                 "Your headset sees further toward the temple than toward the@"
-                "nose; the game is rendered symmetrically. On, the mod submits@"
-                "the sub-rectangle of that render holding exactly the angles@"
-                "each eye really covers, so the image sits on the lens.@"
+                "nose; the game is rendered symmetrically. ON submits only the@"
+                "part of that render each eye can actually see, so the image@"
+                "sits on the lens rather than on the straight-ahead axis.@"
                 "@"
-                "LEAVE IT ON. The arithmetic is checked -- the rectangle lands@"
-                "on the declared angles to within a fifth of a pixel.@"
+                "OFF BY DEFAULT, because the part it drops is not small. On a@"
+                "Quest 3 each eye loses about a fifth of the frame width, on@"
+                "opposite sides, and the two eyes then only agree across the@"
+                "middle 61%% -- which looks like the picture not lining up@"
+                "toward the outer edges.@"
                 "@"
-                "Turn it off only as a TEST. It is the one step the mod cannot@"
-                "verify from its own side: whether your runtime honours that@"
-                "sub-rectangle. A runtime that ignores it shows the whole wide@"
-                "image inside a window declared much narrower, and the world@"
-                "reads as far too wide. If turning this off makes the FOV look@"
-                "RIGHT, that is the cause -- say so, because the fix then@"
-                "belongs somewhere else entirely.@"
+                "Turn it ON if your headset's per-eye view is close to@"
+                "symmetric: then the crop is a few pixels and you get the@"
+                "lens-accurate placement for free.@"
                 "@"
-                "Off is still geometrically exact for what was rendered; it is@"
-                "simply centred on the eye axis instead of on the lens.");
+                "The arithmetic is sound either way -- this is a trade, not a@"
+                "bug. Off-centre projection above is the version that needs no@"
+                "crop at all, because it renders each eye's real shape.");
     }
 
     ImGui::Separator();

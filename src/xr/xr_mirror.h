@@ -274,9 +274,6 @@ struct AppliedEye {
 void       record_applied_eye_offset(float off, int how);
 AppliedEye applied_eye();
 
-// Relative head orientation quaternion (x,y,z,w), OpenXR axes, vs recenter origin.
-void head_orientation(float q[4]);
-
 // --- per-eye display canting -------------------------------------------------
 // Headsets with outward-angled panels (Index, Bigscreen Beyond, some Pimax)
 // report a rotation, not just a +/-IPD/2 translation, in XrView[eye].pose.
@@ -327,13 +324,37 @@ float headset_vfov_deg();
 // Whether the per-eye FOV asymmetry is declared by cropping the submitted
 // subImage to the part of the symmetric render the eye actually covers.
 //
-// ON is correct and is what ships. It is switchable because it is the one link
-// in the FOV chain this side cannot verify: the arithmetic is checked, but
-// whether a runtime honours subImage.imageRect on a projection layer is the
-// runtime's business, and one that ignores it shows the whole image under a
-// window declared much narrower -- an over-wide world. Off declares the
-// symmetric frustum over the full image: exact for what was rendered, but not
-// aligned to the lens. See the note at g_alignAsym in xr_mirror.cpp.
+// OFF by default. It places the image on the lens rather than the boresight,
+// which is the more correct thing to do -- but it costs each eye the part of
+// the frame that eye cannot see, and on a Quest 3's 14 degrees of asymmetry
+// that is 19.5% of the width per eye and drops binocular overlap to 61%. See
+// the measurement at g_alignAsym in xr_mirror.cpp.
+//
+// ON is still the right answer for a headset whose per-eye frustum is nearly
+// symmetric, where the crop is a few pixels and the lens alignment is free.
+// 2D SCREEN MODES: show the map and/or the garage as a flat panel on the UI
+// plane instead of a stereo world. The frame goes on a quad, sized and placed by
+// the UI plane settings (head-locked or pinned, size, distance), and the eye
+// projection layer is not submitted at all.
+//
+// "GARAGE" IS WIDER THAN ITS NAME. The garage cannot be identified -- see the
+// note at g_garageRender in xr_mirror.cpp -- so it is the fallback bucket:
+// the garage, the main menu, every pause menu, loading screens and the level
+// fly-in. 2D flattens all of them.
+enum { kScreenRender3D = 0, kScreenRender2D = 1 };
+int  map_render_mode();
+void set_map_render_mode(int mode);
+int  garage_render_mode();
+void set_garage_render_mode(int mode);
+
+// Stable config tokens ("3D"/"2D"), so the file and the UI cannot disagree.
+const char* screen_render_mode_key(int mode);
+bool screen_render_mode_from_key(const char* key, int& out);
+
+// TRUE while the screen currently shown is set to 2D. The one question every
+// consumer asks -- the FOV scale, the eye offset, both quads and the layer list.
+bool flat_screen_active();
+
 // OFF-CENTRE PROJECTION: render each eye at the runtime's own asymmetric
 // frustum instead of a symmetric one that encloses it. Correct, and off by
 // default because under AER it costs DIBR shift its outer coverage -- the two

@@ -338,14 +338,20 @@ constexpr int  kDefaultForceResH = 0;
 // setup it was written for -- a very wide per-eye FOV on a square canvas -- is
 // not the common one. See xr_mirror.h.
 constexpr bool kDefaultMatchHeadsetVfov = false;
-// The subImage crop that aligns the submitted FOV with the lens. ON: it is
-// correct, and it is the shipping behaviour. See xr_mirror.h for why it is a
-// switch at all -- it is the one link in the FOV chain this side cannot verify.
-constexpr bool kDefaultAlignFovAsymmetry = true;
+// The subImage crop that aligns the submitted FOV with the lens. OFF since
+// 2026-09-20: it is the more correct placement, but it costs each eye the part
+// of the frame that eye cannot see, and on a Quest 3's 14 degrees of asymmetry
+// that is 19.5% of the width per eye. See the measurement at g_alignAsym in
+// xr_mirror.cpp.
+constexpr bool kDefaultAlignFovAsymmetry = false;
 // Per-eye off-centre projection. OFF: it is the more correct render, and under
 // AER it costs DIBR shift its outer coverage, so it is a trade rather than an
 // improvement. See xr_mirror.h.
 constexpr bool kDefaultOffcenterProjection = false;
+// Map and garage rendered in 3D (the stereo world) rather than on a flat panel.
+// Default because it is what the mod has always done; 2D is the opt-in.
+constexpr int kDefaultMapRender    = xr::kScreenRender3D;
+constexpr int kDefaultGarageRender = xr::kScreenRender3D;
 
 constexpr bool kDefaultCullShaders = false;
 // The cab glass, skipped by default. It refracts the scene behind it but writes
@@ -367,6 +373,8 @@ struct Settings {
     float    mapWindowShrink    = kDefaultMapWindowShrink;
     bool     hideHud            = kDefaultHideHud;
     float    verticalRecenter   = kDefaultVerticalRecenter;
+    int      mapRender          = kDefaultMapRender;
+    int      garageRender       = kDefaultGarageRender;
     bool     offcenterProjection = kDefaultOffcenterProjection;
     bool     alignFovAsymmetry  = kDefaultAlignFovAsymmetry;
     bool     matchHeadsetVfov   = kDefaultMatchHeadsetVfov;
@@ -500,6 +508,19 @@ std::string format_file(const Settings& s)
         "WorldMarkerFix=%s\n"
         "# VerticalRecenter: pose-pitch vertical image recenter, radians (-0.5 - 0.5)\n"
         "VerticalRecenter=%.4f\n"
+        "# RenderMap / RenderGarage: 3D, 2D. 3D is the stereo world. 2D shows\n"
+        "# that screen as a flat panel instead -- the frame on a plane, both\n"
+        "# eyes the same image, placed and sized by the UI plane settings\n"
+        "# (UIPlaneMode, UIPlaneSize, UIPlaneDistance). MapWindowShrink does\n"
+        "# not apply in 2D: the panel size comes from UIPlaneSize, so all the\n"
+        "# shrink would do there is crop the map.\n"
+        "# RENDERGARAGE IS WIDER THAN ITS NAME. The garage cannot be told\n"
+        "# apart from the menus -- it shares its interface with them and its\n"
+        "# world with gameplay, and SnowRunner does not tick the drive camera\n"
+        "# there either -- so this covers the garage, the main menu, pause\n"
+        "# menus, loading screens and the level fly-in.\n"
+        "RenderMap=%s\n"
+        "RenderGarage=%s\n"
         "# OffcenterProjection: true, false. Render each eye at the exact\n"
         "# asymmetric frustum the runtime reports for it, instead of a\n"
         "# symmetric one wide enough to contain it. Strictly more correct and\n"
@@ -513,10 +534,12 @@ std::string format_file(const Settings& s)
         "# AlignFovAsymmetry: true, false. Your headset's per-eye frustum is\n"
         "# asymmetric (more FOV toward the temple than the nose); the render is\n"
         "# symmetric. TRUE declares a sub-rectangle of the render holding\n"
-        "# exactly the angles that eye covers, so the image lines up with the\n"
-        "# lens. Leave it TRUE -- the arithmetic is verified. Turn it FALSE\n"
-        "# only to test a runtime that may be ignoring the sub-rectangle: if\n"
-        "# the world stops looking too wide with this off, that is the cause.\n"
+        "# exactly the angles that eye covers, so the image sits on the lens.\n"
+        "# DEFAULT FALSE, because that crop throws away the part of each frame\n"
+        "# the eye cannot see: on a Quest 3 (14 deg of asymmetry) it is 19.5%%\n"
+        "# of the width per eye, and binocular overlap drops to 61%% -- the two\n"
+        "# eyes then agree only in the middle. Worth TRUE on a headset whose\n"
+        "# per-eye FOV is nearly symmetric, where the crop is a few pixels.\n"
         "AlignFovAsymmetry=%s\n"
         "# MatchHeadsetVerticalFov: true, false. Take the rendered VERTICAL\n"
         "# FOV from the headset instead of from the render canvas aspect. On a\n"
@@ -639,6 +662,8 @@ std::string format_file(const Settings& s)
         s.renderFovScale, s.mapWindowShrink,
         s.worldMarkerFix ? "true" : "false",
         s.verticalRecenter,
+        xr::screen_render_mode_key(s.mapRender),
+        xr::screen_render_mode_key(s.garageRender),
         s.offcenterProjection ? "true" : "false",
         s.alignFovAsymmetry ? "true" : "false",
         s.matchHeadsetVfov ? "true" : "false",
@@ -820,6 +845,18 @@ void init()
         if (parse_float(v, f) && f >= -0.5f && f <= 0.5f) s.verticalRecenter = f; else note_invalid("VerticalRecenter", v);
     } else anyMissing = true;
 
+    if (kv_find(kv, "RenderMap", v)) {
+        int m;
+        if (xr::screen_render_mode_from_key(v.c_str(), m)) s.mapRender = m;
+        else note_invalid("RenderMap", v);
+    } else anyMissing = true;
+
+    if (kv_find(kv, "RenderGarage", v)) {
+        int m;
+        if (xr::screen_render_mode_from_key(v.c_str(), m)) s.garageRender = m;
+        else note_invalid("RenderGarage", v);
+    } else anyMissing = true;
+
     if (kv_find(kv, "OffcenterProjection", v)) {
         if (_stricmp(v.c_str(), "true") == 0 || v == "1")       s.offcenterProjection = true;
         else if (_stricmp(v.c_str(), "false") == 0 || v == "0") s.offcenterProjection = false;
@@ -956,6 +993,8 @@ void init()
     xr::set_map_window_shrink(s.mapWindowShrink);
     hooks::set_world_marker_fix_enabled(s.worldMarkerFix);
     xr::set_vertical_recenter(s.verticalRecenter);
+    xr::set_map_render_mode(s.mapRender);
+    xr::set_garage_render_mode(s.garageRender);
     xr::set_offcenter_projection(s.offcenterProjection);
     xr::set_fov_asymmetry_align(s.alignFovAsymmetry);
     xr::set_match_headset_vfov(s.matchHeadsetVfov);
@@ -1029,6 +1068,8 @@ void save()
     s.mapWindowShrink = xr::map_window_shrink();
     s.worldMarkerFix = hooks::world_marker_fix_enabled();
     s.verticalRecenter = xr::vertical_recenter();
+    s.mapRender    = xr::map_render_mode();
+    s.garageRender = xr::garage_render_mode();
     s.offcenterProjection = xr::offcenter_projection();
     s.alignFovAsymmetry = xr::fov_asymmetry_align();
     s.matchHeadsetVfov = xr::match_headset_vfov();

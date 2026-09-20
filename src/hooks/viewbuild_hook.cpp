@@ -556,8 +556,12 @@ constexpr bool kTestCombine = true;
 // sway test. Rotation is applied as one composed matrix (yaw*pitch*roll) so
 // roll rides along with yaw/pitch; the eye is auto-pivoted (C = -eyePos).
 constexpr bool  kConnectHead = true;   // true = live HMD; false = flat T-cycle probe
-constexpr bool  kUseQuatRotation = true;  // drive cockpit rotation from the full HMD quaternion
-constexpr bool  kQuatConj = false;        // conjugate (invert) if rotation comes out reversed
+// (kUseQuatRotation / kQuatConj lived here, with build_head_R() below them:
+// the cockpit rotation driven from the full HMD quaternion instead of Euler
+// angles, basis-changed into the game's view space. Nothing ever called it --
+// the rotation goes in from xr::head_look()'s yaw/pitch/roll at detour_combine2
+// and detour_fna, and has for a long time. Removed 2026-09-20 with
+// xr::head_orientation(), which it was the only consumer of.)
 constexpr float kHeadPosScale = 1.0f;   // metres of head motion -> game units
 
 // DIAGNOSTIC: cycle yaw -> pitch -> horizontal-translate sway (flat-visible).
@@ -572,27 +576,6 @@ Mat4 mul4(const Mat4& A, const Mat4& B){ Mat4 C{}; for(int r=0;r<4;++r)for(int c
 
 float dot3(const float a[3], const float b[3]){ return a[0]*b[0]+a[1]*b[1]+a[2]*b[2]; }
 bool  unit3(const float a[3]){ float l=dot3(a,a); return std::fabs(l-1.0f)<0.02f; }
-
-// Full HMD head rotation as a view-space 4x4 (no Euler): quaternion -> matrix,
-// then basis-change OpenXR axes into the game's view space (view_x=-o_z,
-// view_y=o_y, view_z=o_x, matching the yaw=Y / pitch=Z / roll=X findings).
-void build_head_R(Mat4& R){
-    float q[4]; xr::head_orientation(q);
-    // Negate x,z to reverse pitch (and roll — discarded downstream) while keeping
-    // yaw: headset-confirmed the game's pitch is inverted vs the naive mapping.
-    q[0]=-q[0]; q[2]=-q[2];
-    if (kQuatConj) { q[0]=-q[0]; q[1]=-q[1]; q[2]=-q[2]; }
-    float x=q[0],y=q[1],z=q[2],w=q[3];
-    float Ro[3][3]={
-        {1-2*(y*y+z*z), 2*(x*y-w*z),   2*(x*z+w*y)},
-        {2*(x*y+w*z),   1-2*(x*x+z*z), 2*(y*z-w*x)},
-        {2*(x*z-w*y),   2*(y*z+w*x),   1-2*(x*x+y*y)}};
-    static const float P[3][3]={{0,0,-1},{0,1,0},{1,0,0}};
-    float PR[3][3], Rv[3][3];
-    for(int i=0;i<3;++i)for(int j=0;j<3;++j){float s=0;for(int k=0;k<3;++k)s+=P[i][k]*Ro[k][j];PR[i][j]=s;}
-    for(int i=0;i<3;++i)for(int j=0;j<3;++j){float s=0;for(int k=0;k<3;++k)s+=PR[i][k]*P[j][k];Rv[i][j]=s;}
-    R = Mat4{}; for(int r=0;r<3;++r)for(int c=0;c<3;++c)R.m[r][c]=Rv[r][c]; R.m[3][3]=1.0f;
-}
 
 void cross3(const float a[3], const float b[3], float o[3]){
     o[0]=a[1]*b[2]-a[2]*b[1]; o[1]=a[2]*b[0]-a[0]*b[2]; o[2]=a[0]*b[1]-a[1]*b[0];
