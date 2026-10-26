@@ -353,6 +353,13 @@ bool screen_render_mode_from_key(const char* key, int& out);
 // consumer asks -- the FOV scale, the eye offset, both quads and the layer list.
 bool flat_screen_active();
 
+// TRUE while the game's UI should stay IN the rendered frame instead of moving
+// to its own quad layer. Only ever on a runtime that takes a single quad per
+// frame (SteamVR under Proton): a 2D screen spends that quad on its panel, so
+// the UI is left to draw into the panel's own image. Read per UI draw by
+// ui_hook's redirect. Always false on Windows.
+bool ui_stays_in_frame();
+
 // OFF-CENTRE PROJECTION: render each eye at the runtime's own asymmetric
 // frustum instead of a symmetric one that encloses it. Correct, and off by
 // default because under AER it costs DIBR shift its outer coverage -- the two

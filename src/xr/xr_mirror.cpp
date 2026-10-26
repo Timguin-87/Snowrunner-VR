@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <d3d11.h>
+#include <d3d10.h>        // ID3D10Multithread -- see protect_immediate_context()
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 
@@ -1829,8 +1830,56 @@ bool recommended_eye_size(uint32_t& w, uint32_t& h)
     return w > 0 && h > 0;
 }
 
+// --- SteamVR UNDER PROTON ---------------------------------------------------
+//
+// Two things about it that Windows does not share, both measured by a Linux
+// player (HP Reverb G2, SteamVR 2.18, Proton Experimental, 2026-10-23):
+//
+//   1. xrEndFrame does not return until the GPU has finished the frame it is
+//      handed -- ~9 ms a call, up to 16. Its DXVK share (wineopenxr's queue
+//      lock) is ~0.03 ms, so the wait is in the runtime itself. See end_frame().
+//   2. A frame carrying more than ONE quad layer is rejected outright with
+//      XR_ERROR_SWAPCHAIN_RECT_INVALID (-25): the menu + UI pair failed, and
+//      so did two 64x64 test quads. SteamVR there only ever creates a single
+//      quad overlay (openxr_quadlayer_0 in vrserver.txt). A rejected frame is a
+//      dropped frame, so with the settings menu open nothing reached the
+//      headset at all. See render_frame()'s layer list.
+//
+// Wine is detected by ntdll exporting wine_get_version, which only Wine's
+// does. Both adaptations hang off this one answer; on Windows neither runs.
+bool running_under_wine()
+{
+    static const bool wine = [] {
+        using PFN_wine_get_version = const char* (CDECL*)();
+        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        auto ver = ntdll ? reinterpret_cast<PFN_wine_get_version>(
+                               GetProcAddress(ntdll, "wine_get_version"))
+                         : nullptr;
+        if (ver)
+            VRLOG("platform: Wine %s -- xrEndFrame runs on a worker thread, and each "
+                  "frame carries at most one quad layer", ver());
+        return ver != nullptr;
+    }();
+    return wine;
+}
+
+// Named for the constraint rather than the platform, because that is what the
+// layer list is reasoning about.
+//
+// kTestSingleQuadOnWindows: OFF. True applies the one-quad layer list on
+// Windows as well -- the only way to check it without a Linux machine. Open the
+// mod menu (the UI plane should step aside, the menu stays) and set a screen to
+// 2D (its panel should carry the HUD in its own image, then give way to the eye
+// projection while the menu is open). It does NOT move xrEndFrame onto the
+// worker; that stays Wine-only, because a different runtime's xrEndFrame on
+// another thread proves nothing about SteamVR's.
+constexpr bool kTestSingleQuadOnWindows = false;
+bool single_quad_runtime() { return kTestSingleQuadOnWindows || running_under_wine(); }
+
 bool init(IDXGISwapChain* swapchain)
 {
+    running_under_wine();   // decided, and logged, before anything depends on it
+
     ComPtr<ID3D11Device> dev;
     if (FAILED(swapchain->GetDevice(__uuidof(ID3D11Device), (void**)&dev))) {
         VRLOG("could not get D3D11 device from swapchain");
@@ -1980,6 +2029,8 @@ void note_view_validity(const XrViewState& vst)
           (unsigned long long)vst.viewStateFlags, (int)g.state);
 }
 
+void end_frame_wait();   // defined with end_frame(), above render_frame()
+
 void poll_events()
 {
     XrEventDataBuffer ev{XR_TYPE_EVENT_DATA_BUFFER};
@@ -2004,6 +2055,7 @@ void poll_events()
                 bi.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
                 if (XR_SUCCEEDED(xrBeginSession(g.session, &bi))) g.running = true;
             } else if (s->state == XR_SESSION_STATE_STOPPING) {
+                end_frame_wait();   // no-op: mirror_on_present() already waited
                 xrEndSession(g.session);
                 g.running = false;
             } else if (s->state == XR_SESSION_STATE_LOSS_PENDING) {
@@ -4004,6 +4056,187 @@ ID3D11ShaderResourceView* stale_eye_fill(uint32_t stale)
     return g.dibrFillSrv.Get();
 }
 
+// --- xrEndFrame, and the worker it runs on under Wine ------------------------
+//
+// SteamVR under Proton holds xrEndFrame until the GPU has finished the frame
+// (see running_under_wine()). On Windows the call returns at once and the GPU
+// works through the frame while the game builds the next one; there, the game
+// thread sat in it for the whole GPU frame and then did its own CPU work with
+// the GPU idle. At ~5 ms of game CPU that is past a 90 Hz frame: 60 fps,
+// purple bars in the SteamVR graph, judder on head turns. Light scenes (~2 ms)
+// squeezed under the deadline, which is why it came and went.
+//
+// So under Wine the call is handed to a worker thread. Everything that touches
+// an XR swapchain -- every acquire, blit and release -- has already happened on
+// the game thread by then, and the game thread waits for the worker before it
+// touches the session again: end_frame_wait() runs at the top of
+// mirror_on_present(), ahead of poll_events() and xrWaitFrame. End(N) still
+// precedes everything of frame N+1, as the spec requires. Measured by the
+// reporter: game thread blocked 0.01-2.9 ms instead of ~9, 86-90 fps instead
+// of ~60, no purple.
+//
+// WHAT DOES OVERLAP is xrEndFrame and the game's own D3D11 work, and that is
+// the part to be careful with. Current Proton (10, Experimental) only takes
+// DXVK's submission-queue lock inside xrEndFrame, which is thread-safe by
+// design. Proton 8 and 9 ALSO call FlushRenderingCommands there, which flushes
+// the game's IMMEDIATE context -- from the worker, while the game thread keeps
+// recording into it. That is a data race inside DXVK unless the context is
+// lock-protected, so under Wine it is made so (protect_immediate_context()).
+//
+// Layers are deep-copied into the job: the originals are render_frame()'s
+// locals. None of them carries a `next` chain, which is what makes a struct
+// copy a complete one -- add a chained extension struct to a layer and this
+// copy has to learn about it.
+struct AsyncEndJob {
+    XrCompositionLayerProjection     proj{};
+    XrCompositionLayerProjectionView views[2]{};
+    XrCompositionLayerQuad           quads[3]{};
+    const XrCompositionLayerBaseHeader* layers[4]{};
+    XrFrameEndInfo fei{XR_TYPE_FRAME_END_INFO};
+    XrSession session = XR_NULL_HANDLE;
+    XrResult  result = XR_SUCCESS;
+    uint32_t  quadCount = 0;
+    LARGE_INTEGER dispatched{}, finished{};   // QPC, for the timing line
+};
+AsyncEndJob g_endJob;
+HANDLE g_endGo = nullptr, g_endDone = nullptr, g_endThread = nullptr;
+bool   g_endPending = false;     // game thread only
+bool   g_endAsyncFailed = false;
+
+// A rejected frame is a dropped frame, and it used to be silent: the -25s were
+// found with an instrumented build. The first few in full, then a running
+// count, so a runtime that rejects every frame cannot flood the log.
+void note_end_result(XrResult res, uint32_t layerCount, uint32_t quadCount)
+{
+    if (XR_SUCCEEDED(res)) return;
+    static uint32_t rejected = 0;
+    ++rejected;
+    if (rejected <= 5 || rejected % 600 == 0)
+        VRLOG("xrEndFrame FAILED %d (%u layer(s), %u quad(s)) -- %u frame(s) rejected "
+              "so far, each one a dropped frame", (int)res, layerCount, quadCount, rejected);
+}
+
+// DXVK implements ID3D10Multithread on the immediate context as a spinlock
+// taken by every entry point -- FlushRenderingCommands included -- so turning
+// it on makes the worker's flush and the game thread's recording take turns.
+// One uncontended lock per immediate-context call; Wine only.
+void protect_immediate_context()
+{
+    ComPtr<ID3D10Multithread> mt;
+    if (g.ctx && SUCCEEDED(g.ctx.As(&mt)) && mt) {
+        mt->SetMultithreadProtected(TRUE);
+        VRLOG("xrEndFrame: immediate context lock-protected (Proton 8/9 flush it "
+              "from inside xrEndFrame)");
+    } else {
+        VRLOG("xrEndFrame: ID3D10Multithread unavailable -- on Proton 8/9 the "
+              "worker's flush of the immediate context is unguarded");
+    }
+}
+
+DWORD WINAPI end_frame_worker(LPVOID)
+{
+    for (;;) {
+        WaitForSingleObject(g_endGo, INFINITE);
+        g_endJob.result = xrEndFrame(g_endJob.session, &g_endJob.fei);
+        QueryPerformanceCounter(&g_endJob.finished);
+        SetEvent(g_endDone);
+    }
+}
+
+// Blocks until the previously dispatched xrEndFrame has returned; a no-op when
+// nothing is in flight, which on Windows is always. Also the one place the
+// worker's results are looked at.
+void end_frame_wait()
+{
+    if (!g_endPending) return;
+    LARGE_INTEGER w0, w1;
+    QueryPerformanceCounter(&w0);
+    WaitForSingleObject(g_endDone, INFINITE);
+    QueryPerformanceCounter(&w1);
+    g_endPending = false;
+    note_end_result(g_endJob.result, g_endJob.fei.layerCount, g_endJob.quadCount);
+
+    // Every 10 s: how long xrEndFrame takes on the worker, and how long the
+    // game thread still ends up waiting for it -- the two numbers that say
+    // whether this is doing its job on a given machine.
+    static LARGE_INTEGER freq{};
+    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+    static double sumEnd = 0.0, maxEnd = 0.0, sumWait = 0.0;
+    static uint32_t frames = 0;
+    static ULONGLONG last = GetTickCount64();
+    const double endMs  = double(g_endJob.finished.QuadPart - g_endJob.dispatched.QuadPart) * 1000.0 / double(freq.QuadPart);
+    const double waitMs = double(w1.QuadPart - w0.QuadPart) * 1000.0 / double(freq.QuadPart);
+    sumEnd += endMs; sumWait += waitMs; maxEnd = (std::max)(maxEnd, endMs); ++frames;
+    const ULONGLONG now = GetTickCount64();
+    if (now - last >= 10000) {
+        VRLOG("xrEndFrame on the worker: %.2f ms avg, %.2f max | game thread waited "
+              "%.2f ms avg for it (%u frames)", sumEnd / frames, maxEnd, sumWait / frames, frames);
+        sumEnd = maxEnd = sumWait = 0.0; frames = 0; last = now;
+    }
+}
+
+XrResult end_frame_inline(XrSession session, const XrFrameEndInfo& in, uint32_t quadCount)
+{
+    const XrResult r = xrEndFrame(session, &in);
+    note_end_result(r, in.layerCount, quadCount);
+    return r;
+}
+
+// xrEndFrame for render_frame(). Synchronous on Windows, exactly as it always
+// was; on the worker under Wine. There the result is not known yet, so this
+// returns XR_SUCCESS and end_frame_wait() reports the real one a frame later.
+XrResult end_frame(XrSession session, const XrFrameEndInfo& in, uint32_t quadCount)
+{
+    if (!running_under_wine() || g_endAsyncFailed || in.layerCount > 4)
+        return end_frame_inline(session, in, quadCount);
+
+    if (!g_endThread) {
+        protect_immediate_context();   // before the first flush can race
+        g_endGo   = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        g_endDone = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (g_endGo && g_endDone)
+            g_endThread = CreateThread(nullptr, 0, end_frame_worker, nullptr, 0, nullptr);
+        if (!g_endThread) {
+            VRLOG("xrEndFrame: worker thread would not start -- staying synchronous");
+            g_endAsyncFailed = true;
+            return end_frame_inline(session, in, quadCount);
+        }
+        SetThreadPriority(g_endThread, THREAD_PRIORITY_ABOVE_NORMAL);
+    }
+    end_frame_wait();   // never two in flight (normally finished long ago)
+
+    AsyncEndJob& j = g_endJob;
+    j.session = session;
+    j.fei = in;
+    j.quadCount = quadCount;
+    uint32_t nq = 0;
+    bool haveProj = false;
+    for (uint32_t i = 0; i < in.layerCount; ++i) {
+        const XrCompositionLayerBaseHeader* l = in.layers[i];
+        if (l->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION && !haveProj &&
+            reinterpret_cast<const XrCompositionLayerProjection*>(l)->viewCount <= 2) {
+            j.proj = *reinterpret_cast<const XrCompositionLayerProjection*>(l);
+            for (uint32_t v = 0; v < j.proj.viewCount; ++v) j.views[v] = j.proj.views[v];
+            j.proj.views = j.views;
+            j.layers[i] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&j.proj);
+            haveProj = true;
+        } else if (l->type == XR_TYPE_COMPOSITION_LAYER_QUAD && nq < 3) {
+            j.quads[nq] = *reinterpret_cast<const XrCompositionLayerQuad*>(l);
+            j.layers[i] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&j.quads[nq]);
+            ++nq;
+        } else {
+            // Something this copy cannot hold: submit it here, rather than hand
+            // the worker a pointer into a stack frame that is about to go away.
+            return end_frame_inline(session, in, quadCount);
+        }
+    }
+    j.fei.layers = in.layerCount ? j.layers : nullptr;
+    QueryPerformanceCounter(&j.dispatched);
+    g_endPending = true;
+    SetEvent(g_endGo);
+    return XR_SUCCESS;
+}
+
 // REMOVED 2026-08-24: the "Double AER (2x)" render mode and its render_frame().
 //
 // It was never double-rate. It ran a complete xrWaitFrame -> xrBeginFrame ->
@@ -5064,6 +5297,15 @@ void render_frame(IDXGISwapChain* swapchain)
     XrCompositionLayerQuad menuQuad{};
     const bool haveMenuQuad = build_menu_quad_layer(menuQuad);
 
+    // ONE QUAD PER FRAME on SteamVR under Proton (see running_under_wine()).
+    // What gives way, in order: the UI plane, then a 2D screen's panel -- never
+    // the mod menu, which has to stay usable. With the menu closed a 2D panel
+    // keeps the quad and the UI rides inside its image instead (the redirect
+    // stands down, see ui_stays_in_frame()); with the menu open the panel steps
+    // aside for the eye projection, the way the UI plane already does. On
+    // Windows oneQuad is false and the list below is exactly what it was.
+    const bool oneQuad = single_quad_runtime();
+
     // The game's own UI, on its own plane. UNDER the mod menu and OVER the eye
     // projection -- layer order is submission order, and the settings panel has
     // to stay readable on top of whatever the game is showing.
@@ -5072,13 +5314,14 @@ void render_frame(IDXGISwapChain* swapchain)
     // doing that for a layer that will not be submitted is pure cost.
     XrCompositionLayerQuad uiQuad{};
     const bool haveUiQuad = validTime &&
+                            !(oneQuad && (haveMenuQuad || flat_screen_active())) &&
                             build_ui_quad_layer(uiQuad, fs.predictedDisplayTime);
 
     // 2D SCREEN MODE: the scene on a plane, INSTEAD of the eye projection. Not
     // as well as -- submitting both would leave the stereo world behind the
     // panel, which is neither of the two things the setting offers.
     XrCompositionLayerQuad sceneQuad{};
-    const bool haveSceneQuad = submitLayer &&
+    const bool haveSceneQuad = submitLayer && !(oneQuad && haveMenuQuad) &&
                                build_scene_quad_layer(sceneQuad, fs.predictedDisplayTime);
 
     const XrCompositionLayerBaseHeader* layers[4];
@@ -5097,16 +5340,12 @@ void render_frame(IDXGISwapChain* swapchain)
     fei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
     fei.layerCount = layerCount;
     fei.layers = layerCount ? layers : nullptr;
-    XrResult endRes = xrEndFrame(g.session, &fei);
-
     // A black headset with a working desktop means either no layer is being
-    // submitted or the runtime is rejecting it -- both were silent until now.
-    {
-        // (The every-2s "XR submit: ..." heartbeat lived here. Removed
-        // 2026-08-09 -- steady-state noise that buried the lines that matter.
-        // The braces around this are left deliberately untouched.)
-        (void)endRes;
-    }
+    // submitted or the runtime is rejecting it. Rejections are logged by
+    // end_frame() -- from the worker's result a frame later under Wine. (The
+    // every-2s "XR submit: ..." heartbeat that lived here was removed
+    // 2026-08-09: steady-state noise that buried the lines that matter.)
+    end_frame(g.session, fei, (uint32_t)haveSceneQuad + haveUiQuad + haveMenuQuad);
 
     // Reset fresh flags and signal the next camera build to advance AER parity.
     g.eyeFresh[0] = g.eyeFresh[1] = false;
@@ -5584,6 +5823,13 @@ bool flat_screen_active()
     return false;
 }
 
+bool ui_stays_in_frame()
+{
+    // single_quad_runtime() first: it is a cached constant, false on Windows,
+    // and this runs for every UI draw.
+    return single_quad_runtime() && flat_screen_active();
+}
+
 int map_render_mode()    { return g_mapRender.load(std::memory_order_relaxed); }
 int garage_render_mode() { return g_garageRender.load(std::memory_order_relaxed); }
 
@@ -5912,6 +6158,10 @@ void mirror_on_present(IDXGISwapChain* swapchain)
         winchlayer::latch(g.ctx.Get(), present_route_eye() == kWinchCaptureEye);
     }
 
+    // The previous frame's xrEndFrame may still be on the worker (Wine only).
+    // Waited for HERE, ahead of poll_events() as well as render_frame(), so no
+    // call on the session -- an xrEndSession included -- ever overlaps it.
+    end_frame_wait();
     poll_events();
     if (g.running) render_frame(swapchain);
 }

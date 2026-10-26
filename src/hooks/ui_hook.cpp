@@ -337,6 +337,9 @@ bool redirect_if_ui(ID3D11DeviceContext* ctx, DrawFn&& draw)
 {
     if (hooks::current_draw_role() != hooks::kCullUi || !uilayer::active())
         return false;
+    // A one-quad runtime on a 2D screen: the panel holds the only quad, so the
+    // UI draws into the frame it is a panel of. See xr::ui_stays_in_frame().
+    if (xr::ui_stays_in_frame()) return false;
     if (ui_copy_excluded(hooks::current_draw_hash())) return false;
 
     if (hooks::world_marker_fix_enabled()) {

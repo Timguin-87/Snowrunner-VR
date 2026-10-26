@@ -127,7 +127,11 @@ LONG CALLBACK handler(EXCEPTION_POINTERS* info)
 #if defined(_M_X64)
     if (info->ContextRecord) {
         CONTEXT ctx = *info->ContextRecord;  // local copy; unwind modifies it
-        constexpr int kMaxFrames = 24;
+        // 64, not 24: the exit crash inside Virtual Desktop's runtime spends
+        // 24 frames in d3d11 and VD alone, so a 24-frame walk ended before it
+        // could show WHO called into VD -- the mod's frame loop, or VD
+        // cleaning up during process exit. That is the whole question.
+        constexpr int kMaxFrames = 64;
         int n = 0;
         while (n < kMaxFrames) {
             // Always log the current RIP, even when it is 0.  A null RIP means
