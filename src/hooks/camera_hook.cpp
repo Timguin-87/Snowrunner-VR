@@ -1,5 +1,5 @@
 #include "hooks/camera_hook.h"
-#include "hooks/pattern_scan.h"
+#include "hooks/game_addresses.h"
 #include "xr/xr_mirror.h"
 #include "common/log.h"
 
@@ -13,10 +13,8 @@
 namespace hooks {
 namespace {
 
-// --- recon: docs/recon.md, camera commit function ---
-const char* kSig =
-    "48 8B C4 F3 0F 11 50 18 48 89 50 10 55 53 56 57 41 55 41 56 "
-    "48 8D A8 ?? ?? FF FF 48 81 EC ?? ?? 00 00 0F 29 70 A8 48 8D B1 84 01 00 00";
+// The camera commit function itself is located by game_addresses.cpp (recon:
+// docs/recon.md), with every other engine address.
 
 // Offsets within combine::DRIVE_CAMERA (see recon).
 constexpr int kStageEye    = 0x184;  // 3 floats
@@ -162,14 +160,13 @@ void* detour_cam(void* cam, void* rdx, float dt)
 
 bool install_camera_hook()
 {
-    HMODULE exe = GetModuleHandleW(nullptr);
-    uint8_t* fn = pattern_scan(exe, kSig);
-    if (!fn) {
-        VRLOG("camera signature not found — head tracking disabled (unknown game version)");
+    const uintptr_t rva = game_addresses().cameraCommit;
+    if (!rva) {
+        VRLOG("camera hook NOT installed -- camera commit fn not found in this game "
+              "build (cockpit/exterior detection off)");
         return false;
     }
-    VRLOG("camera commit fn at %p (exe+0x%llX)", fn,
-          (unsigned long long)(fn - reinterpret_cast<uint8_t*>(exe)));
+    uint8_t* fn = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr)) + rva;
 
     if (MH_CreateHook(fn, reinterpret_cast<void*>(&detour_cam),
                       reinterpret_cast<void**>(&real_cam)) != MH_OK ||
@@ -177,7 +174,7 @@ bool install_camera_hook()
         VRLOG("camera hook install FAILED");
         return false;
     }
-    VRLOG("camera hook installed");
+    VRLOG("camera hook installed at exe+0x%llX", (unsigned long long)rva);
     return true;
 }
 

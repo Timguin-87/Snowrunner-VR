@@ -8,6 +8,7 @@
 #include "hooks/ui_hook.h"
 #include "hooks/shader_cull.h"
 #include "hooks/resolution_hook.h"
+#include "hooks/pattern_scan.h"
 #include "render/smudge_layer.hpp"
 #include "xr/xr_mirror.h"
 
@@ -398,6 +399,9 @@ struct Settings {
     // Only roles that hooks::cull_role_extensible() allows have a config slot.
     // The rest are baked into the build with no key at all -- see shader_cull.h.
     std::string rigidShaderHash;
+    // Developer switch, see hooks::maybe_dump_game_image(). Not a preference:
+    // it exists for the session after a game update, and is off otherwise.
+    bool     dumpGameCode       = false;
 };
 
 // Where each role's hash list lives in Settings.
@@ -652,7 +656,14 @@ std::string format_file(const Settings& s)
         "# and across machines, unlike the pointers shown in the settings UI.\n"
         "# Filled in by the search when it finds something that has no name yet.\n"
         "# Empty = none.\n"
-        "CullShaderHashes=%s\n",
+        "CullShaderHashes=%s\n"
+        "\n"
+        "# DumpGameCode: true, false. FOR UPDATING THE MOD AFTER A GAME PATCH.\n"
+        "# Writes the running game's decrypted code beside the log as\n"
+        "# snowrunner_image_<build>.bin (~50 MB, once per game build), which is\n"
+        "# what new signatures are made from -- the exe on disk is encrypted and\n"
+        "# cannot be read. Leave false otherwise.\n"
+        "DumpGameCode=%s\n",
         s.dibrShift ? "true" : "false",
         s.horizonLock ? "true" : "false", s.hideHud ? "true" : "false",
         vk_name(s.menuVk).c_str(), gamepad_combo_name(s.menuCombo).c_str(),
@@ -676,7 +687,8 @@ std::string format_file(const Settings& s)
         s.cameraFovFactor,
         s.disableWindows ? "true" : "false",
         s.rigidShaderHash.c_str(),
-        s.cullShaders ? "true" : "false", s.cullShaderHashes.c_str());
+        s.cullShaders ? "true" : "false", s.cullShaderHashes.c_str(),
+        s.dumpGameCode ? "true" : "false");
     if (written < 0 || written >= (int)sizeof(buf))
         VRLOG("config: FORMAT TRUNCATED (%d bytes needed) -- settings past the cut "
               "will not persist; grow buf[] in format_file()", written);
@@ -974,6 +986,12 @@ void init()
         else note_invalid("CullShaderHashes", v);
     } else anyMissing = true;
 
+    if (kv_find(kv, "DumpGameCode", v)) {
+        if (_stricmp(v.c_str(), "true") == 0 || v == "1")       s.dumpGameCode = true;
+        else if (_stricmp(v.c_str(), "false") == 0 || v == "0") s.dumpGameCode = false;
+        else note_invalid("DumpGameCode", v);
+    } else anyMissing = true;
+
     if (anyMissing) {
         VRLOG("config: Snowrunner_VR_config.txt is missing one or more keys -- filling defaults");
     } else if (fileExisted) {
@@ -1006,6 +1024,7 @@ void init()
     hooks::set_screen_gate_direct(s.screenGateDirect);
     hooks::set_camera_fov_factor(s.cameraFovFactor);
     hooks::set_force_resolution(s.forceResW, s.forceResH);
+    hooks::set_dump_game_code(s.dumpGameCode);
     g_resolutionUnset.store(s.resolutionUnset);
 
     // Hashes first: add_culled_hash() checks each against the named shaders,
@@ -1089,6 +1108,7 @@ void save()
     s.cullShaders = hooks::shader_cull_enabled();
     s.cullShaderHashes = hash_list_str();
     s.disableWindows      = hooks::cull_role_enabled(hooks::kCullWindows);
+    s.dumpGameCode        = hooks::dump_game_code();
     refresh_role_hashes(s);
     write_defaults_or_current(s);
 }

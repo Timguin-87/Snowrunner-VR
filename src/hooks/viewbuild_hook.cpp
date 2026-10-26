@@ -2,6 +2,8 @@
 #include "hooks/camera_fov.h"
 #include "hooks/camera_hook.h"
 #include "hooks/cbuffer_hook.h"
+#include "hooks/game_addresses.h"
+#include "hooks/pattern_scan.h"
 #include "xr/xr_mirror.h"
 #include "common/log.h"
 
@@ -17,11 +19,17 @@
 namespace hooks {
 namespace {
 
-// View-matrix builder + the MAIN RENDER camera's build call site (found via
-// call-site cycling: exe+0xA179FB). Addresses verified against SnowRunner
-// 1.886173.SNOW_DLC_18 (exe SHA-256 FBD3F36C...B4E683).
-constexpr uintptr_t kBuilderOffset = 0x1153390;
-constexpr uintptr_t kMainCallSite  = 0xA179FB;
+// NO ENGINE ADDRESS IN THIS FILE IS A CONSTANT. Every function hooked here and
+// every return address a detour filters on comes from game_addresses.h, which
+// finds them in the running exe by signature and by what calls what -- see the
+// note there for why remembered offsets were retired. The address globals below
+// (g_viewBuilderRet, g_combineRet, g_combine2Ret, g_orbitCam*, g_settingsPtr,
+// g_projOverrideCaller) are filled in by install_viewbuild_hook() before any
+// hook is enabled, and one that was not found stays 0, which no caller matches.
+//
+// The view-matrix builder's MAIN RENDER camera call site (originally found by
+// call-site cycling). Diagnostics only now -- see install_viewbuild_hook().
+uintptr_t g_viewBuilderRet = 0;
 
 // Module base, set at install. Defined here rather than beside the camera code
 // because the screen-state detour below needs it to make a return address
@@ -57,33 +65,29 @@ uintptr_t g_moduleBase = 0;
 // That part always worked.
 
 // The camera COMBINE fn: combine(out=rcx, position=rdx float3, orientation=r8),
-// called for the main camera at +0xA17DF0 (return addr +0xA17DF5). rdx is the
-// eye POSITION — the injection point for stereo/positional translation.
-constexpr uintptr_t kCombineOffset = 0x11528D0;
-constexpr uintptr_t kCombineRet    = 0xA17BC5;
+// return-address filtered to its call in the main camera build. rdx is the eye
+// POSITION -- the injection point for stereo/positional translation.
+uintptr_t g_combineRet = 0;
 
 // FnA = fillOrbitView(viewObj=rcx, eye=rdx, target=r8, up=r9). Called for BOTH the
 // orbit CAMERA and the sun/shadow view — so we hook FnA and filter by ITS caller
 // to transform only the camera view (else head-look drags the shadows).
-constexpr uintptr_t kFnAOffset    = 0xDA1D20;
-constexpr uintptr_t kOrbitCamGame = 0x860EB9;   // in-game orbit camera caller
-constexpr uintptr_t kOrbitCamMenu = 0x8845AD;   // main-menu orbit camera caller
+uintptr_t g_orbitCamGame = 0;   // in-game orbit camera caller (in the DRIVE_CAMERA commit)
+uintptr_t g_orbitCamMenu = 0;   // main-menu orbit camera caller
 
-// Game render FOV: settings obj ptr at [exe+0x2AF4570], FOV percent multipliers
-// at +0x60/+0x64. We scale them each frame to widen the render to fill the HMD.
-constexpr uintptr_t kSettingsPtr = 0x2AF4570;
+// Game render FOV: the settings object, behind a global, holds FOV percent
+// multipliers at +0x60/+0x64. Offset of that global; 0 = not found.
+uintptr_t g_settingsPtr = 0;
 constexpr int kFovOff0 = 0x60, kFovOff1 = 0x64;
 
-// Live 3D-viewport width/height (CE-confirmed, static, NOT behind kSettingsPtr's
-// pointer -- direct module-relative addresses). Crops the 3D scene from origin
-// within the backbuffer, read every frame; the HUD is unaffected (separate,
-// full-window pass), which is how we know this is a viewport, not the window/
-// backbuffer size itself. Paired with forcing the backbuffer bigger at
-// CreateSwapChain/ResizeBuffers time (swapchain_hook.cpp) -- that alone caused
-// a corner-crop because these fields stayed at the small config value; now
-// re-asserted here every frame so they track the forced backbuffer size.
-constexpr uintptr_t kViewportW = 0x2AA1808;
-constexpr uintptr_t kViewportH = 0x2AA180C;
+// (The live 3D-viewport width/height pin -- two int32s at exe+0x2AA1808/C,
+// re-asserted every frame to follow a forced backbuffer -- was removed
+// 2026-10-26. It only ever wrote while the resolution-forcing experiment
+// (xr::g_forceRenderSize) was on, which nothing has switched on since
+// ForceGameResolution started setting the window size at creation instead, and
+// it was a WRITE to a remembered data address: on a build where that address
+// meant something else, enabling it would have corrupted the game silently.)
+
 // THE GAME'S OWN FOV FIELDS (settings+0x60/+0x64) ARE NEVER WRITTEN.
 //
 // They used to be, every Present, with a declared culling FOV scaled by a
@@ -99,19 +103,17 @@ constexpr uintptr_t kViewportH = 0x2AA180C;
 // Reading them is more useful now than it was, because they hold the game's own
 // untouched value rather than an echo of ours.
 
-// PERSPECTIVE PROJECTION BUILDER (CE-confirmed, this game build):
-//   buildPerspective(rcx = out 4x4, ...) -- calls ucrtbase.tanf, then writes
-//   p00 at [rcx+0x00], p11 at [rcx+0x14], 1.0f at [rcx+0x2C], ret at +0x1154264.
+// PERSPECTIVE PROJECTION BUILDER (CE-confirmed; located by signature):
+//   buildPerspective(rcx = out 4x4, ...) -- calls tanf, then writes p00 at
+//   [rcx+0x00], p11 at [rcx+0x14], 1.0f at [rcx+0x2C].
 // This is the authoritative FOV: writing settings+0x60 only influences an INPUT,
 // which is why the controller-look FOV change kept overriding us. Overriding the
 // OUTPUT here cannot be overridden by anything upstream.
 //
 // It also builds shadow/reflection projections, so it must be filtered by caller.
-// Log distinct callers first (kProjOverrideCaller = 0), then pin the main-camera
-// one. Found alongside: the per-frame camera struct has projection at +0x00 and a
+// Found alongside: the per-frame camera struct has projection at +0x00 and a
 // camera-to-world matrix at +0x40 whose translation row is +0x70 (the eye
 // position), stride 0x140; the struct is copied by camera code at +0x8554C2.
-constexpr uintptr_t kProjBuildOffset = 0x11544D0;
 
 // Camera-struct consumer (CE: entry +0x855310, prologue mov rax,rsp / push
 // rbp,r12..r15 / sub rsp,0x300, loops with r14d over globals at exe+0x2B1F778 and
@@ -123,6 +125,11 @@ constexpr uintptr_t kProjBuildOffset = 0x11544D0;
 // camera struct base, giving us the pointer for free. Observe-only for now: log
 // which argument register carries the struct and confirm the layout at runtime
 // before writing anything.
+//
+// A REMEMBERED OFFSET, FROM THE JULY 2026 BUILD -- the one left in this file,
+// and only because nothing uses it. hook_engine_fn() refuses it outright unless
+// it happens to be a function entry; re-derive it (and give it a signature in
+// game_addresses.cpp) before switching kHookCamConsumer on.
 constexpr uintptr_t kCamConsumerOffset = 0x855310;
 // DISABLED. +0x85537C does `movaps xmm15,xmm0`, so this function takes a float in
 // xmm0 -- probably an interpolation factor. A detour declared with pointer-only
@@ -131,10 +138,11 @@ constexpr uintptr_t kCamConsumerOffset = 0x855310;
 // establishing the FULL signature, floats included.
 constexpr bool kHookCamConsumer = false;
 // Main-camera projection call site (observed: produced hfov 107.40, matching the
-// measured rendered FOV; sits in the same function region as the orbit camera
-// setup at 0xDA1C20/0xDA1D2B). The other two callers are a 45-deg view and an
-// asymmetric 31.3x11.6 shadow projection -- both must be left alone.
-std::atomic<uintptr_t> g_projOverrideCaller{0xDA1F4E};
+// measured rendered FOV): the one call to the builder inside combine::CAMERA's
+// set-perspective method, which game_addresses.cpp finds by that relationship.
+// The other callers are a 45-deg view and an asymmetric 31.3x11.6 shadow
+// projection, among others -- all must be left alone. 0 until installed.
+std::atomic<uintptr_t> g_projOverrideCaller{0};
 
 // --- per-caller FOV probe ---------------------------------------------------
 // Every projection call site EXCEPT the locked one keeps the FOV the game gave
@@ -537,16 +545,15 @@ constexpr bool  kLeanAtProj     = true;
 // clean baseline and the hooked state be compared in one session is gone --
 // that comparison is long settled, and the toggle was the only thing that
 // could ever turn the hook off.)
-// FIFTH argument is a float on the STACK ([rsp+0x70] at +0x115421F resolves to
+// FIFTH argument is a float on the STACK ([rsp+0x70] at entry+0x6F resolves to
 // entry+0x28). A 4-parameter detour left that slot as garbage from its own frame,
 // which is why the camera broke even with no writes.
-void* g_projTarget = nullptr;
 
 // Downstream sibling view-builder: builds the FINAL view (up rebuilt here,
-// after look-angles are folded in). Called at +0xA17F20 (return +0xA17F25).
-// Candidate injection point for ROLL, which the earlier stages discard.
-constexpr uintptr_t kCombine2Offset = 0x1152AC0;
-constexpr uintptr_t kCombine2Ret    = 0xA17CF5;
+// after look-angles are folded in), return-address filtered to its call in the
+// main camera build. The injection point for ROLL, which the earlier stages
+// discard.
+uintptr_t g_combine2Ret = 0;
 
 // TEST: while true, the builder rotation is off and we only test translating
 // the eye position at the combine fn.
@@ -756,7 +763,7 @@ PFN real_builder = nullptr;
 // in turn while sitting in the garage; none changed the view, and one visibly
 // swung the shadows. So the injection genuinely writes at a claimed site, and
 // simply none of them builds those screens' camera. Combined with isCam being a
-// tautology for kOrbitCamGame below (its three conditions are exhaustive),
+// tautology for g_orbitCamGame below (its three conditions are exhaustive),
 // those screens are already injected, at the right site, on every frame.
 //
 // Which places the residual drag they show DOWNSTREAM of our write -- the
@@ -798,6 +805,8 @@ uintptr_t g_sites[64]; std::atomic<int> g_nSites{0};
 // identical eyes. Verified by moving head LEAN here too: lean did nothing either.
 // Left in place (disabled) because the census data behind it is still valid --
 // the per-frame stage is real, it just is not where the eye POSITION lives.
+// The site is a JULY 2026 return address, kept as the record of what was
+// measured; it means nothing in a later build. Re-run the census before using it.
 constexpr bool      kEyeOffsetAtBuilder = false;
 constexpr uintptr_t kEyeOffsetSite      = 0xABE7C5;   // other candidate: 0xD6B25B
 constexpr float     kEyeBuilderSign     = 1.0f;       // flip if L/R is reversed
@@ -811,7 +820,8 @@ std::atomic<float> g_lastEyeOff{0.0f};
 // Site probe: applies a big CONSTANT view-space offset at one candidate site at a
 // time, cycling every 2.5 s and logging which is active. Whichever site makes the
 // desktop image visibly jump sideways is the one that actually feeds the render
-// camera. Same call-site-cycling technique that originally found kMainCallSite.
+// camera. Same call-site-cycling technique that originally found the main
+// camera call site (now g_viewBuilderRet).
 // Set false once the site is known.
 constexpr bool  kSiteProbe     = false;  // cycling probe: destructive, off
 constexpr float kSiteProbeOff  = 0.35f;   // metres; deliberately unmissable
@@ -903,7 +913,7 @@ void* detour_builder(void* rcx, void* rdx, void* r8, void* r9){
                 }
             }
 
-            if (site == kMainCallSite && !kTestCombine) {
+            if (site == g_viewBuilderRet && !kTestCombine) {
                 float yaw, pitch, transX; get_transform(yaw, pitch, transX);
                 if (transX != 0.0f) {
                     // Stereo/positional shift in VIEW space: newView = T_view * V.
@@ -942,7 +952,7 @@ void* detour_combine(void* rcx, void* rdx, void* r8, void* r9){
     bool  isMain = false;
     float rollOut = 0.0f;   // roll (rad) to apply to the OUTPUT view after combine
     __try {
-        isMain = (reinterpret_cast<uintptr_t>(raw_ret) - g_moduleBase == kCombineRet);
+        isMain = (reinterpret_cast<uintptr_t>(raw_ret) - g_moduleBase == g_combineRet);
         if (isMain) {
             // Parity now advances at the per-frame builder stage (see
             // kEyeOffsetAtBuilder); advancing here too would let whichever ran
@@ -1239,7 +1249,7 @@ PFN4 real_combine2 = nullptr;
 void* detour_combine2(void* rcx, void* rdx, void* r8, void* r9){
     void* raw_ret = _ReturnAddress();
     bool isMain = false;
-    __try { isMain = (reinterpret_cast<uintptr_t>(raw_ret) - g_moduleBase == kCombine2Ret); }
+    __try { isMain = (reinterpret_cast<uintptr_t>(raw_ret) - g_moduleBase == g_combine2Ret); }
     __except (EXCEPTION_EXECUTE_HANDLER) {}
 
     // (Reasserting the FOV here was tried and measurably did NOT help -- the
@@ -1665,7 +1675,7 @@ void* detour_fna(void* rcx, void* rdx, void* r8, void* r9){
         // In-game orbit only in EXTERIOR mode (the cockpit is still computed via
         // this caller in cockpit mode; transforming it there corrupts the cockpit).
         // Menu camera is unconditional.
-        const bool isMenuCam = (caller==kOrbitCamMenu);
+        const bool isMenuCam = (caller==g_orbitCamMenu);
         // The logic_mode test excludes the in-game orbit builder while the
         // cockpit is the active camera mode -- correct during gameplay, wrong
         // for the MAP or GARAGE opened FROM the cockpit. logic_mode still reads
@@ -1683,7 +1693,7 @@ void* detour_fna(void* rcx, void* rdx, void* r8, void* r9){
         const bool fnaCockpit = hooks::logic_mode() >= 0.75f &&
                                 !hooks::in_map_view();
         bool isCam = isMenuCam ||
-                     (caller==kOrbitCamGame &&
+                     (caller==g_orbitCamGame &&
                       (hooks::logic_mode() < 0.75f || hooks::in_map_view() ||
                        fnaCockpit));
         if (!isCam) {   // log any other orbit-ish caller, once each
@@ -1977,8 +1987,9 @@ void* detour_fna(void* rcx, void* rdx, void* r8, void* r9){
 bool game_fov_fields(float& f0, float& f1)
 {
     bool ok = false;
+    if (!g_settingsPtr || !g_moduleBase) return false;
     __try {
-        const char* obj = *reinterpret_cast<char* const*>(g_moduleBase + kSettingsPtr);
+        const char* obj = *reinterpret_cast<char* const*>(g_moduleBase + g_settingsPtr);
         if (obj) {
             f0 = *reinterpret_cast<const float*>(obj + kFovOff0);
             f1 = *reinterpret_cast<const float*>(obj + kFovOff1);
@@ -2112,20 +2123,6 @@ void viewbuild_on_present(){
         }
     }
 
-    // Pin the 3D viewport width/height to EXACTLY match the forced backbuffer
-    // size (same aspect-preserving W,H the swapchain was actually resized to
-    // -- NOT a square edge, which squashed the image), every frame -- see
-    // kViewportW/kViewportH above for why.
-    __try {
-        uint32_t w = 0, h = 0;
-        if (xr::get_forced_render_wh(w, h)) {
-            int32_t* vw = reinterpret_cast<int32_t*>(g_moduleBase + kViewportW);
-            int32_t* vh = reinterpret_cast<int32_t*>(g_moduleBase + kViewportH);
-            *vw = (int32_t)w;
-            *vh = (int32_t)h;
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-
     // Camera mode change (cockpit <-> exterior): POSITION only. Yaw stays put
     // deliberately -- swinging the world round to face wherever the head
     // happened to be pointing at the moment of a camera switch is disorienting,
@@ -2146,57 +2143,84 @@ void viewbuild_on_present(){
 }
 
 
+// One engine hook, refused unless the address is a function entry in THIS
+// build. A stale offset from an older build lands mid-function in a newer one,
+// and MinHook will patch it anyway -- five bytes of somebody else's code
+// replaced by a jump into a detour that then runs with whatever happened to be
+// in the registers. That is how a game update broke the mod on 2026-10-21
+// without crashing it outright: every hook went in, none of them where a
+// function starts. game_addresses.cpp already insists on an entry; this is the
+// same check at the point of patching, so nothing can reach MinHook without it.
+template <class T>
+bool hook_engine_fn(const char* name, uintptr_t rva, void* detour, T** real)
+{
+    if (!rva) {
+        VRLOG("%s hook NOT installed -- not found in this game build (see the "
+              "game addresses block above)", name);
+        return false;
+    }
+    void* target = reinterpret_cast<void*>(g_moduleBase + rva);
+    if (!is_function_entry(target)) {
+        VRLOG("%s hook REFUSED: exe+0x%llX is not a function entry in this game "
+              "build -- feature off rather than patching the middle of a function",
+              name, (unsigned long long)rva);
+        return false;
+    }
+    if (MH_CreateHook(target, detour, reinterpret_cast<void**>(real)) != MH_OK ||
+        MH_EnableHook(target) != MH_OK) {
+        VRLOG("%s hook FAILED at exe+0x%llX", name, (unsigned long long)rva);
+        return false;
+    }
+    VRLOG("%s hook installed at exe+0x%llX", name, (unsigned long long)rva);
+    return true;
+}
+
 bool install_viewbuild_hook(){
     HMODULE base = GetModuleHandleW(nullptr);
     if (!base) return false;
     g_moduleBase = reinterpret_cast<uintptr_t>(base);
 
-    void* target = reinterpret_cast<void*>(g_moduleBase + kBuilderOffset);
-    if (MH_CreateHook(target, &detour_builder, reinterpret_cast<void**>(&real_builder)) != MH_OK ||
-        MH_EnableHook(target) != MH_OK) {
-        VRLOG("viewbuild hook FAILED at %p", target);
-        return false;
-    }
-    VRLOG("viewbuild hook installed at %p (exe+0x%llX)", target, (unsigned long long)kBuilderOffset);
+    // Every filter value is in place BEFORE any hook is enabled: the camera is
+    // built on a pool of worker threads, so a detour can run the instant
+    // MH_EnableHook returns.
+    const GameAddresses& ga = game_addresses();
+    g_viewBuilderRet = ga.viewBuilderRet;
+    g_combineRet     = ga.combine1Ret;
+    g_combine2Ret    = ga.combine2Ret;
+    g_orbitCamGame   = ga.orbitGameRet;
+    g_orbitCamMenu   = ga.orbitMenuRet;
+    g_settingsPtr    = ga.settingsPtr;
+    g_projOverrideCaller.store(ga.projMainRet);
 
-    void* fna = reinterpret_cast<void*>(g_moduleBase + kFnAOffset);
-    if (MH_CreateHook(fna, &detour_fna, reinterpret_cast<void**>(&real_fna)) == MH_OK &&
-        MH_EnableHook(fna) == MH_OK)
-        VRLOG("fna (orbit view) hook installed at exe+0x%llX", (unsigned long long)kFnAOffset);
+    // THE VIEW BUILDER IS NOT HOOKED unless a diagnostic that reads it is
+    // compiled in. Everything its detour does is behind kBuilderCensus,
+    // kSiteProbe, kEyeOffsetAtBuilder or !kTestCombine, all off -- so hooking it
+    // bought nothing but a detour on a 4x4 transpose the engine calls ~90k
+    // times a second, and one more address a game update could break.
+    if (kBuilderCensus || kSiteProbe || kEyeOffsetAtBuilder || !kTestCombine)
+        hook_engine_fn("viewbuild", ga.viewBuilder,
+                       reinterpret_cast<void*>(&detour_builder), &real_builder);
+
+    if (g_orbitCamGame || g_orbitCamMenu)
+        hook_engine_fn("fna (orbit view)", ga.fna, reinterpret_cast<void*>(&detour_fna), &real_fna);
     else
-        VRLOG("fna hook FAILED");
-
-    if (kHookCamConsumer) {
-        void* camc = reinterpret_cast<void*>(g_moduleBase + kCamConsumerOffset);
-        if (MH_CreateHook(camc, &detour_camconsumer, reinterpret_cast<void**>(&real_camconsumer)) == MH_OK &&
-            MH_EnableHook(camc) == MH_OK)
-            VRLOG("camera consumer hook installed at exe+0x%llX", (unsigned long long)kCamConsumerOffset);
-        else
-            VRLOG("camera consumer hook FAILED");
-    }
-
-    g_projTarget = reinterpret_cast<void*>(g_moduleBase + kProjBuildOffset);
-    if (MH_CreateHook(g_projTarget, &detour_projbuild,
-                      reinterpret_cast<void**>(&real_projbuild)) == MH_OK &&
-        MH_EnableHook(g_projTarget) == MH_OK)
-        VRLOG("projection builder hook installed at exe+0x%llX (FOV lock ON)",
-              (unsigned long long)kProjBuildOffset);
+        VRLOG("fna (orbit view) hook NOT installed -- neither orbit camera call site found");
+    if (kHookCamConsumer)
+        hook_engine_fn("camera consumer", kCamConsumerOffset,
+                       reinterpret_cast<void*>(&detour_camconsumer), &real_camconsumer);
+    // Installed even without the main-camera call site: the detour still logs
+    // every distinct caller with the FOV it built, which is how that site gets
+    // re-identified when its signature fails.
+    hook_engine_fn("projection builder", ga.projBuild,
+                   reinterpret_cast<void*>(&detour_projbuild), &real_projbuild);
+    if (g_combine2Ret)
+        hook_engine_fn("combine2", ga.combine2, reinterpret_cast<void*>(&detour_combine2), &real_combine2);
     else
-        VRLOG("projection builder hook create FAILED");
-
-    void* combine2 = reinterpret_cast<void*>(g_moduleBase + kCombine2Offset);
-    if (MH_CreateHook(combine2, &detour_combine2, reinterpret_cast<void**>(&real_combine2)) == MH_OK &&
-        MH_EnableHook(combine2) == MH_OK)
-        VRLOG("combine2 hook installed at exe+0x%llX", (unsigned long long)kCombine2Offset);
+        VRLOG("combine2 hook NOT installed -- its main-camera call site was not found");
+    if (g_combineRet)
+        hook_engine_fn("combine", ga.combine1, reinterpret_cast<void*>(&detour_combine), &real_combine);
     else
-        VRLOG("combine2 hook FAILED");
-
-    void* combine = reinterpret_cast<void*>(g_moduleBase + kCombineOffset);
-    if (MH_CreateHook(combine, &detour_combine, reinterpret_cast<void**>(&real_combine)) == MH_OK &&
-        MH_EnableHook(combine) == MH_OK)
-        VRLOG("combine hook installed at exe+0x%llX", (unsigned long long)kCombineOffset);
-    else
-        VRLOG("combine hook FAILED");
+        VRLOG("combine hook NOT installed -- its main-camera call site was not found");
 
     // (The scattered-prop hooks at exe+0xC06C80 / +0xC06F60 that mode 5 used
     // were removed with it -- see the note at kRotRestamp. They ran ~150 times a

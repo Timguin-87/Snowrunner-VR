@@ -1,9 +1,9 @@
 #pragma once
 #include <cstdint>
 
-// THE DRIVE CAMERA, OBSERVED. Pattern-scans SnowRunner.exe for the camera
-// commit function (recon: +0x85F4D0, RCX = combine::DRIVE_CAMERA) and
-// MinHook-detours it.
+// THE DRIVE CAMERA, OBSERVED. MinHook-detours the camera commit function
+// (RCX = combine::DRIVE_CAMERA), which game_addresses.h locates by signature in
+// whatever game build is running.
 //
 // IT READS, IT DOES NOT WRITE. The detour used to rewrite the staged eye/target
 // (+0x184 / +0x190) from the head pose, on the theory that turning the logic
@@ -15,8 +15,9 @@
 // pointer to it for the FOV declaration.
 //
 // Requires hooks::init() (MinHook) to have run. Safe to call once; returns
-// false if the signature is not found (unknown game version), which costs the
-// cockpit/garage distinction rather than the whole mod.
+// false if the function was not found (a game build newer than the mod's
+// signatures), which costs the cockpit/garage distinction rather than the
+// whole mod.
 namespace hooks {
 
 bool install_camera_hook();

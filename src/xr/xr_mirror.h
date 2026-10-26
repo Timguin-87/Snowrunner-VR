@@ -188,10 +188,8 @@ void  set_ui_plane_distance(float metres);
 
 
 // Aspect-preserving variant: scales origW x origH by the same factor on both
-// axes (no squash from forcing square). Also records the result so
-// get_forced_render_wh() can return the exact same values elsewhere.
+// axes (no squash from forcing square).
 bool  desired_render_size_for(uint32_t origW, uint32_t origH, uint32_t& outW, uint32_t& outH);
-bool  get_forced_render_wh(uint32_t& w, uint32_t& h);
 
 // The OpenXR runtime's own recommended per-eye render size, unscaled and
 // unshaped -- the reference the settings UI's resolution slider is expressed
@@ -201,9 +199,9 @@ bool  get_forced_render_wh(uint32_t& w, uint32_t& h);
 bool  native_eye_size(uint32_t& w, uint32_t& h);
 
 // The game's real backbuffer size, i.e. the pixel space viewports are
-// expressed in. Unlike get_forced_render_wh() this reports what is actually
-// being rendered, not what the (currently disabled) resolution-forcing
-// experiment asked for. False before the first Present.
+// expressed in -- what is actually being rendered, not what the (currently
+// disabled) resolution-forcing experiment would ask for. False before the
+// first Present.
 bool  render_canvas_wh(uint32_t& w, uint32_t& h);
 
 // Called by the camera hooks at the start of the main-camera build; the first

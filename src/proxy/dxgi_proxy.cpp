@@ -2,6 +2,8 @@
 #include "hooks/swapchain_hook.h"
 #include "hooks/camera_hook.h"
 #include "hooks/viewbuild_hook.h"
+#include "hooks/pattern_scan.h"
+#include "hooks/game_addresses.h"
 #include "common/log.h"
 
 #include <dxgi1_6.h>
@@ -95,10 +97,15 @@ static void install_hooks_on(void** ppFactory)
     static bool camHooked = false;
     if (!camHooked) {
         camHooked = true;  // attempt once; failure logs and leaves mono head-locked
+        // The game's code is decrypted by now (the DRM stub runs before the
+        // exe's own code, and the game's own code is what is calling us), so
+        // this is the first point a dump or a signature scan means anything.
+        hooks::log_game_build();
+        hooks::maybe_dump_game_image();
+        hooks::game_addresses();   // resolve + log every engine address up front
         hooks::install_camera_hook();
-        // CPU-side: rotate the main render camera (call site exe+0xA17C2B) about
-        // a tunable camera-relative pivot (the head). Stereo translation to be
-        // added here too for AER.
+        // CPU-side head tracking, stereo and the FOV lock: the camera-build
+        // and projection hooks, at the addresses resolved just above.
         hooks::install_viewbuild_hook();
     }
 }

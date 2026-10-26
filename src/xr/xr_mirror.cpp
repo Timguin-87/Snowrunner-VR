@@ -5171,13 +5171,9 @@ HeadLook head_look()
 // hidden higher-detail source exists to capture instead. Raising resolution
 // further needs a genuine RenderDoc/IDA session; disabled (g_forceRenderSize
 // defaults false) rather than waste GPU memory inflating for no benefit. The
-// viewport-field pin (kViewportW/H in viewbuild_hook.cpp) stays -- it's a
-// real, independent bug fix (eliminates the corner-crop) that's simply a
-// no-op when nothing is forcing the backbuffer bigger.
-// The last W,H actually applied via desired_render_size_for() below, so other
-// code (viewbuild_hook's viewport-field pin) can match it EXACTLY rather than
-// recomputing independently and risking drift between the two.
-std::atomic<uint32_t> g_forcedW{0}, g_forcedH{0};
+// viewport-field pin that went with it (kViewportW/H in viewbuild_hook.cpp)
+// was removed 2026-10-26: it only ever wrote while this was on, and it wrote to
+// a remembered data address that a game update could repurpose.
 
 // TEST MODE (2026-07-25): fixed target, bypassing the OpenXR-computed edge and
 // the aspect-preserving scale math entirely -- probing empirically what the
@@ -5192,24 +5188,7 @@ bool desired_render_size_for(uint32_t /*origW*/, uint32_t /*origH*/, uint32_t& o
     if (!g_forceRenderSize.load()) return false;
     outW = kTestW;
     outH = kTestH;
-    g_forcedW.store(outW);
-    g_forcedH.store(outH);
     return true;
-}
-
-// Whatever desired_render_size_for() last computed (0,0 if never called / not
-// forcing) -- used by viewbuild_hook.cpp to pin the 3D-viewport fields to
-// EXACTLY the same size the backbuffer was forced to.
-bool get_forced_render_wh(uint32_t& w, uint32_t& h)
-{
-    // Re-check the switch here too, not just cached g_forcedW/H -- those hold
-    // stale values from the last time forcing was on otherwise, so disabling
-    // g_forceRenderSize alone wouldn't have stopped the viewport-field patch
-    // in viewbuild_hook.cpp from still writing them every frame.
-    if (!g_forceRenderSize.load()) return false;
-    w = g_forcedW.load();
-    h = g_forcedH.load();
-    return w > 0 && h > 0;
 }
 
 // Cached after the first success: the settings UI polls this every frame the
@@ -5232,9 +5211,7 @@ bool native_eye_size(uint32_t& w, uint32_t& h)
 bool render_canvas_wh(uint32_t& w, uint32_t& h)
 {
     // The game's ACTUAL backbuffer size (see g.width/g.height, mirrored 1:1
-    // from the swapchain desc) -- deliberately not get_forced_render_wh(),
-    // which reports only the resolution-forcing experiment's requested size
-    // and returns false outright while that experiment is disabled.
+    // from the swapchain desc), whatever chose it.
     w = g.width; h = g.height;
     return w > 0 && h > 0;
 }
