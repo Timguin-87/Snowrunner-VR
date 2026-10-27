@@ -14,6 +14,7 @@
 #include "render/winch_layer.hpp"
 #include "render/ui_layer.hpp"
 #include "render/cursor_overlay.hpp"
+#include "xr/xr_input.h"
 #include "common/dibr_policy.h"
 #include "common/log.h"
 
@@ -1298,17 +1299,6 @@ const char kBlitHlsl[] =
     "}"
     "float4 psmain(VO i) : SV_Target {"
     "  float4 c = tex.Sample(smp, i.uv);"
-    // A smudge pixel with NO captured glass depth behind it is DROPPED, not
-    // placed at a guessed distance. Those pixels are the flat window planes and
-    // the overall tint -- they cannot be positioned correctly by any single
-    // value (the left and right windows are at genuinely different depths, so
-    // one number can never suit both), and comparing against AER shows they are
-    // not drawn where the game puts them anyway. Discarding them leaves exactly
-    // the splatter, which is the part that sits on the surface we measured.
-    //
-    // The test runs for BOTH eyes -- k is simply 0 for the rendered one, so it
-    // composites unshifted -- because dropping on one eye only would put the
-    // planes back as a one-eyed artefact, which is worse than either choice.
     // EVERY layer pixel is composited -- nothing is dropped. An earlier version
     // discarded pixels with no captured depth, on the theory that the flat
     // window planes and tint could not be placed. Keeping them is better for
@@ -1361,6 +1351,16 @@ const char kBlitHlsl[] =
     "      }"
     "    }"
     "    float2 suv = float2(i.uv.x - shift, i.uv.y);"
+    // NO HAZE IN THE DISOCCLUSION BESIDE AN OCCLUDER -- accepted, not a bug.
+    // In the synthesized eye, the band beside the A-pillar or a mirror is
+    // glass the rendered eye never saw: it is further away than the pillar's
+    // edge (measured 2026-10-26 from a stereo screenshot: ~98 px of disparity
+    // against the pillar's 143-159), so the splatter on it was never captured
+    // and no shift can fetch it. Two fixes were tried that day and removed: a
+    // search for the glass whose own disparity lands on the pixel, with far
+    // glass cut in the cockpit (no visible change -- it can only find glass the
+    // rendered eye saw), and each eye's own splatter kept from its previous
+    // render (looked worse when looking around, and the band stayed).
     "    if (suv.x >= 0.0 && suv.x <= 1.0) {"
     // NO GRADING OF ANY KIND. An alpha curve and a brightness multiply lived
     // here, exposed as two sliders, on the theory that the splatter arrives
@@ -1794,15 +1794,27 @@ PFN_xrGetD3D11GraphicsRequirementsKHR pfnGetReq = nullptr;
 bool ensure_instance()
 {
     if (g.instance != XR_NULL_HANDLE) return true;
-    const char* exts[] = {XR_KHR_D3D11_ENABLE_EXTENSION_NAME};
+    // D3D11 always; plus whatever the controller mapping can use and the
+    // runtime offers (the HP Reverb G2's controller profile is an extension).
+    std::vector<const char*> exts = {XR_KHR_D3D11_ENABLE_EXTENSION_NAME};
+    uint32_t extCount = 0;
+    std::vector<XrExtensionProperties> avail;
+    if (XR_SUCCEEDED(xrEnumerateInstanceExtensionProperties(nullptr, 0, &extCount, nullptr)) && extCount) {
+        avail.assign(extCount, {XR_TYPE_EXTENSION_PROPERTIES});
+        if (XR_FAILED(xrEnumerateInstanceExtensionProperties(nullptr, extCount, &extCount, avail.data())))
+            avail.clear();
+    }
+    for (const XrExtensionProperties& e : avail)
+        if (xrinput::wants_extension(e.extensionName)) exts.push_back(e.extensionName);
     XrInstanceCreateInfo ici{XR_TYPE_INSTANCE_CREATE_INFO};
-    ici.enabledExtensionCount = 1;
-    ici.enabledExtensionNames = exts;
+    ici.enabledExtensionCount = (uint32_t)exts.size();
+    ici.enabledExtensionNames = exts.data();
     strcpy_s(ici.applicationInfo.applicationName, "SnowRunnerVR");
     // Request 1.0, not XR_CURRENT_API_VERSION (1.1): VDXR/SteamVR runtimes are
     // 1.0 and reject a 1.1 instance with XR_ERROR_API_VERSION_UNSUPPORTED (-4).
     ici.applicationInfo.apiVersion = XR_MAKE_VERSION(1, 0, 0);
     XR_TRY(xrCreateInstance(&ici, &g.instance), "xrCreateInstance");
+    for (size_t i = 1; i < exts.size(); ++i) xrinput::note_extension_enabled(exts[i]);
 
     XrSystemGetInfo sgi{XR_TYPE_SYSTEM_GET_INFO};
     sgi.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
@@ -1950,6 +1962,10 @@ bool init(IDXGISwapChain* swapchain)
     vci.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;  // head-locked
     vci.poseInReferenceSpace.orientation.w = 1.0f;
     XR_TRY(xrCreateReferenceSpace(g.session, &vci, &g.viewSpace), "xrCreateReferenceSpace VIEW");
+
+    // The controllers as an Xbox pad. Before the first frame: an action set can
+    // only be attached once per session. Failure costs the mapping, not VR.
+    xrinput::init(g.instance, g.session);
 
     // --- swapchain: pick a runtime format matching the backbuffer if we can ---
     uint32_t fmtCount = 0;
@@ -2600,6 +2616,10 @@ bool ensure_menu_swapchain(uint32_t w, uint32_t h)
     return true;
 }
 
+// The smaller of the up/down half-angles of the eye views last submitted, in
+// radians; 0 until the first projection layer. See build_menu_quad_layer.
+std::atomic<float> g_submittedHalfV{0.0f};
+
 // Builds and renders a headset-visible quad layer for the mod settings panel
 // when (and only when) the menu is open, reusing the SAME ImGui draw data
 // hooks::menu_hook_update() already built earlier this Present (see
@@ -2646,17 +2666,28 @@ bool build_menu_quad_layer(XrCompositionLayerQuad& quad)
     pw = (std::min)((int)w - px, pw + kPad * 2);
     ph = (std::min)((int)h - py, ph + kPad * 2);
 
-    // Fixed width in metres at a comfortable reading distance; height follows
-    // the cropped panel's own pixel aspect ratio so the UI isn't stretched.
+    // Width in metres from the menu's UI size (hooks::menu_quad_width_m: 0.42 m
+    // at 100%), at a comfortable reading distance; height follows the cropped
+    // panel's own pixel aspect ratio so the UI isn't stretched.
     //
-    // 0.6 m was oversized in the headset -- it filled most of the vertical FOV
-    // and its top ran outside the rendered image once the composited FOV was
-    // shrunk (map view). This is the 100% baseline; the UI-scale slider still
-    // multiplies the FONT and widget sizes on top, so shrinking here loses no
-    // adjustability.
-    constexpr float kQuadWidthM = 0.42f;
-    constexpr float kQuadDistM  = 1.0f;
+    // The width SCALES with the UI size. It used to be fixed, so a bigger UI
+    // packed more pixels into the same quad and only the text grew against the
+    // widgets around it -- the panel itself never got any bigger to look at.
+    const float quadWidthM = hooks::menu_quad_width_m();
+    constexpr float kQuadDistM = 1.0f;
     float aspect = (pw > 0) ? (float)ph / (float)pw : 1.0f;
+
+    // How tall the panel may get before it scrolls instead (hooks reads this
+    // next frame): the quad is head-locked, so anything past the edge of the
+    // view could never be looked at. The smaller of the two eyes' up/down
+    // half-angles as SUBMITTED -- the map view shrinks them -- and a share of
+    // that, so the panel ends well inside the picture rather than at its rim.
+    {
+        constexpr float kMenuFovShare = 0.6f;
+        const float half = g_submittedHalfV.load();
+        hooks::set_menu_quad_max_height_m(
+            half > 0.0f ? 2.0f * kQuadDistM * std::tan(half * kMenuFovShare) : 0.0f);
+    }
 
     quad.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
     quad.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
@@ -2680,7 +2711,7 @@ bool build_menu_quad_layer(XrCompositionLayerQuad& quad)
     quad.pose.position = {0.0f,
                           kQuadDistM * std::sin(vpitch),
                           -kQuadDistM * std::cos(vpitch)};
-    quad.size = {kQuadWidthM, kQuadWidthM * aspect};
+    quad.size = {quadWidthM, quadWidthM * aspect};
     return true;
 }
 
@@ -5279,6 +5310,10 @@ void render_frame(IDXGISwapChain* swapchain)
         proj.space = g.space;
         proj.viewCount = 2;
         proj.views = pv;
+        // The vertical extent both eyes actually show, for the settings
+        // panel's height limit (build_menu_quad_layer).
+        g_submittedHalfV.store((std::min)((std::min)(pv[0].fov.angleUp, -pv[0].fov.angleDown),
+                                          (std::min)(pv[1].fov.angleUp, -pv[1].fov.angleDown)));
     }
 
     // Only submit the eye projection layer when the runtime is actually
@@ -6163,7 +6198,55 @@ void mirror_on_present(IDXGISwapChain* swapchain)
     // call on the session -- an xrEndSession included -- ever overlaps it.
     end_frame_wait();
     poll_events();
+    // Every Present, running or not: an unfocused session publishes a neutral
+    // pad, so a button held when the headset came off is not held forever.
+    xrinput::poll(g.session, g.running && g.state == XR_SESSION_STATE_FOCUSED);
     if (g.running) render_frame(swapchain);
+}
+
+// CLOSE THE SESSION BEFORE THE PROCESS GOES. Called from the ExitProcess hook
+// (proxy/dllmain.cpp), on the thread that is exiting, before any DLL unloads.
+//
+// Without it the session simply outlived the game: ExitProcess unloaded the
+// DLLs in reverse order, Virtual Desktop's runtime tore its swapchains down
+// from its own DLL_PROCESS_DETACH -- by then the game's renderer was gone --
+// and crashed inside d3d11 on every quit. Measured with the 64-frame crash
+// walk, 2026-10-26: SnowRunner.exe -> ucrtbase!exit -> ExitProcess -> ntdll's
+// loader shutdown -> virtualdesktop-openxr.dll -> VD's LibOVR -> d3d11 ->
+// fault; this DLL nowhere on the stack. Closed here, everything the runtime
+// holds is released while the device it lives on is still intact, and the
+// runtime DLL itself is unloaded by xrDestroyInstance rather than by the
+// exiting loader.
+//
+// Children first: swapchains (our views on their images released before
+// them), spaces, the action set, the session, the instance. Idempotent, and
+// leaves the module in its no-XR state so nothing afterwards touches a handle.
+void shutdown_xr()
+{
+    static std::atomic<bool> s_done{false};
+    if (s_done.exchange(true)) return;
+    if (g.instance == XR_NULL_HANDLE) return;
+
+    end_frame_wait();
+    g.running = false;
+    g_failed = true;
+
+    for (auto& v : g.rtvs) v.clear();
+    g.menuRtvs.clear();
+    g.uiRtvs.clear();
+    for (XrSwapchain& sc : g.swapchain)
+        if (sc != XR_NULL_HANDLE) { xrDestroySwapchain(sc); sc = XR_NULL_HANDLE; }
+    if (g.menuSwapchain != XR_NULL_HANDLE) { xrDestroySwapchain(g.menuSwapchain); g.menuSwapchain = XR_NULL_HANDLE; }
+    if (g.uiSwapchain != XR_NULL_HANDLE)   { xrDestroySwapchain(g.uiSwapchain);   g.uiSwapchain   = XR_NULL_HANDLE; }
+    if (g.viewSpace != XR_NULL_HANDLE) { xrDestroySpace(g.viewSpace); g.viewSpace = XR_NULL_HANDLE; }
+    if (g.space != XR_NULL_HANDLE)     { xrDestroySpace(g.space);     g.space     = XR_NULL_HANDLE; }
+    xrinput::shutdown();
+    // "xrDestroySession can be called when the session is in any session
+    // state" (spec) -- so no xrRequestExitSession round trip at exit.
+    if (g.session != XR_NULL_HANDLE) { xrDestroySession(g.session); g.session = XR_NULL_HANDLE; }
+    xrDestroyInstance(g.instance);
+    g.instance = XR_NULL_HANDLE;
+    VRLOG("xr: session and instance closed before exit");
 }
 
 void mirror_on_resize()

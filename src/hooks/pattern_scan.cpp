@@ -200,6 +200,102 @@ uint8_t* rel32_target(const uint8_t* insn, int dispOffset, int insnLen)
     return const_cast<uint8_t*>(insn) + insnLen + disp;
 }
 
+std::vector<uint8_t*> find_rip_refs(HMODULE module, const uint8_t* opcode, int opLen,
+                                    const void* target)
+{
+    std::vector<uint8_t*> out;
+    IMAGE_NT_HEADERS* nt = nt_headers(module);
+    if (!nt || !opcode || opLen < 1 || !target)
+        return out;
+    auto* base = reinterpret_cast<uint8_t*>(module);
+    const size_t insnLen = (size_t)opLen + 4;
+    auto* section = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+        if (!(section->Characteristics & IMAGE_SCN_MEM_EXECUTE))
+            continue;
+        uint8_t* p = base + section->VirtualAddress;
+        const size_t size = section->Misc.VirtualSize;
+        if (size < insnLen)
+            continue;
+        uint8_t* const last = p + size - insnLen;
+        while (p <= last) {
+            p = static_cast<uint8_t*>(memchr(p, opcode[0], (size_t)(last - p) + 1));
+            if (!p)
+                break;
+            if (memcmp(p, opcode, (size_t)opLen) == 0 &&
+                rel32_target(p, opLen, (int)insnLen) == target)
+                out.push_back(p);
+            ++p;
+        }
+    }
+    return out;
+}
+
+std::vector<uint8_t*> find_cstrings(HMODULE module, const char* s)
+{
+    std::vector<uint8_t*> out;
+    IMAGE_NT_HEADERS* nt = nt_headers(module);
+    const size_t len = s ? strlen(s) : 0;
+    if (!nt || !len)
+        return out;
+    auto* base = reinterpret_cast<uint8_t*>(module);
+    auto* section = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+        const DWORD ch = section->Characteristics;
+        if (!(ch & IMAGE_SCN_CNT_INITIALIZED_DATA) || (ch & IMAGE_SCN_MEM_EXECUTE) ||
+            (ch & IMAGE_SCN_MEM_WRITE))
+            continue;
+        uint8_t* const begin = base + section->VirtualAddress;
+        const size_t size = section->Misc.VirtualSize;
+        if (size < len + 1)
+            continue;
+        uint8_t* const last = begin + size - (len + 1);   // room for the NUL
+        uint8_t* p = begin;
+        while (p <= last) {
+            p = static_cast<uint8_t*>(memchr(p, (unsigned char)s[0], (size_t)(last - p) + 1));
+            if (!p)
+                break;
+            if (memcmp(p, s, len + 1) == 0 && (p == begin || p[-1] == 0))
+                out.push_back(p);
+            ++p;
+        }
+    }
+    return out;
+}
+
+void** import_slot(HMODULE module, const char* dll, const char* fn)
+{
+    IMAGE_NT_HEADERS* nt = nt_headers(module);
+    if (!nt || !fn)
+        return nullptr;
+    auto* base = reinterpret_cast<uint8_t*>(module);
+    const IMAGE_DATA_DIRECTORY& dir =
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!dir.VirtualAddress || !dir.Size)
+        return nullptr;
+
+    auto* imp = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress);
+    for (; imp->Name; ++imp) {
+        if (dll && _stricmp(reinterpret_cast<const char*>(base + imp->Name), dll) != 0)
+            continue;
+        // OriginalFirstThunk holds the NAMES, FirstThunk holds the live
+        // pointers. A bound import has no OFT, in which case the names are not
+        // recoverable and this import is left alone rather than guessed at.
+        if (!imp->OriginalFirstThunk)
+            continue;
+        auto* names = reinterpret_cast<IMAGE_THUNK_DATA64*>(base + imp->OriginalFirstThunk);
+        auto* slots = reinterpret_cast<IMAGE_THUNK_DATA64*>(base + imp->FirstThunk);
+        for (int i = 0; names[i].u1.AddressOfData; ++i) {
+            if (IMAGE_SNAP_BY_ORDINAL64(names[i].u1.Ordinal))
+                continue;
+            auto* imn = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(base + names[i].u1.AddressOfData);
+            if (strcmp(reinterpret_cast<const char*>(imn->Name), fn) == 0)
+                return reinterpret_cast<void**>(&slots[i].u1.Function);
+        }
+    }
+    return nullptr;
+}
+
 uint32_t exe_timestamp()
 {
     IMAGE_NT_HEADERS* nt = nt_headers(GetModuleHandleW(nullptr));

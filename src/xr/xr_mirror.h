@@ -416,4 +416,9 @@ void mirror_on_present(IDXGISwapChain* swapchain);
 // resources so they are rebuilt against the new size.
 void mirror_on_resize();
 
+// Closes the XR session and instance, children first. Called once from the
+// ExitProcess hook so the runtime releases everything while the game's device
+// still exists -- see the note at its definition. Idempotent; no-op without XR.
+void shutdown_xr();
+
 } // namespace xr

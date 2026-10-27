@@ -15,6 +15,7 @@
 #include "render/ui_layer.hpp"
 #include "render/smudge_layer.hpp"
 #include "xr/xr_mirror.h"
+#include "xr/xr_input.h"
 
 #include <d3d11.h>
 #include <wrl/client.h>
@@ -146,7 +147,17 @@ void check_first_run_resolution()
 std::atomic<int>      g_menuToggleVk{VK_INSERT};
 std::atomic<uint32_t> g_menuToggleCombo{XINPUT_GAMEPAD_LEFT_THUMB | XINPUT_GAMEPAD_RIGHT_THUMB};
 
-// --- mod UI scale (font + widget size) ----------------------------------
+// --- mod UI scale: the WHOLE panel, not just its text ---------------------
+//
+// Three parts, and the slider only ever looked like a font-size control
+// because two of them were missing:
+//   - ImGui's own metrics: the font, and every padding, spacing and rounding
+//     (ScaleAllSizes), applied from a pristine copy of the style;
+//   - the widths this file spells out in pixels itself, through ui_px();
+//   - the size of the panel IN THE HEADSET (menu_quad_width_m). The quad used
+//     to be a fixed 0.42 m wide whatever the panel's pixel size, so a bigger
+//     UI just packed more pixels into the same 0.42 m: the text grew against
+//     widgets that did not, and nothing got any bigger to look at.
 
 std::atomic<float> g_modUiScale{1.0f};
 // Un-rescaled style, captured once right after StyleColorsDark() in
@@ -155,6 +166,28 @@ std::atomic<float> g_modUiScale{1.0f};
 // already-scaled style every frame would compound multiplicatively).
 ImGuiStyle g_baseStyle;
 float g_lastAppliedUiScale = -1.0f;   // force-apply on the first present
+// The scale the panel was last BUILT at -- which is what the headset quad has
+// to match, rather than a slider value that may be a frame ahead of it.
+std::atomic<float> g_builtUiScale{1.0f};
+
+// The panel's quad in the headset: this wide at 100%, a metre away (see
+// build_menu_quad_layer in xr_mirror.cpp). 0.6 m was oversized -- it filled
+// most of the vertical FOV and its top ran outside the rendered image once the
+// composited FOV was shrunk (map view) -- so 0.42 m is the 100% baseline.
+constexpr float kMenuQuadWidthM = 0.42f;
+
+// The tallest the quad may be and still be seen whole, published by the XR
+// side from the field of view it submits; 0 = not known (no headset). The
+// quad is head-locked, so a panel taller than this cannot be looked at, only
+// scrolled -- which is what the window is made to do instead.
+std::atomic<float> g_menuQuadMaxHeightM{0.0f};
+
+// A size this file writes in pixels, at the current UI size. Everything ImGui
+// measures itself is already scaled; these are the rest.
+float ui_px(float v)
+{
+    return v * (g_lastAppliedUiScale > 0.0f ? g_lastAppliedUiScale : 1.0f);
+}
 
 // PRESENT RATE. Measured here rather than read from ImGui's io.Framerate
 // because menu_hook_update() runs on EVERY Present, including while the menu is
@@ -184,10 +217,15 @@ void apply_ui_scale_if_changed()
     const float s = g_modUiScale.load();
     if (s == g_lastAppliedUiScale)
         return;
-    ImGui::GetStyle() = g_baseStyle;
-    ImGui::GetStyle().ScaleAllSizes(s);
-    ImGui::GetIO().FontGlobalScale = s;
+    ImGuiStyle& style = ImGui::GetStyle();
+    style = g_baseStyle;
+    style.ScaleAllSizes(s);
+    // style.FontScaleMain, not io.FontGlobalScale: since ImGui 1.92 the font is
+    // rasterised at the size it is drawn, so this stays sharp at any scale --
+    // and the old field asserts once the new one is in use.
+    style.FontScaleMain = s;
     g_lastAppliedUiScale = s;
+    g_builtUiScale.store(s);
 }
 
 // --- rebind capture state (touched only from the Present-hook thread,
@@ -492,7 +530,7 @@ void draw_settings_tab()
                 "Headset rotation only",
                 "Headset + game rotation",
                 "Headset + game 6dof" };
-            ImGui::SetNextItemWidth(230.0f);
+            ImGui::SetNextItemWidth(ui_px(230.0f));
             if (ImGui::Combo("Warp type", &wtype, warpLabels, xr::kWarpTypeCount)) {
                 xr::set_warp_type(wtype);
                 vrcfg::save();
@@ -558,7 +596,7 @@ void draw_settings_tab()
             int item = 0;
             for (int i = 0; i < 4; ++i)
                 if (kFillOrder[i] == current) { item = i; break; }
-            ImGui::SetNextItemWidth(230.0f);
+            ImGui::SetNextItemWidth(ui_px(230.0f));
             if (ImGui::Combo("Hole fill", &item, fillLabels, 4))
                 dibr::set_fill_mode(kFillOrder[item]);
             if (ImGui::IsItemHovered())
@@ -658,6 +696,20 @@ void draw_settings_tab()
         ImGui::SetTooltip("Stick look-YAW stops moving the view; head yaw\n"
                           "becomes the only source.");
 
+    // The VR controllers presented to the game as Xbox pad 0 (xr/xr_input.h).
+    bool vrPad = xrinput::enabled();
+    if (ImGui::Checkbox("VR controllers as gamepad", &vrPad)) {
+        xrinput::set_enabled(vrPad);
+        vrcfg::save();
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Triggers = LT/RT, grips = LB/RB, A/B/X/Y, sticks and\n"
+                          "stick clicks. Left menu button: tap = Start,\n"
+                          "hold half a second = Back (Select).\n"
+                          "Hold the left stick down (L3): the right stick becomes\n"
+                          "the D-pad and the menu button becomes Back.\n"
+                          "Works alongside a real gamepad.");
+
     ImGui::Separator();
 
     // THE CULLING FOV, declared on combine::CAMERA itself (hooks/camera_fov.h).
@@ -676,7 +728,7 @@ void draw_settings_tab()
     // object is ever replaced. Its progress reads out on the Advanced tab.
     {
         float ff = hooks::camera_fov_factor();
-        ImGui::SetNextItemWidth(230.0f);
+        ImGui::SetNextItemWidth(ui_px(230.0f));
         if (ImGui::SliderFloat("Culling FOV", &ff, 0.5f, 2.5f, "%.2fx")) {
             hooks::set_camera_fov_factor(ff);
             vrcfg::save();
@@ -698,10 +750,22 @@ void draw_settings_tab()
 
     ImGui::Separator();
 
-    float modUiPct = mod_ui_scale() * 100.0f;
-    if (ImGui::SliderFloat("Mod UI size", &modUiPct, 50.0f, 250.0f, "%.0f%%")) {
-        set_mod_ui_scale(modUiPct / 100.0f);
-        vrcfg::save();
+    // Applied when the slider is let go, not while it moves: the whole panel
+    // resizes with it, this slider included, and a slider that grows under the
+    // mouse feeds its own new size back into the value being dragged.
+    {
+        static float s_pendingPct = -1.0f;
+        float modUiPct = (s_pendingPct > 0.0f) ? s_pendingPct : mod_ui_scale() * 100.0f;
+        if (ImGui::SliderFloat("Mod UI size", &modUiPct, 50.0f, 250.0f, "%.0f%%"))
+            s_pendingPct = modUiPct;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Size of this whole panel: text, controls, and how big\n"
+                              "it is in the headset. Applies when you let go.");
+        if (s_pendingPct > 0.0f && !ImGui::IsItemActive()) {
+            set_mod_ui_scale(s_pendingPct / 100.0f);
+            vrcfg::save();
+            s_pendingPct = -1.0f;
+        }
     }
 
     // --- flat screens --------------------------------------------------------
@@ -711,7 +775,7 @@ void draw_settings_tab()
         const char* modeLabels[2] = { "3D", "2D" };
 
         int mapMode = xr::map_render_mode();
-        ImGui::SetNextItemWidth(120.0f);
+        ImGui::SetNextItemWidth(ui_px(120.0f));
         if (ImGui::Combo("Render map", &mapMode, modeLabels, 2)) {
             xr::set_map_render_mode(mapMode);
             vrcfg::save();
@@ -728,7 +792,7 @@ void draw_settings_tab()
                 "size, so shrinking the render would only crop the map.");
 
         int garageMode = xr::garage_render_mode();
-        ImGui::SetNextItemWidth(120.0f);
+        ImGui::SetNextItemWidth(ui_px(120.0f));
         if (ImGui::Combo("Render garage", &garageMode, modeLabels, 2)) {
             xr::set_garage_render_mode(garageMode);
             vrcfg::save();
@@ -877,7 +941,7 @@ void draw_advanced_tab()
     {
         const char* gateLabels[2] = { "Legacy (camera pose)", "Direct markers" };
         int gate = hooks::screen_gate_direct() ? 1 : 0;
-        ImGui::SetNextItemWidth(230.0f);
+        ImGui::SetNextItemWidth(ui_px(230.0f));
         if (ImGui::Combo("Screen gate", &gate, gateLabels, 2)) {
             hooks::set_screen_gate_direct(gate != 0);
             vrcfg::save();
@@ -1200,13 +1264,13 @@ void draw_cull_tab()
         int minElems  = (int)hooks::search_min_elems();
         int maxDraws  = (int)hooks::search_max_draws_frame();
         bool changed = false;
-        ImGui::SetNextItemWidth(160.0f);
+        ImGui::SetNextItemWidth(ui_px(160.0f));
         changed |= ImGui::SliderInt("Min elements/draw", &minElems, 1, 64);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Excludes fullscreen passes (tonemap, composite, copy):\n"
                               "they draw 3-6 elements, real geometry draws more.\n"
                               "This is what stops a search step blacking the frame out.");
-        ImGui::SetNextItemWidth(160.0f);
+        ImGui::SetNextItemWidth(ui_px(160.0f));
         changed |= ImGui::SliderInt("Max draws/frame", &maxDraws, 1, 512);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Excludes bulk geometry (terrain, foliage, shadow casters).\n"
@@ -1292,7 +1356,7 @@ void draw_cull_tab()
     if (ImGui::BeginTable("cull_table", 6,
             ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
             ImGuiTableFlags_SizingStretchProp,
-            ImVec2(0.0f, 220.0f))) {
+            ImVec2(0.0f, ui_px(220.0f)))) {
         ImGui::TableSetupColumn("Cull");
         ImGui::TableSetupColumn("#");
         ImGui::TableSetupColumn("Hash (stable)");
@@ -1433,10 +1497,10 @@ void draw_rigid_tab()
         snprintf(label, sizeof(label), "%016llX##rigid%d", (unsigned long long)h, i);
         if (ImGui::Checkbox(label, &on))
             hooks::set_cull_role_hash_muted(kRole, i, !on);
-        ImGui::SameLine(220.0f);
+        ImGui::SameLine(ui_px(220.0f));
         if (hooks::cull_role_hash_seen(kRole, i)) ImGui::TextUnformatted("seen");
         else                                      ImGui::TextDisabled("-");
-        ImGui::SameLine(280.0f);
+        ImGui::SameLine(ui_px(280.0f));
         ImGui::TextDisabled(i < baked ? "built in" : "found");
     }
     ImGui::EndChild();
@@ -1467,6 +1531,19 @@ void draw_settings_window()
 {
     ImGui::SetNextWindowPos(ImVec2(60, 60), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(560, 0), ImGuiCond_FirstUseEver);
+    // NO TALLER THAN THE HEADSET CAN SHOW. At a large UI size a long tab would
+    // otherwise grow past the edge of the view, where a head-locked panel can
+    // never be looked at; capped, it scrolls instead, and gamepad navigation
+    // scrolls to whatever it focuses. In pixels from last frame's width, since
+    // the quad's height is its width times the panel's aspect.
+    {
+        const float maxM  = g_menuQuadMaxHeightM.load();
+        const float wM    = menu_quad_width_m();
+        const int   lastW = g_panelW.load();
+        if (maxM > 0.0f && wM > 0.0f && lastW > 0)
+            ImGui::SetNextWindowSizeConstraints(ImVec2(0.0f, 0.0f),
+                                                ImVec2(FLT_MAX, maxM * (float)lastW / wM));
+    }
     ImGui::Begin("SnowRunner VR Settings", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
 
     // The first-run resolution notice, as a MODAL -- the whole reason the menu
@@ -1489,7 +1566,7 @@ void draw_settings_window()
         const ImVec2 ws = ImGui::GetWindowSize();
         ImGui::SetNextWindowPos(ImVec2(wp.x + ws.x * 0.5f, wp.y + ws.y * 0.5f),
                                 ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-        ImGui::SetNextWindowSizeConstraints(ImVec2(360.0f, 0.0f), ImVec2(520.0f, FLT_MAX));
+        ImGui::SetNextWindowSizeConstraints(ImVec2(ui_px(360.0f), 0.0f), ImVec2(ui_px(520.0f), FLT_MAX));
     }
     if (ImGui::BeginPopupModal("First-time setup", nullptr,
                                ImGuiWindowFlags_AlwaysAutoResize)) {
@@ -1502,7 +1579,7 @@ void draw_settings_window()
         ImGui::TextDisabled("The game builds its window once, at launch, and never "
                             "re-reads the size -- so this cannot be applied now.");
         ImGui::Spacing();
-        if (ImGui::Button("OK", ImVec2(120.0f, 0.0f))) {
+        if (ImGui::Button("OK", ImVec2(ui_px(120.0f), 0.0f))) {
             g_firstRunNotice.store(false);
             ImGui::CloseCurrentPopup();
         }
@@ -1763,5 +1840,8 @@ void  set_mod_ui_scale(float scale)
 {
     g_modUiScale.store((std::max)(0.5f, (std::min)(3.0f, scale)));
 }
+
+float menu_quad_width_m() { return kMenuQuadWidthM * g_builtUiScale.load(); }
+void  set_menu_quad_max_height_m(float m) { g_menuQuadMaxHeightM.store(m > 0.0f ? m : 0.0f); }
 
 } // namespace hooks

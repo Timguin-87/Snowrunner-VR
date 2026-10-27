@@ -11,6 +11,7 @@
 #include "hooks/pattern_scan.h"
 #include "render/smudge_layer.hpp"
 #include "xr/xr_mirror.h"
+#include "xr/xr_input.h"
 
 #include <windows.h>
 #include <xinput.h>
@@ -402,6 +403,9 @@ struct Settings {
     // Developer switch, see hooks::maybe_dump_game_image(). Not a preference:
     // it exists for the session after a game update, and is off otherwise.
     bool     dumpGameCode       = false;
+    // The VR controllers as Xbox pad 0 -- see xr/xr_input.h. On by default:
+    // without it a player holding motion controllers has no way to drive.
+    bool     vrControllersAsGamepad = true;
 };
 
 // Where each role's hash list lives in Settings.
@@ -480,7 +484,8 @@ std::string format_file(const Settings& s)
         "MenuKey=%s\n"
         "# MenuGamepadCombo: gamepad buttons (held together) that open/close the menu\n"
         "MenuGamepadCombo=%s\n"
-        "# ModUIScale: size of this settings window/font (0.5 - 3.0, 1.0 = 100%%)\n"
+        "# ModUIScale: size of this settings panel -- text, controls and the panel\n"
+        "# itself, in the headset too (0.5 - 3.0, 1.0 = 100%%)\n"
         "ModUIScale=%.2f\n"
         "# UIPlaneSize: width of the in-game UI plane, in metres (0.2 - 10). The\n"
         "# UI is a composition layer, not part of the render, so this is a real\n"
@@ -584,6 +589,13 @@ std::string format_file(const Settings& s)
         "TruckLevelLock=%s\n"
         "# TruckYawLock: cockpit only -- same, for the stick's look-YAW.\n"
         "TruckYawLock=%s\n"
+        "# VRControllersAsGamepad: true, false. The VR controllers as Xbox pad 0:\n"
+        "# triggers = LT/RT, grips = LB/RB, A/B/X/Y, sticks and stick clicks,\n"
+        "# left menu button = Start on a tap, Back (Select) when held 0.5 s.\n"
+        "# Holding the left stick down (L3) turns the right stick into the\n"
+        "# D-pad and the menu button into Back. Merged with a real gamepad if\n"
+        "# one is connected.\n"
+        "VRControllersAsGamepad=%s\n"
         "\n"
         "# ForceGameResolution: WxH the game window is CREATED at, overriding\n"
         "# whatever resolution the game itself picked (it clamps its own to the\n"
@@ -682,6 +694,7 @@ std::string format_file(const Settings& s)
         wtKey,
         s.debugEyeCantDeg,
         s.truckLevelLock ? "true" : "false", s.truckYawLock ? "true" : "false",
+        s.vrControllersAsGamepad ? "true" : "false",
         s.resolutionUnset ? "auto" : size_str(s.forceResW, s.forceResH).c_str(),
         s.screenGateDirect ? "direct" : "legacy",
         s.cameraFovFactor,
@@ -916,6 +929,12 @@ void init()
         else note_invalid("TruckYawLock", v);
     } else anyMissing = true;
 
+    if (kv_find(kv, "VRControllersAsGamepad", v)) {
+        if (_stricmp(v.c_str(), "true") == 0 || v == "1")       s.vrControllersAsGamepad = true;
+        else if (_stricmp(v.c_str(), "false") == 0 || v == "0") s.vrControllersAsGamepad = false;
+        else note_invalid("VRControllersAsGamepad", v);
+    } else anyMissing = true;
+
     if (kv_find(kv, "ForceGameResolution", v)) {
         int w = 0, h = 0;
         if (_stricmp(v.c_str(), "auto") == 0) {
@@ -1021,6 +1040,7 @@ void init()
     xr::set_debug_eye_cant_deg(s.debugEyeCantDeg);
     hooks::set_truck_level_lock_enabled(s.truckLevelLock);
     hooks::set_truck_yaw_lock_enabled(s.truckYawLock);
+    xrinput::set_enabled(s.vrControllersAsGamepad);
     hooks::set_screen_gate_direct(s.screenGateDirect);
     hooks::set_camera_fov_factor(s.cameraFovFactor);
     hooks::set_force_resolution(s.forceResW, s.forceResH);
@@ -1097,6 +1117,7 @@ void save()
     s.debugEyeCantDeg = xr::debug_eye_cant_deg();
     s.truckLevelLock = hooks::truck_level_lock_enabled();
     s.truckYawLock = hooks::truck_yaw_lock_enabled();
+    s.vrControllersAsGamepad = xrinput::enabled();
     s.screenGateDirect = hooks::screen_gate_direct();
     s.cameraFovFactor    = hooks::camera_fov_factor();
     // Answering the question is what clears it, and setting a real size is the

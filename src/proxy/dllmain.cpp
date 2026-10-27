@@ -5,6 +5,42 @@
 #include "common/log.h"
 #include "common/crash_log.h"
 #include "common/config.h"
+#include "xr/xr_mirror.h"
+
+#include <MinHook.h>
+
+namespace {
+
+// THE PROCESS IS EXITING: close XR first. ntdll!RtlExitUserProcess is where
+// every normal exit funnels (the game's own goes ucrtbase!exit ->
+// kernel32!ExitProcess -> here), and it runs on the exiting thread BEFORE any
+// DLL is told the process is going -- so not under the loader lock, and while
+// the game's D3D11 device still exists. See xr::shutdown_xr() for the crash
+// this prevents.
+using PFN_RtlExitUserProcess = void (NTAPI*)(LONG);
+PFN_RtlExitUserProcess real_RtlExitUserProcess = nullptr;
+
+void NTAPI Detour_RtlExitUserProcess(LONG status)
+{
+    xr::shutdown_xr();
+    real_RtlExitUserProcess(status);
+}
+
+void install_exit_hook()
+{
+    void* target = nullptr;
+    if (MH_CreateHookApiEx(L"ntdll", "RtlExitUserProcess",
+                           reinterpret_cast<void*>(&Detour_RtlExitUserProcess),
+                           reinterpret_cast<void**>(&real_RtlExitUserProcess),
+                           &target) != MH_OK ||
+        MH_EnableHook(target) != MH_OK) {
+        VRLOG("exit hook FAILED -- XR stays open until the loader unloads it");
+        return;
+    }
+    VRLOG("exit hook installed (XR closes before DLLs unload)");
+}
+
+} // namespace
 
 // Loading the real dxgi.dll inside DllMain runs under loader lock, which is
 // normally discouraged — but the forward table must be live before d3d11.dll
@@ -46,6 +82,7 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID)
         // the exe's entry point runs. Only needs hooks::init() (MinHook) --
         // nothing about it depends on the menu existing yet.
         hooks::install_input_block();
+        install_exit_hook();
     }
     return TRUE;
 }

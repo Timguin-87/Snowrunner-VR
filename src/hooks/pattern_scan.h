@@ -61,6 +61,25 @@ std::vector<uint8_t*> find_calls_to(HMODULE module, const void* callee);
 //   48 8B 05 xx xx xx xx      mov rax,[rip+disp32] -> (insn, 3, 7)
 uint8_t* rel32_target(const uint8_t* insn, int dispOffset, int insnLen);
 
+// Every instruction `opcode` disp32 in the executable sections whose
+// RIP-relative target is `target`, as the address of its first byte. `opcode`
+// is everything before the displacement -- {48 8D 15} for lea rdx,[rip+disp32]
+// -- and the displacement must END the instruction, which is what lets the
+// target be computed without a disassembler. A byte scan, like find_calls_to.
+std::vector<uint8_t*> find_rip_refs(HMODULE module, const uint8_t* opcode, int opLen,
+                                    const void* target);
+
+// Every copy of the string `s` in the image's read-only data, matched WHOLE:
+// starting after a NUL and ending on its own terminator, so "XInputGetState"
+// finds neither "XInputGetStateEx" nor "MyXInputGetState".
+std::vector<uint8_t*> find_cstrings(HMODULE module, const char* s);
+
+// The import slot `module` calls `fn` through, found by NAME in its own import
+// table -- so it is found even when the function itself is already detoured by
+// somebody else. Any DLL when `dll` is null. Null when `fn` is not imported by
+// name.
+void** import_slot(HMODULE module, const char* dll, const char* fn);
+
 // SnowRunner.exe's link timestamp and image size: together, the game build.
 // Logged once at startup so every log says which build it came from.
 uint32_t exe_timestamp();

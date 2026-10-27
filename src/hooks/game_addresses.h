@@ -11,7 +11,9 @@
 //   a CALL SITE (a return address a detour filters on) must be the only call
 //   to that function inside the function it belongs to -- found by what calls
 //   what, not by how far into the caller it sits, so an edit to the caller's
-//   body does not move it.
+//   body does not move it;
+//   a GLOBAL must be the target of the instruction it was found by, and lie in
+//   the exe's writable data.
 //
 // Anything that fails is left at 0 and logged with the reason, and the feature
 // that needed it stays off. Nothing is ever patched at an address carried over
@@ -46,6 +48,15 @@ struct GameAddresses {
     // Data: the global holding the game's settings object, whose FOV pair at
     // +0x60/+0x64 is read (never written) for the FOV monitor.
     uintptr_t settingsPtr = 0;
+
+    // Data: the globals the game keeps its own XInput function pointers in. It
+    // loads xinput9_1_0.dll itself and calls through these, so this is where
+    // input_block.cpp puts the VR controllers in -- in front of anything that
+    // intercepts XInput, the Steam overlay included. Every such global, since
+    // there is more than one loader (two in build 0x6AB52F5D); 0 = unused.
+    static constexpr int kMaxXInputPtrs = 4;
+    uintptr_t xinputGetState[kMaxXInputPtrs] = {};
+    uintptr_t xinputGetCaps[kMaxXInputPtrs]  = {};
 };
 
 // Resolves on the first call, logging one line per address and a summary, and

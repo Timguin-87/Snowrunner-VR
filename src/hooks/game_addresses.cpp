@@ -3,6 +3,7 @@
 #include "common/log.h"
 
 #include <windows.h>
+#include <cstdio>
 #include <mutex>
 #include <vector>
 
@@ -12,11 +13,21 @@ namespace {
 // --- signatures -------------------------------------------------------------
 //
 // Written from build 0x6AB52F5D (the 2026-10-21 update) and checked against a
-// dump of it: each matches exactly once. Call targets and RIP-relative
-// displacements are wildcarded, because those move with every relink. What is
-// left is the instruction stream itself, and for these functions that has not
-// changed in any build the mod has run on -- the 2026-10-21 update moved every
-// one of them and edited none.
+// dump of it: each matches exactly once. Wildcarded, because each moves on its
+// own whenever the code around it changes:
+//   - call targets and RIP-relative displacements: move with every relink;
+//   - STACK OFFSETS: the frame size in sub rsp, and every [rsp+x], [rax+x] or
+//     [r11+x] that is a local, a saved XMM register or a nonvolatile parked in
+//     a home slot. The frame is laid out per function, so one local more or
+//     less anywhere in it shifts all of these while the code stays the same.
+//     (An argument spilled to ITS OWN home slot is fixed by the calling
+//     convention and stays in.)
+// What is left is the instruction stream itself, and for these functions that
+// has not changed in any build the mod has run on -- the 2026-10-21 update moved
+// every one of them and edited none. Checked against more than one build where
+// one exists: kSigMainCamera also matches a fragment of the August build, and
+// kSigCameraCommit is the July pattern (docs/recon.md) with its stack offset
+// wildcarded. tools/sigcheck.py takes any number of dumps; keep one per build.
 //
 // Struct offsets are deliberately LEFT IN where the mod depends on them. If
 // combine::CAMERA's FOV ever moves off +0x108, the set-perspective signature
@@ -27,29 +38,29 @@ namespace {
 // lea rsi,[rcx+0x184]: the staged eye camera_hook reads.
 constexpr const char* kSigCameraCommit =
     "48 8B C4 F3 0F 11 50 18 48 89 50 10 55 53 56 57 41 55 41 56 "
-    "48 8D A8 ?? ?? FF FF 48 81 EC ?? ?? 00 00 0F 29 70 A8 48 8D B1 84 01 00 00";
+    "48 8D A8 ?? ?? FF FF 48 81 EC ?? ?? 00 00 0F 29 70 ?? 48 8D B1 84 01 00 00";
 
 // The main render camera's build (docs/cockpit_camera.md): the function that
 // calls the view builder, combine #1 and combine #2, in that order. Not hooked
 // itself; it is where the three main-camera call sites are looked for.
 constexpr const char* kSigMainCamera =
-    "48 8B C4 48 89 58 10 48 89 78 20 55 48 8D A8 ?? ?? FF FF 48 81 EC ?? ?? 00 00 "
+    "48 8B C4 48 89 58 ?? 48 89 78 ?? 55 48 8D A8 ?? ?? FF FF 48 81 EC ?? ?? 00 00 "
     "48 8B D9 48 8B FA 48 8B 89 38 01 00 00 48 85 C9 0F 84 ?? ?? ?? ?? "
     "0F 10 83 BC 01 00 00 48 81 C1 70 01 00 00";
 
 // The view builder: a 4x4 transpose (rcx = out, rdx = in).
 constexpr const char* kSigViewBuilder =
-    "48 83 EC 48 0F 10 02 4C 8D 41 08 0F 10 4A 10 0F 29 04 24 0F 10 42 20 "
-    "0F 29 4C 24 10 0F 10 4A 30 33 D2";
+    "48 83 EC ?? 0F 10 02 4C 8D 41 08 0F 10 4A 10 0F 29 04 24 0F 10 42 20 "
+    "0F 29 4C 24 ?? 0F 10 4A 30 33 D2";
 
 // combine #1 (out = rcx, position = rdx float3, orientation = r8).
 constexpr const char* kSigCombine1 =
-    "48 83 EC 38 F3 0F 10 62 04 48 8B C1 F3 0F 10 6A 08 0F 29 74 24 20 "
+    "48 83 EC ?? F3 0F 10 62 04 48 8B C1 F3 0F 10 6A 08 0F 29 74 24 ?? "
     "0F 28 CD F3 0F 10 32 F3 41 0F 59 48 20";
 
 // combine #2, the final cockpit view (out = rcx, r8 = orientation).
 constexpr const char* kSigCombine2 =
-    "48 83 EC 18 F2 0F 10 02 8B 42 08 0F 28 E8 F2 0F 11 04 24 F3 0F 10 24 24 "
+    "48 83 EC ?? F2 0F 10 02 8B 42 08 0F 28 E8 F2 0F 11 04 24 F3 0F 10 24 24 "
     "0F C6 ED 55 0F 28 C4 F3 41 0F 59 00";
 
 // buildPerspective(rcx = out, xmm1 = fovY, xmm2 = aspect, xmm3 = near,
@@ -57,8 +68,8 @@ constexpr const char* kSigCombine2 =
 // call and the 1.0f stored at +0x2C that makes it a D3D row-vector perspective
 // -- everything detour_projbuild relies on.
 constexpr const char* kSigProjBuild =
-    "48 89 5C 24 08 57 48 83 EC 40 F3 0F 59 0D ?? ?? ?? ?? 33 FF 48 8B D9 "
-    "48 89 79 30 0F 29 74 24 30 0F 28 F2 0F 29 7C 24 20 0F 28 FB 0F 28 C1 "
+    "48 89 5C 24 ?? 57 48 83 EC ?? F3 0F 59 0D ?? ?? ?? ?? 33 FF 48 8B D9 "
+    "48 89 79 30 0F 29 74 24 ?? 0F 28 F2 0F 29 7C 24 ?? 0F 28 FB 0F 28 C1 "
     "48 89 79 20 48 89 79 18 48 89 79 0C 48 89 79 04 E8 ?? ?? ?? ?? "
     "F3 0F 10 1D ?? ?? ?? ?? 0F 28 D0 F3 0F 59 D6 0F 28 CB 48 8B C3 "
     "C7 43 2C 00 00 80 3F";
@@ -67,23 +78,25 @@ constexpr const char* kSigProjBuild =
 // (+0x10C), then builds the projection. Its one call to buildPerspective is
 // the main camera's -- the PROJ LOCK site.
 constexpr const char* kSigSetPerspective =
-    "48 89 5C 24 08 57 48 81 EC ?? ?? 00 00 0F 57 C0 48 8B F9 0F 2F C8 76 08 "
+    "48 89 5C 24 ?? 57 48 81 EC ?? ?? 00 00 0F 57 C0 48 8B F9 0F 2F C8 76 08 "
     "F3 0F 11 89 08 01 00 00 0F 2F D0 76 08 F3 0F 11 91 0C 01 00 00";
 
 // fillOrbitView(rcx = view, rdx = eye, r8 = target, r9 = up). Opens on
 // target - eye.
 constexpr const char* kSigFnA =
-    "48 8B C4 48 89 58 08 48 89 68 10 48 89 70 18 57 48 83 EC 40 "
+    "48 8B C4 48 89 58 ?? 48 89 68 ?? 48 89 70 ?? 57 48 83 EC ?? "
     "F3 41 0F 10 00 48 8B EA F3 0F 5C 02 F3 41 0F 10 48 04 48 8B F9 F3 0F 5C 4A 04";
 
 // The main-menu camera, whose one call to fillOrbitView is the menu view.
 constexpr const char* kSigMenuCamera =
-    "4C 8B DC 49 89 7B 20 55 49 8D AB ?? ?? FF FF 48 81 EC ?? ?? 00 00 "
-    "83 3D ?? ?? ?? ?? 00 48 8B F9 0F 85 ?? ?? ?? ?? 48 8B 41 28 49 89 5B 08";
+    "4C 8B DC 49 89 7B ?? 55 49 8D AB ?? ?? FF FF 48 81 EC ?? ?? 00 00 "
+    "83 3D ?? ?? ?? ?? 00 48 8B F9 0F 85 ?? ?? ?? ?? 48 8B 41 28 49 89 5B ??";
 // The same call found from its own site instead, for when the function's
-// prologue changes and its body does not. The E8 is at +6.
+// prologue changes and its body does not. The E8 is at +6. With its stack
+// offset wildcarded this also matches the set-perspective call a few lines
+// further on, so the site is the one match whose E8 calls fillOrbitView.
 constexpr const char* kSigMenuCameraCall =
-    "F3 0F 11 4C 24 54 E8 ?? ?? ?? ?? 48 8D 4F 28 E8";
+    "F3 0F 11 4C 24 ?? E8 ?? ?? ?? ?? 48 8D 4F 28 E8";
 constexpr int kMenuCameraCallE8 = 6;
 
 // mov rax,[settings] / movss xmm1,[rax+0x64] / movss xmm2,[rax+0x60]: the
@@ -172,6 +185,91 @@ uintptr_t unique_call(const char* name, uintptr_t caller, uintptr_t callee)
     return rva_of(c[0] + 5);
 }
 
+// In the exe's own writable data: where a global has to be.
+bool exe_data(const void* p)
+{
+    MEMORY_BASIC_INFORMATION mbi{};
+    return VirtualQuery(p, &mbi, sizeof(mbi)) && mbi.AllocationBase == g_exe &&
+           (mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY));
+}
+
+// Every global the game stores GetProcAddress(`name`) in. Found from the name
+// string, which a relink cannot change: lea rdx,[name], then a call through the
+// exe's own GetProcAddress import slot, then mov [global],rax, each within a
+// few instructions of the last. Build 0x6AB52F5D, for the record:
+//
+//   lea  rdx,["XInputGetState"]      lea  rdx,["XInputGetState"]
+//   mov  rcx,rax                     mov  rcx,[rsi+1A8h]
+//   call [GetProcAddress]            call [GetProcAddress]
+//   lea  rdx,["XInputGet...ities"]   mov  [global],rax
+//   mov  rcx,rdi
+//   mov  [global],rax
+//
+// The windows between the steps are searched byte-wise, not disassembled, so
+// each step is held to exactly what it has to be -- the call through that one
+// import slot, the store into the exe's writable data, 8-aligned -- and a step
+// that meets the NEXT one's marker first (rdx reloaded before the call, another
+// import call before the store) drops the site rather than take what belongs
+// to someone else. `sites` counts the lookups found, kept or not.
+int procaddress_globals(const char* name, uintptr_t* out, int cap, int& sites)
+{
+    sites = 0;
+    void** gpa = import_slot(g_exe, nullptr, "GetProcAddress");
+    if (!gpa) return 0;
+    constexpr int kWindow = 32;
+    static const uint8_t kLeaRdx[] = {0x48, 0x8D, 0x15};
+    int n = 0;
+    for (uint8_t* str : find_cstrings(g_exe, name)) {
+        for (uint8_t* lea : find_rip_refs(g_exe, kLeaRdx, 3, str)) {
+            ++sites;
+            uint8_t* call = nullptr;
+            for (uint8_t* p = lea + 7; p < lea + 7 + kWindow; ++p) {
+                if (p[0] == 0x48 && p[1] == 0x8D && p[2] == 0x15) break;
+                if (p[0] == 0xFF && p[1] == 0x15) {
+                    if (rel32_target(p, 2, 6) == reinterpret_cast<uint8_t*>(gpa)) call = p;
+                    break;
+                }
+            }
+            if (!call) continue;
+            uint8_t* glob = nullptr;
+            for (uint8_t* p = call + 6; p < call + 6 + kWindow; ++p) {
+                if (p[0] == 0xFF && p[1] == 0x15) break;
+                if (p[0] == 0x48 && p[1] == 0x89 && p[2] == 0x05) {
+                    glob = rel32_target(p, 3, 7);
+                    break;
+                }
+            }
+            if (!glob || (reinterpret_cast<uintptr_t>(glob) & 7) || !exe_data(glob)) continue;
+            const uintptr_t r = rva_of(glob);
+            bool dup = false;
+            for (int i = 0; i < n; ++i) dup = dup || out[i] == r;
+            if (!dup && n < cap) out[n++] = r;
+        }
+    }
+    return n;
+}
+
+// One summary line for a set of globals, counted as one address.
+void report_globals(const char* label, const char* name, uintptr_t* out, int cap)
+{
+    int sites = 0;
+    const int n = procaddress_globals(name, out, cap, sites);
+    ++g_wanted;
+    if (n == 0) {
+        VRLOG("  %-22s NOT FOUND -- %d lookup(s) of \"%s\" in the code, none storing "
+              "to a global", label, sites, name);
+        return;
+    }
+    ++g_found;
+    char list[128] = {};
+    int len = 0;
+    for (int i = 0; i < n && len < (int)sizeof(list); ++i)
+        len += snprintf(list + len, sizeof(list) - len, "%sexe+0x%llX", i ? ", " : "",
+                        (unsigned long long)out[i]);
+    VRLOG("  %-22s %s  (GetProcAddress(\"%s\"), %d of %d lookup(s))", label, list, name,
+          n, sites);
+}
+
 // The main camera build found WITHOUT its signature: the one function that
 // calls the view builder, combine #1 and combine #2 exactly once each, in that
 // order. In build 0x6AB52F5D, 22 functions call both combines and 4 call all
@@ -214,8 +312,9 @@ void resolve()
     g_exe  = GetModuleHandleW(nullptr);
     g_base = reinterpret_cast<uint8_t*>(g_exe);
     GameAddresses& a = g_addr;
-    VRLOG("game addresses for build 0x%08X -- each found by signature or by what "
-          "calls it, never by a remembered offset:", exe_timestamp());
+    VRLOG("game addresses for build 0x%08X -- each found by signature, by what "
+          "calls it or by the name it looks up, never by a remembered offset:",
+          exe_timestamp());
 
     a.cameraCommit = report("camera commit", by_signature("camera commit", kSigCameraCommit), "signature");
     a.viewBuilder  = report("view builder", by_signature("view builder", kSigViewBuilder), "signature");
@@ -253,12 +352,20 @@ void resolve()
         uintptr_t ret = menuCam ? unique_call("fna <- main menu", menuCam, a.fna) : 0;
         const char* how = "call in main-menu camera";
         if (!ret && a.fna) {
-            // Fallback: the call site's own signature, accepted only if that
-            // E8 really does call fillOrbitView.
-            uint8_t* hit = nullptr;
-            if (pattern_scan_all(g_exe, kSigMenuCameraCall, &hit, 1) == 1 &&
-                rva_of(rel32_target(hit + kMenuCameraCallE8, 1, 5)) == a.fna) {
-                ret = rva_of(hit + kMenuCameraCallE8 + 5);
+            // Fallback: the call site's own signature. Still exactly one: of
+            // its matches, exactly one may call fillOrbitView.
+            constexpr int kCap = 8;
+            uint8_t* hits[kCap] = {};
+            const int n = pattern_scan_all(g_exe, kSigMenuCameraCall, hits, kCap);
+            uint8_t* site = nullptr;
+            int calling = 0;
+            for (int i = 0; i < n && i < kCap; ++i)
+                if (rva_of(rel32_target(hits[i] + kMenuCameraCallE8, 1, 5)) == a.fna) {
+                    site = hits[i];
+                    ++calling;
+                }
+            if (n <= kCap && calling == 1) {
+                ret = rva_of(site + kMenuCameraCallE8 + 5);
                 how = "call-site signature";
             }
         }
@@ -290,6 +397,11 @@ void resolve()
             VRLOG("  %-22s NOT FOUND -- read signature matches %d place(s)%s",
                   "settings global", n, n == 1 ? ", but not a load from writable data" : "");
     }
+
+    report_globals("XInputGetState ptrs", "XInputGetState", a.xinputGetState,
+                   GameAddresses::kMaxXInputPtrs);
+    report_globals("XInputGetCaps ptrs", "XInputGetCapabilities", a.xinputGetCaps,
+                   GameAddresses::kMaxXInputPtrs);
 
     if (g_found == g_wanted)
         VRLOG("game addresses: all %d found", g_wanted);

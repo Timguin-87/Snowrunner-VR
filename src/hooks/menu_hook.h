@@ -68,9 +68,20 @@ void     set_menu_toggle_vk(int vk);
 uint32_t menu_toggle_gamepad_combo();
 void     set_menu_toggle_gamepad_combo(uint32_t xinputButtonMask);
 
-// Size of the mod's own settings window/font (1.0 = 100%, unscaled).
-// Config-file / in-game-slider tunable; clamped to [0.5, 3.0].
+// Size of the mod's own settings panel -- font, widgets and the panel itself
+// (1.0 = 100%, unscaled). Config-file / in-game-slider tunable; clamped to
+// [0.5, 3.0].
 float mod_ui_scale();
 void  set_mod_ui_scale(float scale);
+
+// Width of the settings panel's quad in the headset, in metres: a fixed width
+// at 100% times the UI size the panel was built at, so the slider makes the
+// whole panel bigger in the headset. Its height follows the panel's aspect.
+float menu_quad_width_m();
+
+// The tallest that quad can be and still be seen whole -- it is head-locked --
+// from the field of view the XR side submits; 0 = unknown. The panel scrolls
+// rather than grow past it.
+void  set_menu_quad_max_height_m(float m);
 
 } // namespace hooks

@@ -1,5 +1,8 @@
 #include "hooks/input_block.h"
+#include "hooks/game_addresses.h"
 #include "hooks/menu_hook.h"
+#include "hooks/pattern_scan.h"
+#include "xr/xr_input.h"
 #include "common/log.h"
 
 #define DIRECTINPUT_VERSION 0x0800
@@ -136,6 +139,24 @@ void log_blocked_caller_once(void* ret)
 // never calls through, so a blocked call can never nest.
 thread_local int t_passThrough = 0;
 
+// Nesting depth of THIS detour on the calling thread -- the same
+// XInputGetState -> XInputGetStateEx nesting as above. The VR controllers are
+// merged into pad 0 once, at the outermost level; merging at every level would
+// count them twice.
+thread_local int t_xiDepth = 0;
+
+// Set while one of the wrappers on the game's own XInput pointers (below) is
+// calling through. Everything this detour would decide -- the menu block, the
+// VR merge -- that wrapper decides itself, outermost, so here the call just
+// passes.
+thread_local int t_gameCall = 0;
+
+// True once any of the game's own XInput pointers has been wrapped. From then
+// on the VR pad is the wrapper's to add, and this detour adds it only to the
+// mod's own polling (the menu navigation) -- not to the Steam overlay's, which
+// does not need a pad that is not there.
+std::atomic<bool> g_gameWrapped{false};
+
 template <int N>
 DWORD WINAPI Detour_XInputGetState(DWORD userIndex, XINPUT_STATE* state)
 {
@@ -144,10 +165,19 @@ DWORD WINAPI Detour_XInputGetState(DWORD userIndex, XINPUT_STATE* state)
     if (!orig)
         return ERROR_DEVICE_NOT_CONNECTED;
 
-    if (t_passThrough || !is_menu_open() || caller_is_self(ret)) {
+    if (t_passThrough || t_gameCall || !is_menu_open() || caller_is_self(ret)) {
         ++t_passThrough;
+        ++t_xiDepth;
         DWORD r = orig(userIndex, state);
+        --t_xiDepth;
         --t_passThrough;
+        // The VR controllers as pad 0 (xr/xr_input.h). Here, on the pass-through
+        // side only: a call the menu is blocking stays neutral like any other.
+        // t_passThrough at this point is the CALLER's: set only by
+        // xinput_poll_self, i.e. the mod's own menu polling.
+        if (t_xiDepth == 0 && userIndex == 0 && !t_gameCall &&
+            (t_passThrough || !g_gameWrapped.load(std::memory_order_relaxed)))
+            xrinput::merge_into(r, state);
         if (r == ERROR_SUCCESS && state && userIndex < XUSER_MAX_COUNT)
             g_lastPacket[userIndex] = state->dwPacketNumber;
         return r;
@@ -206,6 +236,203 @@ void hook_one_xinput(HMODULE mod, const char* procName, WORD ordinal, const wcha
     VRLOG("input block: hooked %ls!%s", dllName, procName ? procName : "XInputGetStateEx(ord.100)");
 }
 
+// XInputGetCapabilities, for the VR pad only. The game asks it before polling
+// (the exe names XInputGetCapabilities alongside XInputGetState), so pad 0 has
+// to read as a connected gamepad here too when it is the VR controllers alone.
+// A real pad's answer is never touched.
+using PFN_XInputGetCapabilities = DWORD (WINAPI*)(DWORD, DWORD, XINPUT_CAPABILITIES*);
+struct XcHook { void* target; PFN_XInputGetCapabilities orig; };
+constexpr int kMaxXc = 4;
+XcHook g_xc[kMaxXc]{};
+std::atomic<int> g_xcCount{0};
+
+// What pad 0 reports when it is the VR controllers alone.
+void fill_vr_caps(XINPUT_CAPABILITIES* caps)
+{
+    *caps = XINPUT_CAPABILITIES{};
+    caps->Type    = XINPUT_DEVTYPE_GAMEPAD;
+    caps->SubType = XINPUT_DEVSUBTYPE_GAMEPAD;
+    caps->Gamepad.wButtons = 0xF3FF;            // every standard button
+    caps->Gamepad.bLeftTrigger = caps->Gamepad.bRightTrigger = 0xFF;
+    caps->Gamepad.sThumbLX = caps->Gamepad.sThumbLY = (SHORT)0xFFC0;
+    caps->Gamepad.sThumbRX = caps->Gamepad.sThumbRY = (SHORT)0xFFC0;
+}
+
+template <int N>
+DWORD WINAPI Detour_XInputGetCapabilities(DWORD userIndex, DWORD flags, XINPUT_CAPABILITIES* caps)
+{
+    PFN_XInputGetCapabilities orig = g_xc[N].orig;
+    DWORD r = orig ? orig(userIndex, flags, caps) : ERROR_DEVICE_NOT_CONNECTED;
+    // Once the game's own pointer is wrapped this is the wrapper's job, as
+    // with the merge above.
+    if (r != ERROR_SUCCESS && userIndex == 0 && caps && !t_gameCall &&
+        !g_gameWrapped.load(std::memory_order_relaxed) && xrinput::present()) {
+        fill_vr_caps(caps);
+        r = ERROR_SUCCESS;
+    }
+    return r;
+}
+
+const PFN_XInputGetCapabilities kXcDetours[kMaxXc] = {
+    &Detour_XInputGetCapabilities<0>, &Detour_XInputGetCapabilities<1>,
+    &Detour_XInputGetCapabilities<2>, &Detour_XInputGetCapabilities<3>,
+};
+
+void hook_one_xcaps(HMODULE mod, const wchar_t* dllName)
+{
+    void* target = reinterpret_cast<void*>(GetProcAddress(mod, "XInputGetCapabilities"));
+    if (!target) return;
+    const int n = g_xcCount.load();
+    for (int i = 0; i < n && i < kMaxXc; ++i)
+        if (g_xc[i].target == target) return;      // a forwarder to one already hooked
+    if (n >= kMaxXc) return;
+    void* orig = nullptr;
+    if (MH_CreateHook(target, reinterpret_cast<void*>(kXcDetours[n]), &orig) != MH_OK)
+        return;
+    g_xc[n].target = target;
+    g_xc[n].orig   = reinterpret_cast<PFN_XInputGetCapabilities>(orig);
+    g_xcCount.store(n + 1);
+    if (MH_EnableHook(target) != MH_OK) {
+        g_xc[n].orig = nullptr;
+        VRLOG("input block: FAILED to enable %ls!XInputGetCapabilities hook", dllName);
+        return;
+    }
+    VRLOG("input block: hooked %ls!XInputGetCapabilities", dllName);
+}
+
+// --------------------------------------------------------------------------
+// The game's own XInput pointers -- in front of the Steam overlay
+// --------------------------------------------------------------------------
+//
+// THE VR PAD GOES IN HERE, not in the hooks above. The game loads
+// xinput9_1_0.dll itself, keeps what GetProcAddress returns in globals and
+// calls through those (game_addresses.h finds them). A wrapper swapped into
+// that pointer runs in front of EVERYTHING that intercepts XInput, by
+// construction: whatever the pointer led to -- the export, or the Steam
+// overlay's patch on it -- now runs inside the wrapper, and the wrapper has the
+// last word on what the game gets.
+//
+// The hooks above cannot be that. They sit on the functions themselves, behind
+// the Steam overlay's patch. Measured 2026-10-26 with the merge there: the VR
+// pad was live (the log said so) and the game never saw a button, and the only
+// caller those hooks ever logged was gameoverlayrenderer64.dll -- Steam serving
+// the game from Steam Input, and polling XInput for its own use.
+//
+// The menu block is applied here as well, for the same reason: what Steam
+// serves the game never passes the hooks above. Inside a wrapper's call those
+// hooks let everything through (t_gameCall), so the block and the merge are
+// each decided once, outermost.
+//
+// Checked every Present rather than once: one of the game's loaders fills its
+// pair lazily on first use, and a loader that runs again writes the export back
+// over the wrapper.
+constexpr int kMaxGamePtrs = GameAddresses::kMaxXInputPtrs;
+std::atomic<PFN_XInputGetState>        g_gameGs[kMaxGamePtrs]{};
+std::atomic<PFN_XInputGetCapabilities> g_gameGc[kMaxGamePtrs]{};
+// The last packet number the GAME was given per pad, for the frozen neutral
+// while the menu is open -- the hooks above keep their own, for their callers.
+DWORD g_gamePacket[XUSER_MAX_COUNT]{};
+std::atomic<bool> g_loggedGameBlock{false};
+std::atomic<bool> g_loggedVrReachedGame{false};
+
+template <int N>
+DWORD WINAPI Game_XInputGetState(DWORD userIndex, XINPUT_STATE* state)
+{
+    const PFN_XInputGetState orig = g_gameGs[N].load(std::memory_order_acquire);
+    DWORD r = ERROR_DEVICE_NOT_CONNECTED;
+    if (orig) {
+        ++t_gameCall;
+        r = orig(userIndex, state);
+        --t_gameCall;
+    }
+    // Merged FIRST, menu or not, so that whether pad 0 is connected does not
+    // change with the menu -- the VR controllers alone are a connected pad.
+    if (userIndex == 0 && xrinput::merge_into(r, state) &&
+        !g_loggedVrReachedGame.exchange(true))
+        VRLOG("controllers: the game is receiving the VR controllers as pad 0");
+    if (r != ERROR_SUCCESS || !state || userIndex >= XUSER_MAX_COUNT)
+        return r;
+
+    if (is_menu_open()) {
+        // Neutral with the packet frozen, as in the hooks above -- but the
+        // answer to whether a pad is there at all is kept. Telling the game
+        // every slot is connected while the menu is open, and then that they
+        // are gone when it closes, is a "controller disconnected" waiting to
+        // happen.
+        *state = XINPUT_STATE{};
+        state->dwPacketNumber = g_gamePacket[userIndex];
+        if (!g_loggedGameBlock.exchange(true))
+            VRLOG("input block: menu open -- the game's XInput neutralised at its own pointer");
+        return r;
+    }
+    g_gamePacket[userIndex] = state->dwPacketNumber;
+    return r;
+}
+
+template <int N>
+DWORD WINAPI Game_XInputGetCapabilities(DWORD userIndex, DWORD flags, XINPUT_CAPABILITIES* caps)
+{
+    const PFN_XInputGetCapabilities orig = g_gameGc[N].load(std::memory_order_acquire);
+    DWORD r = ERROR_DEVICE_NOT_CONNECTED;
+    if (orig) {
+        ++t_gameCall;
+        r = orig(userIndex, flags, caps);
+        --t_gameCall;
+    }
+    // The game asks before it polls, so a pad that is only the VR controllers
+    // has to exist here too, or it is never polled at all.
+    if (r != ERROR_SUCCESS && userIndex == 0 && caps && xrinput::present()) {
+        fill_vr_caps(caps);
+        r = ERROR_SUCCESS;
+    }
+    return r;
+}
+
+static_assert(kMaxGamePtrs == 4, "one wrapper instance per pointer slot");
+const PFN_XInputGetState kGameGs[kMaxGamePtrs] = {
+    &Game_XInputGetState<0>, &Game_XInputGetState<1>,
+    &Game_XInputGetState<2>, &Game_XInputGetState<3>,
+};
+const PFN_XInputGetCapabilities kGameGc[kMaxGamePtrs] = {
+    &Game_XInputGetCapabilities<0>, &Game_XInputGetCapabilities<1>,
+    &Game_XInputGetCapabilities<2>, &Game_XInputGetCapabilities<3>,
+};
+
+// One pointer: if the game has stored something there that is not our wrapper,
+// that becomes the wrapper's target and the wrapper goes in. Compare-exchange,
+// so a value the game writes in between is never overwritten -- it is simply
+// picked up on the next Present.
+template <typename PFN>
+void wrap_game_pointer(uintptr_t rva, std::atomic<PFN>& orig, PFN wrapper, const char* what)
+{
+    if (!rva) return;
+    auto* slot = reinterpret_cast<PVOID volatile*>(
+        reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr)) + rva);
+    void* cur = *slot;
+    if (!cur || cur == reinterpret_cast<void*>(wrapper)) return;
+    orig.store(reinterpret_cast<PFN>(cur), std::memory_order_release);
+    if (InterlockedCompareExchangePointer(slot, reinterpret_cast<void*>(wrapper), cur) != cur)
+        return;
+    g_gameWrapped.store(true);
+    // Says what the game had been calling -- the export, or the Steam overlay.
+    static std::atomic<int> s_logged{0};
+    if (s_logged.fetch_add(1) < 12) {
+        char c[MAX_PATH + 32];
+        format_caller(cur, c, sizeof(c));
+        VRLOG("input: the game's %s pointer (exe+0x%llX, was %s) now goes through "
+              "the mod first", what, (unsigned long long)rva, c);
+    }
+}
+
+void wrap_game_xinput()
+{
+    const GameAddresses& a = game_addresses();
+    for (int i = 0; i < kMaxGamePtrs; ++i) {
+        wrap_game_pointer(a.xinputGetState[i], g_gameGs[i], kGameGs[i], "XInputGetState");
+        wrap_game_pointer(a.xinputGetCaps[i], g_gameGc[i], kGameGc[i], "XInputGetCapabilities");
+    }
+}
+
 // Rescanned until something lands, because the game loads its XInput DLL
 // whenever it feels like it -- possibly long after our DllMain.
 void scan_xinput()
@@ -219,6 +446,7 @@ void scan_xinput()
         // Ordinal 100 is the undocumented XInputGetStateEx, identical
         // signature, used by anything that wants the Guide button.
         hook_one_xinput(m, nullptr, 100, name);
+        hook_one_xcaps(m, name);
     }
 }
 
@@ -487,45 +715,15 @@ SHORT WINAPI Detour_GetKeyState(int vk)
 bool hook_iat(HMODULE module, const char* dllName, const char* fnName,
               void* detour, void** orig)
 {
-    auto* base = reinterpret_cast<uint8_t*>(module);
-    auto* dos  = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
-    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
-
-    const IMAGE_DATA_DIRECTORY& dir =
-        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-    if (!dir.VirtualAddress || !dir.Size) return false;
-
-    auto* imp = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress);
-    for (; imp->Name; ++imp) {
-        const char* dll = reinterpret_cast<const char*>(base + imp->Name);
-        if (_stricmp(dll, dllName) != 0) continue;
-
-        // OriginalFirstThunk holds the NAMES, FirstThunk holds the live
-        // pointers. A bound import has no OFT, in which case the names are not
-        // recoverable and this import is left alone rather than guessed at.
-        if (!imp->OriginalFirstThunk) continue;
-        auto* names = reinterpret_cast<IMAGE_THUNK_DATA64*>(base + imp->OriginalFirstThunk);
-        auto* slots = reinterpret_cast<IMAGE_THUNK_DATA64*>(base + imp->FirstThunk);
-
-        for (int i = 0; names[i].u1.AddressOfData; ++i) {
-            if (IMAGE_SNAP_BY_ORDINAL64(names[i].u1.Ordinal)) continue;
-            auto* imn = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(
-                base + names[i].u1.AddressOfData);
-            if (strcmp(reinterpret_cast<const char*>(imn->Name), fnName) != 0) continue;
-
-            void** slot = reinterpret_cast<void**>(&slots[i].u1.Function);
-            DWORD old = 0;
-            if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old))
-                return false;
-            if (orig) *orig = *slot;
-            *slot = detour;
-            VirtualProtect(slot, sizeof(void*), old, &old);
-            return true;
-        }
-    }
-    return false;
+    void** slot = import_slot(module, dllName, fnName);
+    if (!slot) return false;
+    DWORD old = 0;
+    if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old))
+        return false;
+    if (orig) *orig = *slot;
+    *slot = detour;
+    VirtualProtect(slot, sizeof(void*), old, &old);
+    return true;
 }
 
 void install_keyboard_block()
@@ -770,6 +968,7 @@ DWORD xinput_poll_self(DWORD userIndex, XINPUT_STATE* state)
 void input_block_on_present()
 {
     install_keyboard_block();
+    wrap_game_xinput();
 
     // The game resolves XInput at runtime, so the DLL it uses may not have
     // been loaded yet at DllMain. Keep looking until at least one hook lands,

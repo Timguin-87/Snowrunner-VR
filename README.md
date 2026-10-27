@@ -30,11 +30,23 @@ Two files appear beside it:
 
 **Set the game to windowed mode. The first launch does little but read your headset and requires a restart.** The mod writes your headset's native per-eye resolution into the config and asks you to restart — the engine builds its window once, at startup, and never re-reads the size, I found no way to apply it live.
 
+**After a game update** the mod finds the game functions it hooks again by signature, so most updates need no new mod version. The log lists them in a `game addresses` block near the top. If one is missing, the features that need it switch off rather than patch the wrong code, and the log says which. Attach the log when you report it.
+
 ## Using it
 
 Open the menu with **Insert**, or **L3+R3** on a gamepad — both rebindable.
 **HOME** recenters, as does the button at the top of the menu: face the
 direction you want as "forward", then press it.
+
+### VR controllers
+
+The VR controllers work as an Xbox gamepad: triggers are LT/RT, grips are
+LB/RB, A/B/X/Y are A/B/X/Y, and the sticks and their clicks are the sticks and
+L3/R3. **The left menu button is Start on a tap and Back (Select) when held for
+half a second.** **Hold the left stick down (L3) to use the right stick as the
+D-pad** — the menu button then acts as Back straight away. A quick tap of L3
+still reaches the game as L3. A real gamepad keeps working alongside; the
+"VR controllers as gamepad" setting turns the mapping off.
 
 ### Mouse cursor
 
@@ -71,6 +83,7 @@ cmake --build build --config Release
 ```
 
 The DLL lands at `build\Release\dxgi.dll`. Copy it next to `SnowRunner.exe`.
+Visual Studio 2026 works the same way with `-G "Visual Studio 18 2026"`.
 
 If CMake is not on your PATH it is inside the Build Tools install, typically at
 `C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe`.
@@ -98,7 +111,9 @@ src/proxy/    the proxy dxgi.dll itself: forwards every export to the real
               undocumented ones through asm jump stubs
 src/hooks/    the engine hooks -- swapchain/Present, the camera and view
               builders, the constant buffer, draw calls, depth, input,
-              resolution, and the settings menu
+              resolution, and the settings menu -- plus the signature
+              scanner that finds the game's functions in each build
+              (game_addresses.cpp)
 src/render/   D3D11 work the mod does itself: the DIBR reprojection, the
               6-DoF reprojection, the UI/smudge/winch composition layers,
               the truck and mirror masks, frame dumps
