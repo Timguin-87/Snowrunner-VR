@@ -8,12 +8,15 @@
 #include "render/mirror_mask.hpp"
 #include "render/rigid_mask.hpp"
 #include "render/ui_layer.hpp"
+#include "render/dlss.hpp"
+#include "render/motion_field.hpp"
 #include "render/smudge_layer.hpp"
 #include "render/winch_layer.hpp"
 #include "hooks/menu_hook.h"
 #include "hooks/input_block.h"
 #include "hooks/resolution_hook.h"
 #include "xr/xr_mirror.h"
+#include "common/dibr_policy.h"
 #include "common/log.h"
 
 #include <dxgi1_2.h>
@@ -169,6 +172,8 @@ HRESULT STDMETHODCALLTYPE Detour_Present(IDXGISwapChain* sc, UINT sync, UINT fla
     hooks::install_menu_hook(sc);
     hooks::menu_hook_update();
     xr::mirror_on_present(sc);
+    dlss::on_present();
+    motionfield::on_present();
     hooks::menu_render_to_desktop(sc);
 
     // Mirror mask: sized/released here, and cleared AFTER DIBR shift has read it this
@@ -180,22 +185,25 @@ HRESULT STDMETHODCALLTYPE Detour_Present(IDXGISwapChain* sc, UINT sync, UINT fla
         uint32_t cw = 0, ch = 0;
         if (SUCCEEDED(sc->GetDevice(__uuidof(ID3D11Device), (void**)&dev)) && dev) {
             xr::render_canvas_wh(cw, ch);
-            mirrormask::update(dev.Get(), cw, ch, xr::dibr_shift_enabled());
+            const bool dibrShift = xr::dibr_shift_active();
+            mirrormask::update(dev.Get(), cw, ch, dibrShift || motionfield::wanted(),
+                               dibrpolicy::mirror_mask_marks(dibrShift, motionfield::measuring()));
             // Wanted by the 6-DoF stale-eye reprojection WHETHER OR NOT DIBR
             // shift is on: with it, the reprojection fills disocclusion holes;
             // without it, it builds the whole synthesized eye, which is where it
             // matters most. Same condition as depth_capture_wanted()'s second
             // term -- the mask is useless without the depth it is paired with.
-            rigidmask::update(dev.Get(), cw, ch,
-                              xr::warp_uses_6dof() && xr::warp_enabled());
+            rigidmask::update(dev.Get(), cw, ch, xr::warp_uses_6dof() && xr::warp_active(),
+                              dibrpolicy::rigid_mask_marks(dibrShift, xr::warp_uses_motion(),
+                                                           motionfield::covering()));
             // Not gated on DIBR shift: the UI layer feeds a composition layer
             // now, and that applies either way. xr::ui_plane_wanted() is the
             // whole condition -- see ui_layer.hpp.
             uilayer::update(dev.Get(), cw, ch, xr::ui_plane_wanted());
-            smudgelayer::update(dev.Get(), cw, ch, xr::dibr_shift_enabled());
+            smudgelayer::update(dev.Get(), cw, ch, xr::dibr_shift_active());
             // Same gate, same reason: the winch markers only need taking out
             // of the scene when something is about to depth-reproject it.
-            winchlayer::update(dev.Get(), cw, ch, xr::dibr_shift_enabled());
+            winchlayer::update(dev.Get(), cw, ch, xr::dibr_shift_active());
             dev->GetImmediateContext(&imm);
             if (imm) {
                 mirrormask::clear(imm.Get());
@@ -290,9 +298,9 @@ HRESULT STDMETHODCALLTYPE Detour_ResizeTarget(IDXGISwapChain* sc, const DXGI_MOD
 
 // (apply_pending_resize() lived here, draining a queued live resize at the top
 // of Present for the settings UI's "Apply resolution now" button. Removed
-// 2026-08-24 with the button -- see the note in resolution_hook.cpp for why
-// a live resize cannot work, and why succeeding DXGI calls are not evidence
-// that it does.)
+// 2026-08-24 with the button -- see the note in resolution_hook.cpp for why a
+// resize from out here cannot work, and why succeeding DXGI calls are not
+// evidence that it does. The live apply that does work is in that file too.)
 
 void hook_present_once(IDXGISwapChain* sc)
 {

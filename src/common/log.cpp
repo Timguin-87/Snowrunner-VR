@@ -45,10 +45,14 @@ void write(const char* fmt, ...)
     int end = off + ((n < static_cast<int>(sizeof(line)) - off - 2) ? n : static_cast<int>(sizeof(line)) - off - 2);
     line[end++] = '\n';
 
+    // NO FlushFileBuffers. It waited for the disk on every line, 1-6 ms measured,
+    // on whichever thread logged -- the game and Present threads included. What
+    // WriteFile has taken is in the system's cache and survives this process
+    // dying, so the crash handler's lines still reach the file; only a Windows
+    // crash or power loss can lose the last of them.
     AcquireSRWLockExclusive(&g_lock);
     DWORD written;
     WriteFile(g_file, line, static_cast<DWORD>(end), &written, nullptr);
-    FlushFileBuffers(g_file);
     ReleaseSRWLockExclusive(&g_lock);
 }
 

@@ -28,7 +28,9 @@
 // can actually reach, leaving everything else as the caller left it -- which is
 // the rotation-warped image. So the result is strictly better than, or equal
 // to, today's fill: where the reprojection has no source it degrades to exactly
-// the previous behaviour rather than to a hole.
+// the previous behaviour rather than to a hole. The one exception is a CRACK,
+// a lone unreached pixel between reached ones, which is filled from them -- see
+// CS_Resolve.
 namespace reproject {
 
 struct Params {
@@ -95,6 +97,48 @@ struct Params {
     // a typical near plane, which makes the translation term sub-pixel while
     // staying finite enough to unproject. Set to 0 to restore the old drop.
     float farDepth = 1.0e-4f;
+
+    // THE DEPTH'S GRID (and the rigid mask's, which always matches it), when it
+    // is smaller than the colour's: DLSS upscaled the colour after the game
+    // rendered it, so the depth is the same picture at the render resolution.
+    // Each colour pixel then takes the depth of the render pixel it came from.
+    // 0 = the same grid as the colour.
+    unsigned depthWidth = 0, depthHeight = 0;
+
+    // THE GAME'S OWN MOTION (render/motion_field.hpp), on the depth's grid.
+    // With both set, every pixel moves by the world motion its surface made
+    // since the retained frame -- measured from the game's velocity buffer --
+    // and the rigid mask and rigidSkip are not consulted: the truck, the cab and
+    // anything else that moves carries its own motion instead of a guess.
+    //   motionSrv     the next render's motion, on this frame's grid; w = the
+    //                 surface's depth here, so a surface that was hidden behind
+    //                 this pixel is told apart from the one it shows
+    //   motionOwnSrv  this frame's own motion since the frame before it, for a
+    //                 moving surface the next render did not see: carried on
+    ID3D11ShaderResourceView* motionSrv    = nullptr;
+    ID3D11ShaderResourceView* motionOwnSrv = nullptr;
+
+    // THE MIRRORS, on the depth's grid (render/mirror_mask.hpp), for the motion
+    // path. A mirror's depth is its GLASS, ~0.7 m away, but what it shows is
+    // the scene far behind you -- so moving its pixels by the glass's parallax
+    // drags the reflection with every millimetre the eye moves: a shimmer, and
+    // with the head rolled a VERTICAL misalignment between the eyes (Tim,
+    // 2026-10-29). Far content is warped by rotation alone. So the glass moves
+    // with its housing and is filled from the caller's rotation-only warp
+    // (rotH below); without it, marked pixels contribute nothing and keep that
+    // warp, as they always did.
+    ID3D11ShaderResourceView* mirrorMaskSrv = nullptr;
+
+    // THE CALLER'S ROTATION-ONLY WARP, as the homography it drew the base with:
+    // destination uv -> retained uv, row-major. Used to fill the mirror glass.
+    float rotH[9] = {};
+    bool  haveRotH = false;
+
+    // THE MOTION-VECTOR OVERLAY (render/motion_overlay.hpp), motion path only:
+    // every pixel tinted by the motion it took, relative to the head -- whose own
+    // travel over the frame is headMove, in the world.
+    bool  debugMotion = false;
+    float headMove[3] = {};
 };
 
 // Scatters `srcColor` (sampled through `srcColorSrv`) into `dstUav` using
@@ -116,5 +160,9 @@ void release();
 // GPU time of the last completed composite, in milliseconds; negative until one
 // has been measured. Same non-stalling query ring as dibr::gpu_ms().
 float gpu_ms();
+
+// The mean composite since the last call, for the periodic log line; negative
+// if none was measured.
+float take_gpu_ms();
 
 } // namespace reproject

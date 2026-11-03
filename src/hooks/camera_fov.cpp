@@ -301,6 +301,10 @@ void write_fov()
     }
 }
 
+// Read on the engine's culling workers for every small object they test, hence
+// an atomic rather than anything that locks. See camera_fov.h.
+std::atomic<float> g_smallObjectDistance{5.0f};
+
 } // namespace
 
 float camera_fov_factor()  { return g_factor.load(std::memory_order_relaxed); }
@@ -316,6 +320,15 @@ void set_camera_fov_factor(float f)
     if (f < 0.5f) f = 0.5f;
     if (f > 2.5f) f = 2.5f;
     g_factor.store(f, std::memory_order_relaxed);
+}
+
+float small_object_distance() { return g_smallObjectDistance.load(std::memory_order_relaxed); }
+
+void set_small_object_distance(float k)
+{
+    if (!(k >= 1.0f)) k = 1.0f;   // NaN lands here too
+    if (k > 8.0f) k = 8.0f;
+    g_smallObjectDistance.store(k, std::memory_order_relaxed);
 }
 
 void camera_fov_on_present()

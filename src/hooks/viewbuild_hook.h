@@ -60,6 +60,37 @@ void set_truck_level_lock_enabled(bool on);
 bool truck_yaw_lock_enabled();        // drops the stick's YAW
 void set_truck_yaw_lock_enabled(bool on);
 
+// THE FIRST-PERSON OFFSET: where the head sits in the cab, in metres along the
+// TRUCK's own axes -- right, toward the roof, toward the bonnet -- however the
+// truck is lying and whatever the look locks above are set to, so it moves the
+// seat rather than the view. Cockpit only. Clamped to +-0.5 m on each axis.
+void cockpit_offset(float& right, float& up, float& forward);
+void set_cockpit_offset(float right, float up, float forward);
+
+// THE HEAD SMOOTHING: a time constant in seconds (0 - 0.25, 0 = off) over which
+// the cockpit camera follows the truck's jolts across and up and its roll and
+// pitch, in the world -- never along the truck's length or its heading, and
+// never the head's own movement. Cockpit only. See smooth_cab() in
+// viewbuild_hook.cpp.
+float head_smoothing();
+void  set_head_smoothing(float seconds);
+
+// SYNCHED SEQUENTIAL'S CAMERA HOLD (see detour_fna): the second render of a
+// moment is built from the camera input its first render had. Counted since
+// the last call: second renders, how many arrived with a DIFFERENT camera input
+// and were held to the first's (with the largest difference in view direction,
+// eye position and the truck frame the cockpit locks level against), and how
+// many found no first render to hold to.
+struct SsHoldStats {
+    uint32_t seconds   = 0;
+    uint32_t moved     = 0;
+    uint32_t unmatched = 0;
+    float    maxDeg      = 0.0f;
+    float    maxCm       = 0.0f;
+    float    maxTruckDeg = 0.0f;
+};
+void take_ss_hold_stats(SsHoldStats& out);
+
 // The MAP screen, identified from the GAME's own camera pose -- sampled at the
 // builder BEFORE any head transform, so it is not contaminated by our injected
 // rotation the way anything read back from the camera constant buffer would be.

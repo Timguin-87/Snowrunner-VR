@@ -6,6 +6,8 @@
 #include "render/ui_layer.hpp"
 #include "render/smudge_layer.hpp"
 #include "render/winch_layer.hpp"
+#include "render/dlss.hpp"
+#include "render/motion_field.hpp"
 #include "hooks/depth_probe.h"
 #include "hooks/camera_hook.h"
 #include "xr/xr_mirror.h"
@@ -162,6 +164,10 @@ SRWLOCK g_ctxSumLock = SRWLOCK_INIT;
 void note_deferred_draw(ID3D11DeviceContext* ctx)
 {
     if (ctx->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE) return;
+    // ONLY UI DRAWS ARE RECORDED, so everything else leaves here, before the COM
+    // calls and the lock below. This runs on every draw of every recording
+    // thread, and that lock had them all queueing behind each other.
+    if (hooks::current_draw_role() != hooks::kCullUi) return;
 
     // Only the render target's SIZE is needed: the canvas test below is what
     // distinguishes the late composite onto the main canvas from the offscreen
@@ -204,7 +210,7 @@ void note_deferred_draw(ID3D11DeviceContext* ctx)
         // synthesized eye that was nearly black, which is the same pre-grading
         // darkness this file has hit before. The composite onto the canvas is
         // the late pass, and the one worth knowing about.
-        if (w && hooks::current_draw_role() == hooks::kCullUi) {
+        if (w) {
             uint32_t cw = 0, ch = 0;
             if (xr::render_canvas_wh(cw, ch) && w == cw && h == ch) s.sawUi = true;
         }
@@ -308,26 +314,25 @@ bool ui_copy_excluded(uint64_t hash)
 // no OpenXR session, a swapchain that would not create, HUD hidden -- in every
 // one of those uilayer::active() is false and the UI draws into the frame
 // exactly as it did before any of this existed.
-// ONE EYE'S UI ends up on the plane -- but WHICH FRAME'S is not decided here.
+// WHICH FRAMES' UI ends up on the plane is not decided here.
 //
 // Not every UI element is screen-space. Anything positioned by projecting a
 // WORLD point -- the map's mapspace markers, waypoint and objective pips, any
 // prompt pinned to something nearby -- has its screen position computed
 // through the camera of the frame it is drawn in, and under AER that camera
-// alternates eyes every frame. In the eye images that was exactly right: each
-// eye received the marker projected for itself, which is real disparity and
-// fuses. On ONE shared plane it is not: consecutive frames hand the same
-// surface two different positions, and it reads as a doubled or jittering
-// marker. Worst on the map, where the eye offset is sign-flipped and the
-// camera is close in.
+// alternates eyes every frame. On ONE shared plane that hands the same surface
+// two different positions on consecutive frames, and it reads as a doubled or
+// jittering marker. The world markers are placed from between the eyes instead
+// (marker_camera.h), so wherever that runs every frame's UI is the same and
+// all of it goes to the plane; anywhere else only one eye's frames do.
 //
-// The frame's eye is therefore picked at PRESENT, in build_ui_quad_layer, and
-// not from here. Two reasons, both about this being the wrong place to ask:
-// the UI is recorded on worker threads, so a parity read here races the flip
-// the camera build performs mid-frame; and roughly 1% of Presents carry no
-// camera build at all (the log's "AER: n/N Presents had no camera build"),
-// which shifts the alternation's phase under any draw-time answer. By Present
-// the frame is finished and present_route_eye() is simply what it rendered as.
+// That is picked at PRESENT, in build_ui_quad_layer, and not from here. Two
+// reasons, both about this being the wrong place to ask: the UI is recorded on
+// worker threads, so a parity read here races the flip the camera build
+// performs mid-frame; and roughly 1% of Presents carry no camera build at all
+// (the log's "AER: n/N Presents had no camera build"), which shifts the
+// alternation's phase under any draw-time answer. By Present the frame is
+// finished and present_route_eye() is simply what it rendered as.
 //
 // So this captures unconditionally and Present throws away the frames it does
 // not want. Re-issuing the draw is what the old copy_if_ui did every frame
@@ -342,30 +347,8 @@ bool redirect_if_ui(ID3D11DeviceContext* ctx, DrawFn&& draw)
     if (xr::ui_stays_in_frame()) return false;
     if (ui_copy_excluded(hooks::current_draw_hash())) return false;
 
-    if (hooks::world_marker_fix_enabled()) {
-        ID3D11Buffer* uiCb = nullptr;
-        ctx->PSGetConstantBuffers(hooks::kMarkerCbSlot, 1, &uiCb);
-        const bool dynamic = uiCb && hooks::marker_cb_position_is_dynamic((void*)uiCb);
-        if (uiCb) uiCb->Release();   // PSGetConstantBuffers AddRefs -- must release
-        if (dynamic) {
-            // World-projected marker: under DIBR shift it would otherwise get
-            // depth-reprojected using whatever's BEHIND it (wrong disparity) --
-            // the exact problem winch markers have, same fix -- capture it
-            // into the winch layer and composite back with zero disparity.
-            // Without DIBR shift, winchlayer::active() is false, so this is a
-            // no-op and falls through to the plain scene draw below, which is
-            // already correct in that mode (see the notes above
-            // redirect_if_winch_marker).
-            winchlayer::Saved saved;
-            if (winchlayer::active() && winchlayer::begin_capture(ctx, saved)) {
-                draw();
-                winchlayer::end_capture(ctx, saved);
-                return true;
-            }
-            return false;   // DIBR off (or capture unavailable) -- fall through into the scene
-        }
-    }
-
+    // Every UI draw belongs on the plane: the world markers in it were placed
+    // for the plane in the first place (marker_camera.h).
     uilayer::Saved saved;
     if (!uilayer::begin_capture(ctx, saved)) return false;
     draw();
@@ -482,6 +465,16 @@ void STDMETHODCALLTYPE Detour_Draw(ID3D11DeviceContext* ctx, UINT vc, UINT sv)
     PFN_Draw pfn = (is_imm(ctx) && real_Draw_imm) ? real_Draw_imm
                  : (real_Draw_def ? real_Draw_def : real_Draw_imm);
     if (!pfn) return;
+    // The game's TAA resolve -- a full-screen triangle on the immediate
+    // context, with its velocity buffer and depth bound. The scene depth is
+    // finished by now, so this is where it is read (depth_probe.h); the
+    // motion-vector warp reads the bound pair (render/motion_field.hpp); then
+    // DLSS may produce the resolve's output instead (render/dlss.cpp).
+    if (hooks::current_draw_is_taa_resolve() && is_imm(ctx)) {
+        hooks::depth_capture_at_resolve(ctx);
+        motionfield::on_taa_resolve(ctx);
+        if (dlss::replace_taa_resolve(ctx, vc)) return;
+    }
     auto call = [&] { pfn(ctx, vc, sv); };
     capture_glass_depth(ctx, call);
     if (redirect_if_smudge(ctx, call)) return;
@@ -699,7 +692,7 @@ void STDMETHODCALLTYPE Detour_ExecuteCommandList(
     // the correct source rather than the fallback.
     const bool uiCl = is_ui_cl((void*)cl);
     const bool anyUiKnown = g_uiCl[0].load() != nullptr;
-    if (xr::dibr_shift_enabled() && !uilayer::active() &&
+    if (xr::dibr_shift_active() && !uilayer::active() &&
         (uiCl || (!anyUiKnown && isPredictedHud))) {
         capture_pre_hud(ctx);
         g_capturedThisFrame.store(true);

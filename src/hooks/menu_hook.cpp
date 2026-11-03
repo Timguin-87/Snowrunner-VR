@@ -6,6 +6,7 @@
 #include "hooks/shader_cull.h"
 #include "hooks/depth_probe.h"
 #include "hooks/cbuffer_hook.h"
+#include "hooks/marker_camera.h"
 #include "hooks/resolution_hook.h"
 #include "hooks/input_block.h"
 #include "common/log.h"
@@ -14,6 +15,9 @@
 #include "render/frame_dump.hpp"
 #include "render/ui_layer.hpp"
 #include "render/smudge_layer.hpp"
+#include "render/dlss.hpp"
+#include "render/motion_field.hpp"
+#include "render/motion_overlay.hpp"
 #include "xr/xr_mirror.h"
 #include "xr/xr_input.h"
 
@@ -23,6 +27,7 @@
 #include <xinput.h>
 
 #include <imgui.h>
+#include <imgui_internal.h>   // the window list, for the headset crop (publish_drawn_rect)
 #include <imgui_impl_win32.h>
 #include <imgui_impl_dx11.h>
 
@@ -79,11 +84,13 @@ std::atomic<bool> g_menuOpen{false};
 // FIRST-RUN RESOLUTION, and the one thing in this file that acts on its own.
 //
 // The render resolution is consumed at CreateWindowExW, long before any OpenXR
-// runtime exists -- so the config cannot be born with the right value, and
-// nothing can apply a new one to the running game (see the note where
-// apply_resolution_now() used to live in resolution_hook.cpp). The best that
-// can be done is to fill it in the moment a runtime IS reachable, write it, and
-// say plainly that the game has to be restarted for it to take.
+// runtime exists -- so the config cannot be born with the right value. The best
+// that can be done is to fill it in the moment a runtime IS reachable, write it,
+// and say so. OK then applies it to the running game, the same way the slider
+// does: a launch with no size chosen ('auto') still installs the window hooks a
+// live apply needs (hooks::install_resolution_hooks). Where this session cannot
+// resize the game at all (hooks::live_resize_available() -- fullscreen, or
+// signatures that did not match), the notice asks for a restart instead.
 //
 // Runs from the Present tick rather than from a draw, because the menu is
 // almost certainly closed when this fires and ImGui only builds draw data while
@@ -93,6 +100,7 @@ std::atomic<bool> g_menuOpen{false};
 std::atomic<bool> g_firstRunNotice{false};   // popup owed
 bool              g_firstRunPopupShown = false;
 uint32_t          g_firstRunW = 0, g_firstRunH = 0;
+uint32_t          g_firstRunNativeW = 0, g_firstRunNativeH = 0;
 
 void check_first_run_resolution()
 {
@@ -110,11 +118,14 @@ void check_first_run_resolution()
     hooks::set_force_resolution((int)e, (int)e);
     vrcfg::save();              // clears resolution_unset() on the way through
     g_firstRunW = e; g_firstRunH = e;
+    g_firstRunNativeW = nativeW; g_firstRunNativeH = nativeH;
     g_firstRunNotice.store(true);
     g_menuOpen.store(true);     // nothing draws while it is closed
     VRLOG("resolution: first run -- wrote %ux%u to the config from the headset's "
-          "native %ux%u per eye; a restart is needed for the game to be created "
-          "at that size", e, e, nativeW, nativeH);
+          "native %ux%u per eye; %s", e, e, nativeW, nativeH,
+          hooks::live_resize_available()
+              ? "OK on the notice applies it to the running game"
+              : "this session cannot resize the game, so it takes a restart");
 }
 
 // --- input blocking while the menu is open --------------------------------
@@ -153,11 +164,13 @@ std::atomic<uint32_t> g_menuToggleCombo{XINPUT_GAMEPAD_LEFT_THUMB | XINPUT_GAMEP
 // because two of them were missing:
 //   - ImGui's own metrics: the font, and every padding, spacing and rounding
 //     (ScaleAllSizes), applied from a pristine copy of the style;
-//   - the widths this file spells out in pixels itself, through ui_px();
-//   - the size of the panel IN THE HEADSET (menu_quad_width_m). The quad used
-//     to be a fixed 0.42 m wide whatever the panel's pixel size, so a bigger
-//     UI just packed more pixels into the same 0.42 m: the text grew against
-//     widgets that did not, and nothing got any bigger to look at.
+//   - the widths this file spells out in pixels itself, through ui_px(), and
+//     the window's own size (g_pendingWindowRescale);
+//   - the size of the panel IN THE HEADSET, which follows from those: a panel
+//     pixel is a fixed size there (kMenuMetresPerPx). The quad used to be a
+//     fixed 0.42 m wide whatever the panel's pixel size, so a bigger UI just
+//     packed more pixels into the same 0.42 m: the text grew against widgets
+//     that did not, and nothing got any bigger to look at.
 
 std::atomic<float> g_modUiScale{1.0f};
 // Un-rescaled style, captured once right after StyleColorsDark() in
@@ -166,21 +179,36 @@ std::atomic<float> g_modUiScale{1.0f};
 // already-scaled style every frame would compound multiplicatively).
 ImGuiStyle g_baseStyle;
 float g_lastAppliedUiScale = -1.0f;   // force-apply on the first present
-// The scale the panel was last BUILT at -- which is what the headset quad has
-// to match, rather than a slider value that may be a frame ahead of it.
-std::atomic<float> g_builtUiScale{1.0f};
 
-// The panel's quad in the headset: this wide at 100%, a metre away (see
-// build_menu_quad_layer in xr_mirror.cpp). 0.6 m was oversized -- it filled
-// most of the vertical FOV and its top ran outside the rendered image once the
-// composited FOV was shrunk (map view) -- so 0.42 m is the 100% baseline.
-constexpr float kMenuQuadWidthM = 0.42f;
+// The panel's quad in the headset: the default-width panel is this wide at
+// 100%, a metre away (see build_menu_quad_layer in xr_mirror.cpp). 0.6 m was
+// oversized -- it filled most of the vertical FOV and its top ran outside the
+// rendered image once the composited FOV was shrunk (map view) -- so 0.42 m is
+// the 100% baseline.
+//
+// ONE FIXED SCALE, metres per panel pixel, rather than a fixed width. The
+// window used to size itself to its content and the quad stayed 0.42 m wide
+// whatever that came to, so every tab with a wider line, and every popup the
+// crop had to take in, packed more pixels into the same width and shrank the
+// whole panel in the headset. Now a pixel is always the same size there: a
+// wider window is a wider quad, and the UI size slider (which scales the
+// pixels) is what makes everything bigger.
+constexpr float kMenuQuadWidthM    = 0.42f;
+constexpr float kMenuDefaultWidth  = 560.0f;   // px at 100% -- the 0.42 m panel
+constexpr float kMenuDefaultHeight = 620.0f;
+constexpr float kMenuMetresPerPx   = kMenuQuadWidthM / kMenuDefaultWidth;
 
-// The tallest the quad may be and still be seen whole, published by the XR
-// side from the field of view it submits; 0 = not known (no headset). The
-// quad is head-locked, so a panel taller than this cannot be looked at, only
-// scrolled -- which is what the window is made to do instead.
+// The tallest and widest the quad may be and still be seen whole, published by
+// the XR side from the field of view; 0 = not known (no headset). The quad is
+// head-locked, so a panel bigger than this cannot be looked at -- the window
+// cannot be dragged past it, and scrolls instead.
 std::atomic<float> g_menuQuadMaxHeightM{0.0f};
+std::atomic<float> g_menuQuadMaxWidthM{0.0f};
+
+// A UI size change, as new/old, to apply to the window on its next Begin: the
+// window keeps its own size now, and without this a bigger UI would only cram
+// the same window.
+float g_pendingWindowRescale = 0.0f;
 
 // A size this file writes in pixels, at the current UI size. Everything ImGui
 // measures itself is already scaled; these are the rest.
@@ -224,8 +252,11 @@ void apply_ui_scale_if_changed()
     // rasterised at the size it is drawn, so this stays sharp at any scale --
     // and the old field asserts once the new one is in use.
     style.FontScaleMain = s;
+    // The window grows with it, so the layout stays as it was and the panel is
+    // simply bigger. Not on the first apply: the size ImGui restored was saved
+    // at this scale.
+    if (g_lastAppliedUiScale > 0.0f) g_pendingWindowRescale = s / g_lastAppliedUiScale;
     g_lastAppliedUiScale = s;
-    g_builtUiScale.store(s);
 }
 
 // --- rebind capture state (touched only from the Present-hook thread,
@@ -374,16 +405,18 @@ void feed_gamepad_nav(const XINPUT_GAMEPAD& gp, bool connected)
 // only way of filling it was to declare a window the content was never drawn
 // for.
 //
-// This is the one setting here that cannot take effect live. The pixel size is
-// consumed at CreateWindowExW, during startup, before an OpenXR instance
-// exists -- so the slider cannot compute it in time for the run you are
-// sitting in. What it does instead is write the resolved pixel size into the
-// config (ForceGameResolution), where the next launch reads it early enough.
-// The percentage is therefore not stored at all: it is derived back from
-// pixels / native width each time the menu opens, so the slider always shows
-// what is really configured rather than a number that could drift out of
-// agreement with it (e.g. after switching headsets, where the same pixel size
-// is a different percentage).
+// Nothing happens while it moves: letting go is the choice. Then it writes the
+// resolved pixel size into the config (ForceGameResolution), where the next launch
+// reads it, and asks for it to be applied to the running game. An apply rebuilds
+// the game's render targets and the headset images, which is far too much to do
+// for every step of a drag.
+//
+// A launch reads the pixel size before an OpenXR instance exists, which is why
+// that is what the config holds. The percentage is not stored at all: it is
+// derived back from pixels / native width each time the menu opens, so the slider
+// always shows what is really configured rather than a number that could drift
+// out of agreement with it (e.g. after switching headsets, where the same pixel
+// size is a different percentage).
 void draw_resolution_scale()
 {
     uint32_t nativeW = 0, nativeH = 0;
@@ -410,11 +443,13 @@ void draw_resolution_scale()
     int pct = (s_pct < 0) ? 100 : s_pct;
 
     ImGui::BeginDisabled(!haveNative);
-    if (ImGui::SliderInt("Render resolution", &pct, 50, 150, "%d%%")) {
+    if (ImGui::SliderInt("Render resolution", &pct, 50, 150, "%d%%"))
         s_pct = pct;
+    if (ImGui::IsItemDeactivatedAfterEdit()) {
         const uint32_t e = edge_for(pct);
         hooks::set_force_resolution((int)e, (int)e);
         vrcfg::save();
+        hooks::request_resolution_apply();
     }
     ImGui::EndDisabled();
 
@@ -427,46 +462,64 @@ void draw_resolution_scale()
         } else {
             const uint32_t e = edge_for(pct);
             // The "currently rendering" line is the only way to see at a
-            // glance whether a restart is still owed for the chosen value.
+            // glance whether the chosen value has reached the game yet.
             //
             // Compared against what the CONFIG actually asks for, not against
             // the square size this slider would write. ForceGameResolution is a
             // free WxH -- hand-editing it to a non-square (e.g. the headset's
             // own aspect, which the frustum declaration handles correctly) is a
             // supported thing to do, and testing against `e` would have told
-            // anyone who did that they still owed a restart forever.
+            // anyone who did that they were still waiting for it forever.
             const int cfgW = hooks::force_resolution_w();
             const int cfgH = hooks::force_resolution_h();
+            // Under a DLSS upscaling mode the window -- what the game renders --
+            // is that mode's share of this size, and DLSS makes up the rest.
+            int winW = (int)e, winH = (int)e, expW = cfgW, expH = cfgH;
+            dlss::render_size_for(dlss::mode(), (int)e, (int)e, winW, winH);
+            if (cfgW > 0 && cfgH > 0)
+                dlss::render_size_for(dlss::mode(), cfgW, cfgH, expW, expH);
             uint32_t curW = 0, curH = 0;
             char now[80];
+            const bool live = hooks::live_resize_available();
             if (xr::render_canvas_wh(curW, curH)) {
-                const bool matches = (cfgW > 0 && cfgH > 0)
-                    ? ((int)curW == cfgW && (int)curH == cfgH)
-                    : (curW == e && curH == e);
+                // Mid-drag the config still holds the old value, by design.
+                const bool dragged = ImGui::IsItemActive() && (int)e != cfgW;
+                const bool matches = !dragged && ((cfgW > 0 && cfgH > 0)
+                    ? ((int)curW == expW && (int)curH == expH)
+                    : ((int)curW == winW && (int)curH == winH));
                 snprintf(now, sizeof(now), "%ux%u%s", curW, curH,
-                         matches ? "  (matches)" : "  (restart pending)");
+                         matches ? "  (matches)" : live ? "  (applies on release)"
+                                                        : "  (restart pending)");
             } else {
                 snprintf(now, sizeof(now), "(unknown)");
             }
 
+            char dlssNote[96] = "";
+            if (dlss::is_upscaling(dlss::mode()))
+                _snprintf_s(dlssNote, sizeof(dlssNote), _TRUNCATE,
+                            " (DLSS %s brings it up to %ux%u)", dlss::mode_name(dlss::mode()),
+                            e, e);
             ImGui::SetTooltip("Headset native: %ux%u per eye (width is what scales).\n"
-                              "Game window becomes: %ux%u\n"
+                              "Game window becomes: %dx%d%s\n"
                               "Currently rendering: %s\n"
                               "\n"
-                              "A RESTART IS REQUIRED. The game builds its window\n"
-                              "once, at launch, and sizes its swapchain from it --\n"
-                              "it never re-reads that size, so there is no way to\n"
-                              "apply a new resolution to the running game. Moving\n"
-                              "this slider saves to Snowrunner_VR_config.txt and\n"
-                              "takes effect the next time you launch.\n"
+                              "%s"
                               "\n"
                               "Square by design. The image always spans the full\n"
                               "width of the display; vertically it letterboxes if\n"
                               "your headset's per-eye view is taller than wide.",
-                              nativeW, nativeH, e, e, now);
+                              nativeW, nativeH, winW, winH, dlssNote, now,
+                              live ? "Applied when you let go of the slider\n"
+                                   : "A RESTART IS REQUIRED. This session cannot resize\n"
+                                     "the game (the log says why: it needs windowed\n"
+                                     "mode). Letting go of this slider saves to\n"
+                                     "Snowrunner_VR_config.txt, and it takes effect the\n"
+                                     "next time you launch.\n");
         }
     }
 
+    if (hooks::resolution_apply_waiting())
+        ImGui::TextDisabled("Applying -- waiting for the game to finish loading.");
 }
 
 void draw_settings_tab()
@@ -481,23 +534,59 @@ void draw_settings_tab()
     // while this origin is our own snapshot taken inside it.
     // Pitch and roll are deliberately untouched (see update_head_pose): they
     // should always read as the headset's true absolute tilt.
-    ImGui::TextDisabled("%.0f FPS", g_fps.load());
+    // Under Synched Sequential a stereo pair takes two of the game's frames, so
+    // the world moves on at half this rate. Said beside it, since the frame
+    // rate alone reads as twice the pair rate the headset gets.
+    const float fps = g_fps.load();
+    if (xr::synched_sequential_active())
+        ImGui::TextDisabled("%.0f FPS = %.0f stereo pairs/s", fps, fps * 0.5f);
+    else
+        ImGui::TextDisabled("%.0f FPS", fps);
 
     if (ImGui::Button("Recenter view", ImVec2(-1.0f, 0.0f)))
         xr::request_recenter();
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Face the direction you want as forward, then click.\n"
-                          "Sets the game's forward yaw to where you are looking,\n"
-                          "re-centres your position, and re-pins the UI plane if\n"
-                          "it is set to Forward. Pitch and roll always follow the\n"
-                          "headset, so the horizon stays put. Same as the HOME key.\n\n"
-                          "Nothing else moves the yaw: a camera change or truck\n"
-                          "swap re-centres your position only.");
+        ImGui::SetTooltip("Sets the game's forward yaw to where you are looking.\n"
+                          "Same as the HOME key.");
     ImGui::Separator();
 
-    // THE TWO RENDER OPTIONS, and there is no longer a third thing choosing
-    // between them. The path is always AER -- one eye rendered per Present --
-    // and these decide what the OTHER eye is made of:
+    // THE RENDER METHOD FIRST: it decides what else there is to set. Synched
+    // Sequential renders both eyes for real, so the two options that supply
+    // AER's missing eye have nothing to do there and are hidden -- their
+    // settings are kept, for switching back.
+    const bool ssAvailable = xr::synched_sequential_available();
+    const bool aer = xr::render_method() == xr::kRenderAER || !ssAvailable;
+    {
+        static const char* kMethods[2] = { "Synched Sequential", "Alternate Eye Rendering" };
+        const int current = aer ? 1 : 0;
+        ImGui::SetNextItemWidth(ui_px(230.0f));
+        if (ImGui::BeginCombo("Render method", kMethods[current])) {
+            for (int i = 0; i < 2; ++i) {
+                const ImGuiSelectableFlags flags =
+                    (i == 0 && !ssAvailable) ? ImGuiSelectableFlags_Disabled : 0;
+                if (ImGui::Selectable(kMethods[i], i == current, flags) && i != current) {
+                    xr::set_render_method(i == 0 ? xr::kRenderSynchedSequential
+                                                 : xr::kRenderAER);
+                    vrcfg::save();
+                }
+                if (i == current) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "SYNCHED SEQ: Both eyes are rendered from the same moment.%s\n"
+                "\n"
+                "ALTERNATE EYE RENDERING: every frame is a new moment, for one\n"
+                "eye. The other eye is supplied by the stale eye warp and DIBR\n"
+                "shift below.",
+                ssAvailable ? ""
+                            : "\n\nNOT AVAILABLE in this game build: the frame callbacks\n"
+                              "were not found (see the game addresses in the log).");
+    }
+
+    // AER's TWO OPTIONS. One eye is rendered per Present, and these decide what
+    // the OTHER eye is made of:
     //
     //   the warp    brings that eye's own last real render to now
     //   the shift   reprojects the eye that WAS rendered into it, by depth
@@ -505,7 +594,7 @@ void draw_settings_tab()
     // They compose. The shift lands where it has depth and a source; the warp
     // fills every pixel it could not reach. So each is a checkbox with its own
     // detail control beside it, rather than a mode that excludes the other.
-    {
+    if (aer) {
         bool warpOn = xr::warp_enabled();
         if (ImGui::Checkbox("Stale eye warp", &warpOn)) {
             xr::set_warp_enabled(warpOn);
@@ -513,15 +602,7 @@ void draw_settings_tab()
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Bring the eye that was not rendered this frame to the\n"
-                              "current instant, instead of resubmitting it unchanged.\n"
-                              "\n"
-                              "On by default. Turning it off is how you tell 'the warp\n"
-                              "is wrong' from 'what it is warping is wrong' -- if a\n"
-                              "judder survives with this off, the warp is not it.\n"
-                              "\n"
-                              "SAVED, so a measurement left switched off stays off on\n"
-                              "the next launch. That is deliberate: a switch that puts\n"
-                              "itself back is harder to notice than one left wrong.");
+                              "current instant.");
 
         if (warpOn) {
             ImGui::SameLine();
@@ -529,7 +610,8 @@ void draw_settings_tab()
             const char* warpLabels[xr::kWarpTypeCount] = {
                 "Headset rotation only",
                 "Headset + game rotation",
-                "Headset + game 6dof" };
+                "Headset + game 6dof",
+                "Motion vectors" };
             ImGui::SetNextItemWidth(ui_px(230.0f));
             if (ImGui::Combo("Warp type", &wtype, warpLabels, xr::kWarpTypeCount)) {
                 xr::set_warp_type(wtype);
@@ -537,29 +619,10 @@ void draw_settings_tab()
             }
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip(
-                    "A ladder, not three separate things -- each level contains\n"
-                    "the one before it.\n"
-                    "\n"
-                    "HEADSET ROTATION ONLY is the headset pose at capture against\n"
-                    "now. It is blind to the game camera, so stick look and vehicle\n"
-                    "turns move the rendered eye and leave the stale one behind.\n"
-                    "\n"
-                    "HEADSET + GAME ROTATION builds it from the game's own view\n"
-                    "matrix instead, which already has your head composed into it --\n"
-                    "so it covers both, with no decomposition to get wrong. COCKPIT\n"
-                    "ONLY: the orbit camera swings around the truck rather than\n"
-                    "turning in place, which a rotation warp cannot represent, so\n"
-                    "orbit always falls back to the headset pose.\n"
-                    "\n"
-                    "HEADSET + GAME 6DOF adds a reprojection by the camera's\n"
-                    "TRANSLATION, using the retained frame's own depth -- rotation\n"
-                    "is a homography and needs none, but a translation moves near\n"
-                    "pixels further than far ones. In a driving game that is most of\n"
-                    "what is left. It supersedes the rotation warp wherever it lands,\n"
-                    "so the level above is what fills the pixels it cannot reach.\n"
-                    "\n"
-                    "Costs a second reprojection pass and the depth capture that\n"
-                    "feeds it.");
+                    "From least smooth to smoothest.");
+            if (xr::warp_uses_motion() && motionfield::wanted() && !motionfield::measuring())
+                ImGui::TextDisabled("Motion vectors: waiting for the game's TAA -- set "
+                                    "its anti-aliasing to TAA");
         }
 
         bool shift = xr::dibr_shift_enabled();
@@ -568,14 +631,17 @@ void draw_settings_tab()
             vrcfg::save();
         }
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Reproject the eye that WAS rendered into the other one\n"
-                              "using scene depth, so both eyes carry this frame's\n"
-                              "content rather than one carrying the last frame's.\n"
+            ImGui::SetTooltip("Reproject the eye that WAS rendered into the other one.\n"
+                              "Off by default: has visual artefacts.\n"
                               "\n"
-                              "Off by default: it is the only thing that pays for the\n"
-                              "scene-depth capture, and where it cannot see a surface\n"
-                              "it leaves a disocclusion hole -- which the stale eye\n"
-                              "warp above then fills.");
+                              "Not available while DLSS upscales (DLSS tab).");
+        {
+            uint32_t uw = 0, uh = 0;
+            if (shift && xr::upscale_canvas(uw, uh)) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("(off while DLSS upscales)");
+            }
+        }
 
         if (shift) {
             ImGui::SameLine();
@@ -601,25 +667,7 @@ void draw_settings_tab()
                 dibr::set_fill_mode(kFillOrder[item]);
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip(
-                    "Not saved to the config -- it is a diagnostic, and two of the\n"
-                    "four are unusable to actually play with.\n"
-                    "\n"
-                    "MAGENTA shows exactly which pixels the reprojection could not\n"
-                    "reach. Speckle over near geometry means the disparity step\n"
-                    "between neighbouring pixels is being read as a silhouette;\n"
-                    "large clean bands beside objects are real disocclusions. It is\n"
-                    "what separates the two things ghosting can be: holes in the\n"
-                    "wrong PLACE, or holes filled with the wrong CONTENT. If the\n"
-                    "ghosting persists with magenta on, look at the warp; if magenta\n"
-                    "looks clean and only the filled image ghosts, it is the fill.\n"
-                    "\n"
-                    "STALE EYE is the default, and the only source that actually SAW\n"
-                    "the disoccluded surface. It is one frame old and brought to now\n"
-                    "by whatever Warp type is selected above.\n"
-                    "\n"
-                    "STRETCH never leaves the current frame so it cannot drift, but\n"
-                    "it invents the surface it fills with. It is also what stale eye\n"
-                    "falls back to when no retained eye is available.");
+                    "Not saved to the config -- it is a diagnostic.");
         }
 
     }
@@ -669,32 +717,7 @@ void draw_settings_tab()
     // behind them -- see smudge_layer.hpp.
     ImGui::Separator();
 
-    bool horizonLock = hooks::horizon_lock_enabled();
-    if (ImGui::Checkbox("Orbit camera horizon lock", &horizonLock)) {
-        hooks::set_horizon_lock_enabled(horizonLock);
-        vrcfg::save();
-    }
-
-    // Cockpit counterparts to the orbit horizon lock above, levelled against
-    // the TRUCK rather than the world -- the truck's tilt on hills is kept,
-    // only the stick's own look input is dropped on the locked axis.
-    bool truckLevelLock = hooks::truck_level_lock_enabled();
-    if (ImGui::Checkbox("Cockpit lock truck level", &truckLevelLock)) {
-        hooks::set_truck_level_lock_enabled(truckLevelLock);
-        vrcfg::save();
-    }
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Stick look-PITCH stops moving the view; head pitch\n"
-                          "becomes the only source. Truck tilt on hills is kept.");
-
-    bool truckYawLock = hooks::truck_yaw_lock_enabled();
-    if (ImGui::Checkbox("Cockpit lock truck yaw", &truckYawLock)) {
-        hooks::set_truck_yaw_lock_enabled(truckYawLock);
-        vrcfg::save();
-    }
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Stick look-YAW stops moving the view; head yaw\n"
-                          "becomes the only source.");
+    // (The look locks moved to the Camera tab.)
 
     // The VR controllers presented to the game as Xbox pad 0 (xr/xr_input.h).
     bool vrPad = xrinput::enabled();
@@ -709,44 +732,6 @@ void draw_settings_tab()
                           "Hold the left stick down (L3): the right stick becomes\n"
                           "the D-pad and the menu button becomes Back.\n"
                           "Works alongside a real gamepad.");
-
-    ImGui::Separator();
-
-    // THE CULLING FOV, declared on combine::CAMERA itself (hooks/camera_fov.h).
-    //
-    // ALWAYS ON, and there is no switch any more. It replaced writing the game's
-    // own FOV fields, which no longer happens at all: that value needed ~200 deg
-    // before geometry stopped vanishing at the periphery and was already culling
-    // small objects dead ahead by ~150, so no setting satisfied both ends.
-    // m_fFOV is the field the engine genuinely builds its cull frustum from, and
-    // at 1.00x the periphery is clear and what forward culling remains has moved
-    // further out. Off would mean the game's own value, which is far too narrow
-    // for a headset -- not a state worth being able to reach.
-    //
-    // The search that finds the camera looks after itself: it waits for
-    // gameplay, takes one attempt per visit, and re-arms on its own if the
-    // object is ever replaced. Its progress reads out on the Advanced tab.
-    {
-        float ff = hooks::camera_fov_factor();
-        ImGui::SetNextItemWidth(ui_px(230.0f));
-        if (ImGui::SliderFloat("Culling FOV", &ff, 0.5f, 2.5f, "%.2fx")) {
-            hooks::set_camera_fov_factor(ff);
-            vrcfg::save();
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip(
-                "Multiplier on the RENDERED FOV, written into\n"
-                "combine::CAMERA::m_fFOV (+0x108, radians) -- the field the\n"
-                "engine derives its cull frustum from. The game's own FOV\n"
-                "fields are never touched, and what the renderer DRAWS is\n"
-                "unaffected either way: PROJ LOCK owns the projection matrix\n"
-                "independently of this.\n"
-                "\n"
-                "1.00x declares exactly what is drawn -- currently %.1f deg.\n"
-                "Higher keeps more geometry alive at the edges of vision and\n"
-                "costs draw calls.",
-                hooks::camera_fov_result_deg());
-    }
 
     ImGui::Separator();
 
@@ -782,14 +767,13 @@ void draw_settings_tab()
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip(
-                "3D shows the map as the stereo world it is drawn as.@"
-                "@"
-                "2D puts it on a flat panel instead -- one image, both eyes,@"
-                "placed and sized by the UI plane settings below. Head locked@"
-                "or pinned, whichever you have set there.@"
-                "@"
-                "Map screen size does not apply in 2D: the panel is the UI@"
-                "size, so shrinking the render would only crop the map.");
+                "3D shows the map as the stereo world it is drawn as.\n"
+                "\n"
+                "2D puts it on a flat panel instead -- one image, both eyes,\n"
+                "placed and sized by the UI plane settings below. Head locked\n"
+                "or pinned, whichever you have set there.\n"
+                "\n"
+                "Map UI size does not apply in 2D: the UI covers the panel.");
 
         int garageMode = xr::garage_render_mode();
         ImGui::SetNextItemWidth(ui_px(120.0f));
@@ -799,17 +783,10 @@ void draw_settings_tab()
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip(
-                "Same flat panel, for the garage.@"
-                "@"
-                "THIS IS WIDER THAN ITS NAME, and the setting cannot help it.@"
-                "The garage cannot be told apart from the menus -- it shares@"
-                "its interface with them and its world with gameplay, and the@"
-                "game does not tick the drive camera there either, so there is@"
-                "nothing left to identify it by.@"
-                "@"
-                "So 2D here also flattens the main menu, pause menus, loading@"
-                "screens and the fly-in when a level loads. If you like the@"
-                "menus flat, that is a bonus; if not, leave this on 3D.");
+                "Same flat panel, for the garage.\n"
+                "\n"
+                "2D here also flattens the main menu, pause menus, loading\n"
+                "screens and the fly-in when a level loads.");
 
         if (garageMode == xr::kScreenRender2D)
             ImGui::TextDisabled("  also the menus, loading screens and the fly-in");
@@ -822,10 +799,10 @@ void draw_settings_tab()
     // all: they are captured to their own layer and submitted as a quad, which
     // is what these three controls place.
     //
-    // The MAP ignores all three in 3D -- it is forced head-locked at full size
-    // so its screen-space markers stay on the map features they point at. In 2D
-    // it follows them like everything else, because there the markers ride the
-    // panel rather than the render (see place_ui_plane_quad).
+    // The MAP ignores all three in 3D -- it is forced head-locked, sized by the
+    // Map UI size slider further down, with its markers placed for that plane.
+    // In 2D it follows them like everything else, because there the markers
+    // ride the panel rather than the render (see place_ui_plane_quad).
     ImGui::TextDisabled("UI plane");
 
     // First, because it is the switch for whether the other three place
@@ -851,13 +828,7 @@ void draw_settings_tab()
         vrcfg::save();
     }
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("How far away the plane sits, and therefore where the\n"
-                          "UI converges. It is a real distance, so moving it back\n"
-                          "makes it LOOK smaller too -- raise the size above to\n"
-                          "get back to the same apparent size at a comfier depth.\n\n"
-                          "The map screen follows this too, but only in DEPTH: its\n"
-                          "size stays locked to the rendered view so the markers\n"
-                          "keep lining up.");
+        ImGui::SetTooltip("How far away the plane sits.");
 
     int uiMode = xr::ui_plane_mode();
     const char* uiModeLabels[] = { "Head locked", "Forward (pinned)" };
@@ -866,49 +837,31 @@ void draw_settings_tab()
         vrcfg::save();
     }
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Head locked: follows you everywhere (the original\n"
-                          "behaviour). Forward: stays where you put it in the\n"
+        ImGui::SetTooltip("Head locked: follows the head.\n"
+                          "Forward: stays where you put it in the\n"
                           "world, so you can look away from it.");
 
-    // World Marker Fix Checkbox
-    bool worldMarkerFix = hooks::world_marker_fix_enabled();
-    if (ImGui::Checkbox("World marker fix (experimental)", &worldMarkerFix)) {
-        hooks::set_world_marker_fix_enabled(worldMarkerFix);
-        vrcfg::save();
-    }
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Keeps world-projected markers (waypoints, building icons)\n"
-                          "correctly positioned in the scene instead of pinned flat to the HUD plane.\n"
-                          "Experimental right now. Will cause other UI Elements to flicker.");
+    // Not a setting: what the world markers are doing (marker_camera.h).
+    ImGui::TextDisabled("World markers: %s", hooks::marker_camera_status());
 
     ImGui::Separator();
 
-    // BASE render size. Shrinks the rendered FOV and the compositor window
-    // together, so lowering it draws less scene into fewer pixels with no
-    // stretch -- the same mechanism the map screen uses, applied everywhere.
-    // Everything downstream re-derives from it automatically (it lives inside
-    // composited_fov_scale), including the map slider below, which is a
-    // fraction OF this rather than of the headset's native FOV.
-    float renderPct = xr::render_fov_scale() * 100.0f;
-    if (ImGui::SliderFloat("Render size (FOV)", &renderPct, 30.0f, 100.0f, "%.0f%%")) {
-        xr::set_render_fov_scale(renderPct / 100.0f);
+    float mapUiPct = xr::map_ui_scale() * 100.0f;
+    if (ImGui::SliderFloat("Map UI size", &mapUiPct, 20.0f, 100.0f, "%.0f%%")) {
+        xr::set_map_ui_scale(mapUiPct / 100.0f);
         vrcfg::save();
     }
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip(
-            "Renders a narrower FOV into a smaller window.\n\n"
-            "Cheaper than it looks: fewer pixels AND less scene, with no\n"
-            "stretch, because the submitted FOV and the rendered FOV stay\n"
-            "locked to each other. Costs peripheral vision, not sharpness.");
-
-    float mapPct = xr::map_window_shrink() * 100.0f;
-    if (ImGui::SliderFloat("Map screen size", &mapPct, 0.0f, 100.0f, "%.0f%%")) {
-        xr::set_map_window_shrink(mapPct / 100.0f);
-        vrcfg::save();
-    }
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("A fraction of the render size above, not of the\n"
-                          "headset's native FOV -- the two multiply.");
+        ImGui::SetTooltip("The map's icons, panels and cursor, as a share of the\n"
+                          "rendered view, with the same centre. The map itself\n"
+                          "fills the render size on the Advanced tab. The icons\n"
+                          "stay on the map features they mark; features outside\n"
+                          "the smaller UI lose their icons. 3D map only.");
+    // Without the marker camera the game projects the icons itself, onto the
+    // full window, so the window shrinks with the UI (composited_fov_scale).
+    if (!hooks::marker_camera_available())
+        ImGui::TextDisabled("  no world-marker camera in this game build: the map's view\n"
+                            "  shrinks with its UI");
 
     ImGui::Separator();
     draw_resolution_scale();
@@ -925,6 +878,101 @@ void draw_settings_tab()
         begin_gamepad_capture();
 }
 
+// THE CAMERA TAB: where the head sits and how big the world reads, then the
+// look locks that decide what the stick still does to the view.
+void draw_camera_tab()
+{
+    // The seat in the cab, three sliders on one line. Truck-relative and
+    // cockpit only (hooks::cockpit_offset); shown in centimetres, kept in metres.
+    ImGui::TextUnformatted("First person offset");
+    {
+        float off[3];
+        hooks::cockpit_offset(off[0], off[1], off[2]);
+        static const char* kIds[3]  = { "##fpoH", "##fpoV", "##fpoF" };
+        static const char* kFmts[3] = { "horizontal %.0f cm", "vertical %.0f cm",
+                                        "forward %.0f cm" };
+        static const char* kTips[3] = { "Toward the truck's right.",
+                                        "Toward the truck's roof, however it lies.",
+                                        "Toward the truck's bonnet." };
+        const float gap = ImGui::GetStyle().ItemInnerSpacing.x;
+        const float w = (ImGui::GetContentRegionAvail().x - 2.0f * gap) / 3.0f;
+        bool changed = false;
+        for (int i = 0; i < 3; ++i) {
+            if (i) ImGui::SameLine(0.0f, gap);
+            float cm = off[i] * 100.0f;
+            ImGui::SetNextItemWidth(w);
+            if (ImGui::SliderFloat(kIds[i], &cm, -50.0f, 50.0f, kFmts[i])) {
+                off[i] = cm / 100.0f;
+                changed = true;
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s Cockpit only.", kTips[i]);
+        }
+        if (changed) {
+            hooks::set_cockpit_offset(off[0], off[1], off[2]);
+            vrcfg::save();
+        }
+    }
+
+    // Logarithmic, so 100% sits in the middle: half and double size are the
+    // same distance either side of it.
+    float worldPct = xr::world_scale() * 100.0f;
+    if (ImGui::SliderFloat("World scale", &worldPct, 50.0f, 200.0f, "%.0f%%",
+                           ImGuiSliderFlags_Logarithmic)) {
+        xr::set_world_scale(worldPct / 100.0f);
+        vrcfg::save();
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("How big the world looks. 100%% is life size; 200%%\n"
+                          "renders the eyes half as far apart and moves the view\n"
+                          "half as far as your head, so everything looks twice\n"
+                          "the size. Every 3D view.");
+
+    // Milliseconds here, seconds in the hook (hooks::head_smoothing).
+    float smoothMs = hooks::head_smoothing() * 1000.0f;
+    if (ImGui::SliderFloat("Head smoothing", &smoothMs, 0.0f, 250.0f,
+                           smoothMs < 0.5f ? "off" : "%.0f ms")) {
+        hooks::set_head_smoothing(smoothMs < 0.5f ? 0.0f : smoothMs / 1000.0f);
+        vrcfg::save();
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Cockpit only. Smooths how the truck throws your head\n"
+                          "about -- sideways and up and down, and its roll and\n"
+                          "pitch. Never front to back or its heading, so speeding\n"
+                          "up, braking and steering do not drag the view. Your own\n"
+                          "head movement is never smoothed. Higher is softer, and\n"
+                          "the cab moves around you more.");
+
+    ImGui::Separator();
+
+    bool horizonLock = hooks::horizon_lock_enabled();
+    if (ImGui::Checkbox("Orbit camera horizon lock", &horizonLock)) {
+        hooks::set_horizon_lock_enabled(horizonLock);
+        vrcfg::save();
+    }
+
+    // Cockpit counterparts to the orbit horizon lock above, levelled against
+    // the TRUCK rather than the world -- the truck's tilt on hills is kept,
+    // only the stick's own look input is dropped on the locked axis.
+    bool truckLevelLock = hooks::truck_level_lock_enabled();
+    if (ImGui::Checkbox("Cockpit lock truck level", &truckLevelLock)) {
+        hooks::set_truck_level_lock_enabled(truckLevelLock);
+        vrcfg::save();
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Stick look-PITCH stops moving the view; head pitch\n"
+                          "becomes the only source. Truck tilt on hills is kept.");
+
+    bool truckYawLock = hooks::truck_yaw_lock_enabled();
+    if (ImGui::Checkbox("Cockpit lock truck yaw", &truckYawLock)) {
+        hooks::set_truck_yaw_lock_enabled(truckYawLock);
+        vrcfg::save();
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Stick look-YAW stops moving the view; head yaw\n"
+                          "becomes the only source.");
+}
+
 // THE ADVANCED TAB: the controls that are diagnostics or one-time
 // calibrations rather than things you would reach for while playing, plus the
 // readouts that tell you whether the machinery underneath is working.
@@ -932,8 +980,297 @@ void draw_settings_tab()
 // Nothing here is second-guessed elsewhere -- these are the only copies of
 // these controls, moved out of Settings to stop that tab reading like a list
 // of everything the mod can do rather than a list of what you would change.
+// NVIDIA DLSS in place of the game's TAA (render/dlss.cpp): the mode, the
+// model ("preset"), what it needs, and one debug switch.
+void draw_dlss_tab()
+{
+    if (!dlss::compiled_in()) {
+        ImGui::TextWrapped("This build of the mod was made without NVIDIA's DLSS SDK, "
+                           "so it has no DLSS.");
+        return;
+    }
+
+    const int cur = dlss::mode();
+    ImGui::SetNextItemWidth(ui_px(230.0f));
+    if (ImGui::BeginCombo("Mode", dlss::mode_name(cur))) {
+        for (int m = 0; m < dlss::kModeCount; ++m) {
+            if (!dlss::mode_available(m)) continue;
+            // True on the confirm alone -- a click, or A on the pad. Moving
+            // through the open list only moves the highlight, so nothing here
+            // runs while browsing, which matters: this can rebuild the game's
+            // render targets.
+            if (ImGui::Selectable(dlss::mode_name(m), m == cur) && m != cur) {
+                dlss::set_mode(m);
+                vrcfg::save();
+                hooks::request_resolution_apply();
+            }
+            if (m == cur) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "DLAA: DLSS at the game's own resolution, as anti-aliasing.\n"
+            "\n"
+            "Quality, Balanced, Performance, Ultra Performance: the game renders\n"
+            "smaller -- 67%%, 58%%, 50%%, 33%% of the headset image on each side -- and\n"
+            "DLSS brings each eye up to the full size. VR only.\n"
+            "While upscaling, DIBR shift is off.");
+    ImGui::TextDisabled("%s", dlss::status());
+    if (hooks::resolution_apply_waiting())
+        ImGui::TextDisabled("Applying -- waiting for the game to finish loading.");
+
+    // WHAT THE GAME RENDERS AT, for the mode picked, and whether that needs a
+    // restart -- which it does only when this session cannot resize the game
+    // (hooks::live_resize_available()): then the mode here can be ahead of the
+    // game until the next launch.
+    {
+        const int ow = hooks::force_resolution_w(), oh = hooks::force_resolution_h();
+        int rw = ow, rh = oh;
+        dlss::render_size_for(cur, ow, oh, rw, rh);
+        int sOw = 0, sOh = 0, sRw = 0, sRh = 0;
+        const bool upSession = hooks::upscale_session(sOw, sOh, sRw, sRh);
+        uint32_t fw = 0, fh = 0;
+        const bool haveFrame = xr::render_canvas_wh(fw, fh);
+        if (dlss::is_upscaling(cur)) {
+            if (ow <= 0 || oh <= 0)
+                ImGui::TextWrapped("Upscaling needs the Render resolution set (Settings "
+                                   "tab): it is the size DLSS brings each eye up to.");
+            else
+                ImGui::TextDisabled("Renders %dx%d, upscaled to %dx%d per eye", rw, rh, ow,
+                                    oh);
+        }
+        // Restart owed: the frame is not the size this mode renders at, and
+        // nothing here can make it so.
+        const bool owed = !hooks::live_resize_available() && haveFrame && ow > 0 && oh > 0 &&
+                          ((int)fw != rw || (int)fh != rh) &&
+                          (dlss::is_upscaling(cur) || upSession);
+        if (owed)
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f),
+                               "Restart the game to apply -- it renders at %ux%u now.", fw,
+                               fh);
+    }
+
+    // The model. Recreates DLSS, so the image resets for a moment.
+    static const int   kPresetVal[]  = { dlss::kPresetDefault, dlss::kPresetJ, dlss::kPresetK,
+                                         dlss::kPresetL, dlss::kPresetM };
+    static const char* kPresetName[] = { "Default (DLSS decides)", "J", "K", "L", "M" };
+    constexpr int kPresetCount = (int)(sizeof(kPresetVal) / sizeof(kPresetVal[0]));
+    int pi = 0;
+    for (int i = 0; i < kPresetCount; ++i)
+        if (kPresetVal[i] == dlss::preset()) pi = i;
+    ImGui::SetNextItemWidth(ui_px(230.0f));
+    if (ImGui::Combo("Preset", &pi, kPresetName, kPresetCount)) {
+        dlss::set_preset(kPresetVal[pi]);
+        vrcfg::save();
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "Which DLSS model runs (NVIDIA calls these presets):\n"
+            "  Default  DLSS's own choice for the mode -- K for DLAA. May change\n"
+            "           with a newer nvngx_dlss.dll.\n"
+            "  J        like K; slightly less ghosting, a little more flicker.\n"
+            "  K        transformer model, the best image; default for DLAA,\n"
+            "           Quality and Balanced.\n"
+            "  L        default for Ultra Performance.\n"
+            "  M        default for Performance.\n"
+            "The others in NVIDIA's list are retired and not offered.");
+
+    // Sharpening after DLSS (render/sharpen.hpp). Straight away, nothing rebuilt.
+    float sharpPct = dlss::sharpness() * 100.0f;
+    ImGui::SetNextItemWidth(ui_px(230.0f));
+    if (ImGui::SliderFloat("Sharpness", &sharpPct, 0.0f, 100.0f, "%.0f%%")) {
+        dlss::set_sharpness(sharpPct / 100.0f);
+        vrcfg::save();
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "AMD's contrast adaptive sharpening (CAS) on DLSS's image: after the\n"
+            "upscale, or with DLAA on the finished frame. It lifts detail where\n"
+            "the image is soft and holds back at edges that already have\n"
+            "contrast, so it adds little shimmer. 0%% is off.");
+
+    ImGui::Separator();
+    ImGui::TextWrapped(
+        "Needs an NVIDIA RTX card, and the game's own TAA switched ON in its graphics "
+        "settings");
+    ImGui::TextWrapped(
+        "And nvngx_dlss.dll in the game's folder, next to SnowRunner.exe. The mod does "
+        "not ship it: download it from NVIDIA's DLSS SDK on GitHub "
+        "(github.com/NVIDIA/DLSS, lib/Windows_x86_64/rel/nvngx_dlss.dll).");
+
+    ImGui::Separator();
+    bool flip = dlss::jitter_flip_y();
+    if (ImGui::Checkbox("Flip jitter Y (debug)", &flip))
+        dlss::set_jitter_flip_y(flip);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Not saved. If DLAA looks soft or faintly shimmers while standing\n"
+                          "still, the vertical jitter sign handed to DLSS is wrong -- this\n"
+                          "flips it.");
+
+    // NVIDIA's attribution, which its SDK license asks for. Only reached by a
+    // build that has the SDK in it (see the early return above).
+    ImGui::Separator();
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+    ImGui::TextWrapped("This mod uses the NVIDIA DLSS SDK. NVIDIA, NVIDIA RTX and DLSS are "
+                       "trademarks of NVIDIA Corporation. This mod is not sponsored or "
+                       "endorsed by NVIDIA.");
+    ImGui::PopStyleColor();
+}
+
 void draw_advanced_tab()
 {
+    // BASE render size. Shrinks the rendered FOV and the compositor window
+    // together, so lowering it draws less scene into fewer pixels with no
+    // stretch. Everything downstream re-derives from it automatically (it lives
+    // inside composited_fov_scale), the map included, whose UI size on the
+    // Settings tab is a share OF this rather than of the headset's native FOV.
+    float renderPct = xr::render_fov_scale() * 100.0f;
+    ImGui::SetNextItemWidth(ui_px(230.0f));
+    if (ImGui::SliderFloat("Render size (FOV)", &renderPct, 30.0f, 100.0f, "%.0f%%")) {
+        xr::set_render_fov_scale(renderPct / 100.0f);
+        vrcfg::save();
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "Renders a narrower FOV into a smaller window.\n\n"
+            "Cheaper than it looks: fewer pixels AND less scene, with no\n"
+            "stretch, because the submitted FOV and the rendered FOV stay\n"
+            "locked to each other. Costs peripheral vision, not sharpness.");
+
+    // THE CULLING FOV, declared on combine::CAMERA itself (hooks/camera_fov.h).
+    //
+    // ALWAYS ON, and there is no switch any more. It replaced writing the game's
+    // own FOV fields, which no longer happens at all: that value needed ~200 deg
+    // before geometry stopped vanishing at the periphery and was already culling
+    // small objects dead ahead by ~150, so no setting satisfied both ends.
+    // m_fFOV is the field the engine genuinely builds its cull frustum from, and
+    // at 1.00x the periphery is clear and what forward culling remains has moved
+    // further out. Off would mean the game's own value, which is far too narrow
+    // for a headset -- not a state worth being able to reach.
+    //
+    // The search that finds the camera looks after itself: it waits for
+    // gameplay, takes one attempt per visit, and re-arms on its own if the
+    // object is ever replaced. Its progress reads out below the sliders.
+    {
+        float ff = hooks::camera_fov_factor();
+        ImGui::SetNextItemWidth(ui_px(230.0f));
+        if (ImGui::SliderFloat("Culling FOV", &ff, 0.5f, 2.5f, "%.2fx")) {
+            hooks::set_camera_fov_factor(ff);
+            vrcfg::save();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Multiplier on the RENDERED FOV, written into\n"
+                "combine::CAMERA::m_fFOV (+0x108, radians) -- the field the\n"
+                "engine derives its cull frustum from. The game's own FOV\n"
+                "fields are never touched, and what the renderer DRAWS is\n"
+                "unaffected either way: PROJ LOCK owns the projection matrix\n"
+                "independently of this.\n"
+                "\n"
+                "1.00x declares exactly what is drawn -- currently %.1f deg.\n"
+                "Higher keeps more geometry alive at the edges of vision and\n"
+                "costs draw calls.\n"
+                "\n"
+                "Small stones and debris have their own distance below: the\n"
+                "game also judges their size on screen from this FOV, which is\n"
+                "why widening it used to make them vanish dead ahead.",
+                hooks::camera_fov_result_deg());
+    }
+
+    // THE SMALL-OBJECT CULL (camera_fov.h): the second thing m_fFOV decides,
+    // and the forward culling the note above found left over. A multiplier on
+    // the FOV scale the game's size test sees, nothing else -- the frustum is
+    // the slider above's.
+    {
+        float sd = hooks::small_object_distance();
+        ImGui::SetNextItemWidth(ui_px(230.0f));
+        if (ImGui::SliderFloat("Small object distance", &sd, 1.0f, 8.0f, "%.1fx")) {
+            hooks::set_small_object_distance(sd);
+            vrcfg::save();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "How far away small stones, debris and loose branches are\n"
+                "still drawn. Trees and plants are a different system and are\n"
+                "not affected.\n"
+                "\n"
+                "The game drops a small object once it covers less than a\n"
+                "fixed share of the screen, worked out from the culling FOV --\n"
+                "so the wide headset view loses them at about a third of the\n"
+                "distance a monitor does, and straight ahead first (it measures\n"
+                "depth, not distance).\n"
+                "\n"
+                "1.0x is the game's own rule at the headset's FOV, 3.0x is\n"
+                "roughly what a monitor shows, 5.0x is the default. Higher draws\n"
+                "more of them and costs draw calls; takes effect immediately.");
+    }
+
+    // How the culling-FOV camera search is getting on (hooks/camera_fov.h).
+    // It runs itself -- waits for gameplay, one attempt per visit, re-arms if
+    // the object is replaced -- so this is the only place that says whether it
+    // ever succeeded.
+    ImGui::TextDisabled("Culling FOV: %s", hooks::camera_fov_status());
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "The camera object lives on the heap under ASLR, so there is no\n"
+            "fixed address to record and it is found by sweeping for\n"
+            "m_tmViewProj == m_tmView * m_tmProj -- sixteen floats that must\n"
+            "be the exact product of thirty-two others.\n"
+            "\n"
+            "It only exists IN GAMEPLAY, so the search waits for the drive\n"
+            "camera rather than wasting an attempt on a menu. Every write\n"
+            "re-checks the object first, so a freed or recycled block starts\n"
+            "a fresh search by itself.");
+
+    ImGui::Separator();
+
+    // Kept as a switch so the two can be compared in the headset: depth_probe.cpp
+    // has why one read is enough, and the log's "GPU time" line what each costs.
+    {
+        bool once = hooks::depth_at_resolve();
+        if (ImGui::Checkbox("Read scene depth once per frame", &once)) {
+            hooks::set_depth_at_resolve(once);
+            vrcfg::save();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "The 6-DoF warp needs each frame's depth. With the game's TAA on,\n"
+                "this reads it once, at the TAA pass, where it is finished.\n"
+                "\n"
+                "Off reads it at every depth pass of the frame and merges them,\n"
+                "up to 30 full-screen reads a frame. That is what runs with TAA\n"
+                "off either way. Takes effect immediately.");
+    }
+
+    // A DEBUG VIEW, not a setting: off at every start (render/motion_overlay.hpp).
+    {
+        bool mv = motionoverlay::enabled();
+        if (ImGui::Checkbox("Show motion vectors", &mv))
+            motionoverlay::set_enabled(mv);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Paints what the stale-eye warp moves each pixel by over both\n"
+                "eyes, half transparent. Needs the Motion vectors warp type.\n"
+                "\n"
+                "The colour is how a surface moved relative to your head in one\n"
+                "frame: red right, yellow-green up, cyan left, violet down. White\n"
+                "is measured but not moving relative to you, like the cab; full\n"
+                "colour is 30 px or more. No tint: the game reported nothing\n"
+                "moving there, so the warp moves it as static world.\n"
+                "\n"
+                "In the warped eye: solid = the next render's own vectors, striped\n"
+                "/ = borrowed from a neighbour, striped \\ = its own motion from\n"
+                "the frame before, carried on. Magenta dots = nothing landed there\n"
+                "at all, so it shows the rotation-only image, a frame old: what\n"
+                "the last render could not see (beside the cab when you lean or\n"
+                "the truck moves, the edge of view when you turn) and the mirrors.");
+        if (mv && !xr::warp_uses_motion())
+            ImGui::TextDisabled("Motion vectors: select the Motion vectors warp type");
+    }
+
+    ImGui::Separator();
+
     // WHICH SCREEN THE MOD THINKS YOU ARE ON. It drives the render FOV, the HUD
     // shrink bypass and whether DIBR shift runs, so a wrong answer is visible
     // immediately -- which is why both classifiers stay live and only the one
@@ -998,8 +1335,13 @@ void draw_advanced_tab()
     // to be folded into the slider's -8 deg default, which was only ever right
     // for the machine it was tuned on.
     {
-        const float autoDeg = xr::fov_center_pitch() * kRad2Deg;
-        ImGui::TextDisabled("  + %.1f deg auto (headset FOV centre) = %.1f total",
+        // Under off-centre projection the render already is the eye's own
+        // lopsided frustum, so no automatic tilt is applied (see
+        // xr::submitted_vertical_pitch).
+        const bool  offc    = xr::offcenter_projection();
+        const float autoDeg = offc ? 0.0f : xr::fov_center_pitch() * kRad2Deg;
+        ImGui::TextDisabled(offc ? "  + %.1f deg auto (off-centre projection) = %.1f total"
+                                 : "  + %.1f deg auto (headset FOV centre) = %.1f total",
                             autoDeg, autoDeg + vertRecenterDeg);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip(
@@ -1008,7 +1350,13 @@ void draw_advanced_tab()
                 "than above it, so the middle of the panel is not straight\n"
                 "ahead. That offset is read once and applied for you.\n"
                 "\n"
-                "0.0 here means the runtime has not reported a frustum yet.\n"
+                "Both terms tilt the game's camera and the image together, so\n"
+                "the world stays where it really is: they only choose which\n"
+                "part of it is drawn, i.e. where the image sits on the panel.\n"
+                "\n"
+                "0.0 here means the runtime has not reported a frustum yet --\n"
+                "or off-centre projection is on, which covers the panel\n"
+                "exactly without a tilt.\n"
                 "\n"
                 "The slider above is preference on top. If you find yourself\n"
                 "needing a large value again, the automatic term is wrong --\n"
@@ -1084,23 +1432,23 @@ void draw_advanced_tab()
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip(
-                "Renders each eye at the exact lopsided frustum your runtime@"
-                "reports for it, instead of a symmetric one wide enough to@"
-                "contain it.@"
-                "@"
-                "Strictly more correct, and it stops drawing the surplus: on a@"
-                "wide headset about a third of every frame is currently@"
-                "rendered and then thrown away, so the pixels you keep get@"
-                "sharper for free.@"
-                "@"
-                "THE TRADE, and it is a real one. The two eyes then look at@"
-                "different angles and overlap over only part of their width.@"
-                "DIBR shift builds one eye out of the other, so outside that@"
-                "overlap it has nothing to build from and the outer edge falls@"
-                "back to the stale-eye warp. Best paired with DIBR shift OFF.@"
-                "@"
-                "The warp and the shift are both corrected for the new frustum@"
-                "shape, so this is not expected to break them -- but it is the@"
+                "Renders each eye at the exact lopsided frustum your runtime\n"
+                "reports for it, instead of a symmetric one wide enough to\n"
+                "contain it.\n"
+                "\n"
+                "Strictly more correct, and it stops drawing the surplus: on a\n"
+                "wide headset about a third of every frame is currently\n"
+                "rendered and then thrown away, so the pixels you keep get\n"
+                "sharper for free.\n"
+                "\n"
+                "THE TRADE, and it is a real one. The two eyes then look at\n"
+                "different angles and overlap over only part of their width.\n"
+                "DIBR shift builds one eye out of the other, so outside that\n"
+                "overlap it has nothing to build from and the outer edge falls\n"
+                "back to the stale-eye warp. Best paired with DIBR shift OFF.\n"
+                "\n"
+                "The warp and the shift are both corrected for the new frustum\n"
+                "shape, so this is not expected to break them -- but it is the\n"
                 "least-travelled path in the mod. Report what you see.");
 
         if (oc) {
@@ -1120,23 +1468,23 @@ void draw_advanced_tab()
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip(
-                "Your headset sees further toward the temple than toward the@"
-                "nose; the game is rendered symmetrically. ON submits only the@"
-                "part of that render each eye can actually see, so the image@"
-                "sits on the lens rather than on the straight-ahead axis.@"
-                "@"
-                "OFF BY DEFAULT, because the part it drops is not small. On a@"
-                "Quest 3 each eye loses about a fifth of the frame width, on@"
-                "opposite sides, and the two eyes then only agree across the@"
-                "middle 61%% -- which looks like the picture not lining up@"
-                "toward the outer edges.@"
-                "@"
-                "Turn it ON if your headset's per-eye view is close to@"
-                "symmetric: then the crop is a few pixels and you get the@"
-                "lens-accurate placement for free.@"
-                "@"
-                "The arithmetic is sound either way -- this is a trade, not a@"
-                "bug. Off-centre projection above is the version that needs no@"
+                "Your headset sees further toward the temple than toward the\n"
+                "nose; the game is rendered symmetrically. ON submits only the\n"
+                "part of that render each eye can actually see, so the image\n"
+                "sits on the lens rather than on the straight-ahead axis.\n"
+                "\n"
+                "OFF BY DEFAULT, because the part it drops is not small. On a\n"
+                "Quest 3 each eye loses about a fifth of the frame width, on\n"
+                "opposite sides, and the two eyes then only agree across the\n"
+                "middle 61%% -- which looks like the picture not lining up\n"
+                "toward the outer edges.\n"
+                "\n"
+                "Turn it ON if your headset's per-eye view is close to\n"
+                "symmetric: then the crop is a few pixels and you get the\n"
+                "lens-accurate placement for free.\n"
+                "\n"
+                "The arithmetic is sound either way -- this is a trade, not a\n"
+                "bug. Off-centre projection above is the version that needs no\n"
                 "crop at all, because it renders each eye's real shape.");
     }
 
@@ -1214,23 +1562,6 @@ void draw_advanced_tab()
                             ws.used, ws.staleSnapshot, ws.orbitDeclined,
                             ws.worstDisagreeDeg);
     }
-
-    // How the culling-FOV camera search is getting on (hooks/camera_fov.h).
-    // It runs itself -- waits for gameplay, one attempt per visit, re-arms if
-    // the object is replaced -- so this is the only place that says whether it
-    // ever succeeded.
-    ImGui::TextDisabled("Culling FOV: %s", hooks::camera_fov_status());
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip(
-            "The camera object lives on the heap under ASLR, so there is no\n"
-            "fixed address to record and it is found by sweeping for\n"
-            "m_tmViewProj == m_tmView * m_tmProj -- sixteen floats that must\n"
-            "be the exact product of thirty-two others.\n"
-            "\n"
-            "It only exists IN GAMEPLAY, so the search waits for the drive\n"
-            "camera rather than wasting an attempt on a menu. Every write\n"
-            "re-checks the object first, so a freed or recycled block starts\n"
-            "a fresh search by itself.");
 }
 
 void draw_cull_tab()
@@ -1407,22 +1738,42 @@ void draw_cull_tab()
 
 // Settings panel's own pixel rect within the full desktop draw data, captured
 // fresh each Present -- see menu_panel_rect() / the headset quad layer, which
-// crops to just this instead of the whole (mostly empty) desktop-sized
-// texture. AlwaysAutoResize means GetWindowSize() already reflects this
-// frame's real laid-out size by the time we read it here, right before End().
+// is placed by it.
 std::atomic<int> g_panelX{0}, g_panelY{0}, g_panelW{0}, g_panelH{0};
 
-// A POPUP IS ITS OWN WINDOW, and the headset quad crops to the settings
-// panel's bounds -- so a popup laid out anywhere else is simply not in the
-// picture. That is exactly what happened to the first-run notice: ImGui
-// centres a modal on the VIEWPORT, which here is the whole desktop-sized
-// texture, and only its bottom-left corner fell inside the crop.
+// EVERYTHING THE MENU DREW, as one rect: the panel plus every tooltip, popup
+// and combo list that was up this frame. The headset quad crops to this rather
+// than to the panel alone.
 //
-// Two halves to the fix and both are needed. The popup is positioned over the
-// panel (so it is inside the crop to begin with), and menu_panel_rect() unions
-// this in (so a popup larger than the panel, or nudged off it, still cannot be
-// cut off). Zeroed every frame the popup is not up.
-std::atomic<int> g_popupX{0}, g_popupY{0}, g_popupW{0}, g_popupH{0};
+// A tooltip or a popup is its own window, so a crop to the panel's bounds cut
+// off whatever of it fell outside -- most tooltips, most of an open combo, and
+// the first-run notice (ImGui centres a modal on the VIEWPORT, which here is
+// the whole desktop-sized texture, and only its bottom-left corner fell inside
+// the crop; it is also positioned over the panel now, below). Taken from
+// ImGui's own window list after Render(), so nothing has to remember to
+// report itself. With the quad at a fixed scale, a tooltip that reaches past
+// the panel makes the quad bigger around it instead of shrinking the panel.
+std::atomic<int> g_drawnX{0}, g_drawnY{0}, g_drawnW{0}, g_drawnH{0};
+
+void publish_drawn_rect()
+{
+    const int px = g_panelX.load(), py = g_panelY.load();
+    const int pw = g_panelW.load(), ph = g_panelH.load();
+    ImRect r((float)px, (float)py, (float)(px + pw), (float)(py + ph));
+    if (ImGuiContext* ctx = ImGui::GetCurrentContext()) {
+        for (ImGuiWindow* w : ctx->Windows) {
+            // Active = submitted this frame. Children sit inside their parent
+            // and are clipped to it; only these float free of it.
+            if (!w || !w->Active || w->Hidden) continue;
+            if (!(w->Flags & (ImGuiWindowFlags_Tooltip | ImGuiWindowFlags_Popup))) continue;
+            r.Add(w->Rect());
+        }
+    }
+    g_drawnX.store((int)std::floor(r.Min.x));
+    g_drawnY.store((int)std::floor(r.Min.y));
+    g_drawnW.store((int)std::ceil(r.Max.x) - (int)std::floor(r.Min.x));
+    g_drawnH.store((int)std::ceil(r.Max.y) - (int)std::floor(r.Min.y));
+}
 
 // --- tab strip -----------------------------------------------------------
 // Table-driven so the shoulder-button cycling in menu_hook_update() and the
@@ -1509,6 +1860,8 @@ void draw_rigid_tab()
 struct MenuTab { const char* name; void (*draw)(); };
 constexpr MenuTab kTabs[] = {
     { "Settings",    &draw_settings_tab },
+    { "Camera",      &draw_camera_tab },
+    { "DLSS",        &draw_dlss_tab },
     { "Advanced",    &draw_advanced_tab },
     { "Shader Cull", &draw_cull_tab },
     { "Rigid",       &draw_rigid_tab },
@@ -1529,34 +1882,47 @@ void cycle_tab(int delta)
 
 void draw_settings_window()
 {
+    // A FIXED SIZE THAT YOU CHANGE BY DRAGGING, like any window: the edges and
+    // the corner grip resize it, and ImGui keeps the result in imgui.ini. It
+    // used to be AlwaysAutoResize, so its width followed whichever tab and
+    // whichever line was widest -- and the headset quad, then a fixed width in
+    // metres, rescaled the whole panel every time it did. Long tabs scroll.
+    //
+    // A new ID ("###" -- the title is unchanged), so the size the old
+    // auto-sizing window left in imgui.ini is not restored as if it had been
+    // chosen.
     ImGui::SetNextWindowPos(ImVec2(60, 60), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(560, 0), ImGuiCond_FirstUseEver);
-    // NO TALLER THAN THE HEADSET CAN SHOW. At a large UI size a long tab would
-    // otherwise grow past the edge of the view, where a head-locked panel can
-    // never be looked at; capped, it scrolls instead, and gamepad navigation
-    // scrolls to whatever it focuses. In pixels from last frame's width, since
-    // the quad's height is its width times the panel's aspect.
-    {
-        const float maxM  = g_menuQuadMaxHeightM.load();
-        const float wM    = menu_quad_width_m();
-        const int   lastW = g_panelW.load();
-        if (maxM > 0.0f && wM > 0.0f && lastW > 0)
-            ImGui::SetNextWindowSizeConstraints(ImVec2(0.0f, 0.0f),
-                                                ImVec2(FLT_MAX, maxM * (float)lastW / wM));
+    ImGui::SetNextWindowSize(ImVec2(ui_px(kMenuDefaultWidth), ui_px(kMenuDefaultHeight)),
+                             ImGuiCond_FirstUseEver);
+    if (g_pendingWindowRescale > 0.0f) {
+        const int lastW = g_panelW.load(), lastH = g_panelH.load();
+        if (lastW > 0 && lastH > 0)
+            ImGui::SetNextWindowSize(ImVec2((float)lastW * g_pendingWindowRescale,
+                                            (float)lastH * g_pendingWindowRescale),
+                                     ImGuiCond_Always);
+        g_pendingWindowRescale = 0.0f;
     }
-    ImGui::Begin("SnowRunner VR Settings", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+    // NO BIGGER THAN THE HEADSET CAN SHOW. The quad is head-locked, so a panel
+    // past the edge of the view could never be looked at; capped, it scrolls
+    // instead, and gamepad navigation scrolls to whatever it focuses. A pixel
+    // is a fixed size in the headset, so the limits convert directly.
+    {
+        const float maxHm = g_menuQuadMaxHeightM.load();
+        const float maxWm = g_menuQuadMaxWidthM.load();
+        const ImVec2 minPx(ui_px(360.0f), ui_px(200.0f));
+        const ImVec2 maxPx(maxWm > 0.0f ? (std::max)(minPx.x, maxWm / kMenuMetresPerPx) : FLT_MAX,
+                           maxHm > 0.0f ? (std::max)(minPx.y, maxHm / kMenuMetresPerPx) : FLT_MAX);
+        ImGui::SetNextWindowSizeConstraints(minPx, maxPx);
+    }
+    ImGui::Begin("SnowRunner VR Settings###SrvrSettings", nullptr, 0);
 
     // The first-run resolution notice, as a MODAL -- the whole reason the menu
     // was opened, so it should not be possible to miss it behind a tab.
     //
     // CENTRED ON THIS PANEL, not on the viewport, which is what ImGui would do
     // by default. The viewport here is the desktop-sized texture the menu is
-    // drawn into, and the headset only ever sees the crop around this window
-    // (menu_panel_rect), so a viewport-centred popup lands almost entirely
-    // outside the picture. Read straight from the window we are inside: the
-    // position is exact and the size is last frame's, which under
-    // AlwaysAutoResize is this frame's unless the content just changed.
-    g_popupW.store(0); g_popupH.store(0);   // re-published below while it is up
+    // drawn into, and the headset is placed by this window (menu_panel_rect),
+    // so a viewport-centred popup would sit far off to one side of it.
     if (g_firstRunNotice.load() && !g_firstRunPopupShown) {
         g_firstRunPopupShown = true;
         ImGui::OpenPopup("First-time setup");
@@ -1570,25 +1936,33 @@ void draw_settings_window()
     }
     if (ImGui::BeginPopupModal("First-time setup", nullptr,
                                ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::TextWrapped(
-            "First time startup detected and resolution set in config, please "
-            "restart game to launch with corrected resolution.");
+        // Asked every frame rather than once: OK acts on whatever is true when it
+        // is pressed, and the text has to promise that and nothing else.
+        const bool live = hooks::live_resize_available();
+        ImGui::TextWrapped("First time startup: detected %ux%u per eye from your headset.",
+                           g_firstRunNativeW, g_firstRunNativeH);
         ImGui::Spacing();
-        ImGui::TextWrapped("Render resolution set to %ux%u, from your headset's "
-                           "own native size.", g_firstRunW, g_firstRunH);
-        ImGui::TextDisabled("The game builds its window once, at launch, and never "
-                            "re-reads the size -- so this cannot be applied now.");
+        if (live)
+            ImGui::TextWrapped("Render resolution set to %ux%u to match. Press OK to apply it.",
+                               g_firstRunW, g_firstRunH);
+        else
+            ImGui::TextWrapped("Render resolution set to %ux%u in config, please restart game "
+                               "to launch with corrected resolution.", g_firstRunW, g_firstRunH);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        if (live)
+            ImGui::TextWrapped("The game rebuilds itself at the new size, which takes a moment. "
+                               "Change it any time with Render resolution on the Settings tab.");
+        else
+            ImGui::TextWrapped("This session cannot resize the game. It needs windowed mode; if "
+                               "the game is windowed, the log says why.");
+        ImGui::PopStyleColor();
         ImGui::Spacing();
         if (ImGui::Button("OK", ImVec2(ui_px(120.0f), 0.0f))) {
+            hooks::request_resolution_apply();   // nothing, where this session cannot
             g_firstRunNotice.store(false);
             ImGui::CloseCurrentPopup();
         }
         ImGui::SetItemDefaultFocus();
-
-        const ImVec2 pp = ImGui::GetWindowPos();
-        const ImVec2 ps = ImGui::GetWindowSize();
-        g_popupX.store((int)pp.x); g_popupY.store((int)pp.y);
-        g_popupW.store((int)ps.x); g_popupH.store((int)ps.y);
         ImGui::EndPopup();
     }
 
@@ -1758,6 +2132,7 @@ void menu_hook_update()
     ImGui::NewFrame();
     draw_settings_window();
     ImGui::Render();
+    publish_drawn_rect();
 
     LeaveCriticalSection(&g_imguiLock);
 }
@@ -1795,19 +2170,16 @@ bool menu_panel_rect(int& x, int& y, int& w, int& h)
         return false;
     x = g_panelX.load(); y = g_panelY.load();
     w = g_panelW.load(); h = g_panelH.load();
-    if (w <= 0 || h <= 0) return false;
+    return w > 0 && h > 0;
+}
 
-    // Grow to cover any popup as well -- see g_popupX.
-    const int pw = g_popupW.load(), ph = g_popupH.load();
-    if (pw > 0 && ph > 0) {
-        const int px = g_popupX.load(), py = g_popupY.load();
-        const int x1 = (x < px) ? x : px;
-        const int y1 = (y < py) ? y : py;
-        const int x2 = ((x + w) > (px + pw)) ? (x + w) : (px + pw);
-        const int y2 = ((y + h) > (py + ph)) ? (y + h) : (py + ph);
-        x = x1; y = y1; w = x2 - x1; h = y2 - y1;
-    }
-    return true;
+bool menu_drawn_rect(int& x, int& y, int& w, int& h)
+{
+    if (!g_installed.load() || !g_menuOpen.load())
+        return false;
+    x = g_drawnX.load(); y = g_drawnY.load();
+    w = g_drawnW.load(); h = g_drawnH.load();
+    return w > 0 && h > 0;
 }
 
 void menu_render_to_extra_target(ID3D11RenderTargetView* rtv, ID3D11DeviceContext* ctx)
@@ -1841,7 +2213,11 @@ void  set_mod_ui_scale(float scale)
     g_modUiScale.store((std::max)(0.5f, (std::min)(3.0f, scale)));
 }
 
-float menu_quad_width_m() { return kMenuQuadWidthM * g_builtUiScale.load(); }
-void  set_menu_quad_max_height_m(float m) { g_menuQuadMaxHeightM.store(m > 0.0f ? m : 0.0f); }
+float menu_quad_metres_per_px() { return kMenuMetresPerPx; }
+void  set_menu_quad_max_size_m(float w, float h)
+{
+    g_menuQuadMaxWidthM.store(w > 0.0f ? w : 0.0f);
+    g_menuQuadMaxHeightM.store(h > 0.0f ? h : 0.0f);
+}
 
 } // namespace hooks

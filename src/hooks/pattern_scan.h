@@ -74,6 +74,22 @@ std::vector<uint8_t*> find_rip_refs(HMODULE module, const uint8_t* opcode, int o
 // finds neither "XInputGetStateEx" nor "MyXInputGetState".
 std::vector<uint8_t*> find_cstrings(HMODULE module, const char* s);
 
+// TRUE when the bytes at `p` match an IDA-style pattern. For code whose place
+// is already known -- a vtable slot -- but whose SHAPE still has to be confirmed
+// before anything relies on it. An unreadable address is a mismatch, not a
+// crash.
+bool pattern_matches_at(const void* p, const char* ida_pattern);
+
+// A CLASS'S VTABLE, BY ITS RTTI NAME -- MSVC's mangled form, e.g.
+// ".?AVui3D_CAMERA_MR@@". Followed the way the compiler lays it down: the name
+// sits in a TypeDescriptor in the image's data, the class's primary
+// CompleteObjectLocator in read-only data points at that descriptor and at
+// itself, and the vtable is the one read-only pointer to that locator
+// (vtable[-1]). A relink cannot rename a class, so this outlives the game
+// updates that move everything else. Each step has to be unique; otherwise
+// null, with `why` saying which step failed.
+void** rtti_vtable(HMODULE module, const char* mangledName, const char** why);
+
 // The import slot `module` calls `fn` through, found by NAME in its own import
 // table -- so it is found even when the function itself is already detoured by
 // somebody else. Any DLL when `dll` is null. Null when `fn` is not imported by

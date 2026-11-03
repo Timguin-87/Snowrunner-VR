@@ -11,6 +11,7 @@
 #include <intrin.h>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <atomic>
 #include <algorithm>
 
@@ -200,6 +201,14 @@ std::atomic<int>       g_projSiteCount{0};
 // whenever the aspect cannot decide -- no canvas size yet, or a whole frame in
 // which nothing matched -- so the main view can never be left unlocked because
 // the rule failed to recognise it.
+//
+// A SQUARE MIRROR BEATS THE SHAPE TEST, which is why mirrors are now recognised
+// first, by who is asking (detour_setperspective). A mirror's aspect comes from
+// its own data, so nothing stops it being exactly 1.0, and on a square canvas
+// that is a match: on the car in Capture_twomirrors the lower mirror (26 deg,
+// aspect 1.0) was widened to the headset's 103 deg while the one above it
+// (39 deg, aspect 0.525) was left alone. The shape test stays for everything
+// else, and alone if that call site is not found in this game build.
 constexpr float kAspectTol = 0.02f;   // 2% relative; mirrors are not near-misses
 
 // Did ANY projection at this site match the canvas aspect. Split across two
@@ -312,7 +321,22 @@ std::atomic<uintptr_t> g_mapProjCaller{0};
 // also established only after the double-supply was fixed -- while two suppliers
 // were fighting, flipping this turned "no depth" into "double depth", which said
 // nothing about handedness.)
-constexpr float kMapEyeSign = -1.0f;
+//
+// BACK TO +1, 2026-10-27, and this time for a measured cause. On the map, the
+// garage and the menus the image at a Present is drawn with the camera built
+// one frame EARLIER than in gameplay -- a 2 deg yaw bump on every fourth build
+// of the title-screen camera showed up one Present late in 16 of 16. Routed by
+// the latest build, every image there landed in the OTHER eye; flipping the
+// offset put the depth back, which is what this constant did -- and why "the
+// map camera looks straight down" never fitted: it looks down at 45 deg, and
+// the menu camera does not look down at all. What the flip could not fix was
+// the pose: each eye was declared a frame of head motion away from what it
+// showed, which is why those screens never felt like gameplay (and why, under
+// Synched Sequential, the left eye lagged there while the right one did not).
+// xr_mirror.cpp now routes and declares every image by the build it was drawn
+// with (update_on_screen), so no flip is needed. Kept as a constant only so the
+// arithmetic that used it still reads the same.
+constexpr float kMapEyeSign = 1.0f;
 
 // The GAME's own camera pose, published from fna BEFORE any head transform.
 //
@@ -529,6 +553,13 @@ std::atomic<bool> g_horizonLockOn{true};
 std::atomic<bool> g_truckLevelLock{true};    // config is authoritative
 std::atomic<bool> g_truckYawLock{false};
 
+// The first-person offset, metres along the truck's right, up and forward
+// (viewbuild_hook.h). Config is authoritative.
+std::atomic<float> g_cockpitOffset[3] = {};
+// The head smoothing's time constant in seconds, 0 = off (viewbuild_hook.h,
+// smooth_cab). Config is authoritative.
+std::atomic<float> g_headSmoothingS{0.0f};
+
 
 // Head LEAN through the same matrix, so it can be used as a live check that this
 // injection point works: lean should move the view immediately.
@@ -569,6 +600,8 @@ constexpr bool  kConnectHead = true;   // true = live HMD; false = flat T-cycle 
 // the rotation goes in from xr::head_look()'s yaw/pitch/roll at detour_combine2
 // and detour_fna, and has for a long time. Removed 2026-09-20 with
 // xr::head_orientation(), which it was the only consumer of.)
+// The world scale is not this: xr::head_look() has divided the head's travel by
+// it already.
 constexpr float kHeadPosScale = 1.0f;   // metres of head motion -> game units
 
 // DIAGNOSTIC: cycle yaw -> pitch -> horizontal-translate sway (flat-visible).
@@ -1370,6 +1403,11 @@ void* detour_combine2(void* rcx, void* rdx, void* r8, void* r9){
 // whatever the detour left in them. That is not "observe-only", it is corruption.
 using PFN_PROJ = void*(*)(void*, float, float, float, float);
 PFN_PROJ real_projbuild = nullptr;
+// Set for the length of a mirror camera's set-perspective, which is where its
+// projection gets built: the projection builder only sees set-perspective as its
+// caller, for every camera alike, so the question has to be asked one level up.
+thread_local bool t_mirrorPerspective = false;
+
 void* detour_projbuild(void* rcx, float fovY, float aspect, float nearZ, float farZ){
     void* raw_ret = _ReturnAddress();
     void* ret = real_projbuild(rcx, fovY, aspect, nearZ, farZ);
@@ -1469,21 +1507,38 @@ void* detour_projbuild(void* rcx, float fovY, float aspect, float nearZ, float f
                 // Kept for the census below only -- the LOCK no longer depends
                 // on it. See proj_lock_should_lock().
                 const unsigned invoc = g_projInvocation.fetch_add(1);
-                const bool lockThis = proj_lock_should_lock(p00, p11);
+                // Not asked about mirrors at all, or a square one would count as
+                // having seen the main view this frame.
+                const bool mirrorCam = t_mirrorPerspective;
+                const bool lockThis = !mirrorCam && proj_lock_should_lock(p00, p11);
 
-                // CENSUS, once every 600 Presents. The aspect rule assumes a
-                // truck mirror is not shaped like the backbuffer, which is a
+                // CENSUS, sampled every 600 Presents and logged when an
+                // invocation's answer CHANGES. The aspect rule assumes a truck
+                // mirror is not shaped like the backbuffer, which is a
                 // reasonable assumption and not a proven one -- and a square
                 // render resolution (2688x2688 here) shrinks the gap it relies
                 // on. If a mirror ever matches, this is the line that says so,
                 // instead of leaving a magnified view nobody can account for.
+                // Repeating an unchanged answer said nothing new, and made up
+                // most of the log.
                 if ((g_projFrameNo.load(std::memory_order_relaxed) % 600u) == 0u) {
                     const float aspect = (p00 > 1.0e-4f && p11 > 1.0e-4f) ? p11 / p00 : 0.0f;
                     const float nativeHfov = (p00 > 1.0e-4f)
                         ? 2.0f * std::atan(1.0f / p00) * 57.2957795f : 0.0f;
-                    VRLOG("PROJ LOCK census: invocation %u  aspect %.4f  native hfov "
-                          "%.2f deg  -> %s", invoc, aspect, nativeHfov,
-                          lockThis ? "LOCKED to our FOV" : "left at the game's FOV");
+                    constexpr unsigned kCensusSlots = 16;   // later ones share the last
+                    static std::atomic<uint32_t> s_census[kCensusSlots];
+                    // Aspect to 0.001 and FOV to 0.1 deg; the top bit keeps it
+                    // from ever equalling the 0 an unseen slot holds.
+                    const uint32_t sig = 0x80000000u |
+                        (static_cast<uint32_t>(aspect * 1000.0f + 0.5f) << 12) |
+                        (static_cast<uint32_t>(nativeHfov * 10.0f + 0.5f) << 1) |
+                        (lockThis ? 1u : 0u);
+                    if (s_census[(std::min)(invoc, kCensusSlots - 1)].exchange(sig) != sig)
+                        VRLOG("PROJ LOCK census: invocation %u  aspect %.4f  native hfov "
+                              "%.2f deg  -> %s", invoc, aspect, nativeHfov,
+                              lockThis ? "LOCKED to our FOV"
+                                       : (mirrorCam ? "left at the game's FOV (mirror camera)"
+                                                    : "left at the game's FOV"));
                 }
 
                 // RECON probe. Deliberately ABOVE the FOV-lock gate below.
@@ -1666,6 +1721,263 @@ void* detour_camconsumer(void* rcx, void* rdx, void* r8, void* r9){
 // filtered to the CAMERA caller (not the sun/shadow view). Unrecognised
 // callers are logged once each (see g_sites).
 PFN4 real_fna = nullptr;
+// The game's own camera input for this build, hashed before anything of ours
+// is applied. Synched Sequential learns its render lag from where this changes
+// (xr::advance_aer_parity): the freeze holds it bit-identical within a moment,
+// all but the camera's own swing -- see ss_hold_camera() below. Never 0, which
+// means "no fingerprint".
+uint64_t camera_fingerprint(const float* eye, const float* target, const float* up)
+{
+    uint64_t h = 1469598103934665603ull;            // FNV-1a
+    for (const float* v : {eye, target, up}) {
+        if (!v) continue;
+        for (int i = 0; i < 3; ++i) {
+            uint32_t bits;
+            std::memcpy(&bits, &v[i], sizeof(bits));
+            h = (h ^ bits) * 1099511628211ull;
+        }
+    }
+    return h ? h : 1;
+}
+
+// SYNCHED SEQUENTIAL'S CAMERA HOLD. The freeze stops the world between the two
+// renders of a moment, but not quite the camera: its own motion -- the stick
+// swinging the orbit round the truck -- is applied by the update it is run in,
+// while in-game a render shows the update BEFORE. So the swing lands in the
+// second render of a pair and not the first. Seen in the play log 2026-10-28:
+// in orbit view up to 314 of ~400 second renders per 10 s arrived with a camera
+// input different from their first's (the log's "new moments at real updates"),
+// against none in a steady cockpit. One eye then stands further along the
+// orbit than the other -- a wider or narrower effective IPD while the camera
+// swings, which reads as the world shrinking or growing.
+//
+// The truck frame the cockpit locks level against is skewed the same way for
+// another reason: combine2 publishes it AFTER this hook in the same camera
+// update, so the first render of a pair reads the previous moment's frame and
+// the second its own. On rough ground the two eyes were levelled against two
+// different truck attitudes -- a vertical disparity.
+//
+// So the first render's inputs are kept, and the second render is built from
+// them: the same camera exactly, with the eye offset the only difference. The
+// swing reaches the screen with the next pair, in both eyes at once. Kept per
+// call within the frame, in case a frame builds this camera more than once,
+// and never carried across a change of camera (`kind`: menu, map/garage,
+// cockpit or orbit) -- that would put one camera's view into the other's frame.
+struct HeldCamCall {
+    int   kind;
+    float eye[4], tgt[4], up[3];
+    bool  haveUp;
+    float tf[3], tu[3], tr[3];
+    bool  haveTruck;
+};
+constexpr uint32_t kHeldCalls = 4;
+SRWLOCK     g_holdLock   = SRWLOCK_INIT;
+bool        g_holdValid  = false;
+uint32_t    g_holdMoment = 0;              // the moment the held inputs belong to
+uint32_t    g_holdCount  = 0;              // calls held for it
+HeldCamCall g_holdCall[kHeldCalls];
+uint32_t    g_holdBuild = 0, g_holdIdx = 0;   // this call's index within its frame
+SsHoldStats g_holdStats;
+
+float angle_deg(const float a[3], const float b[3])
+{
+    float c[3]; cross3(a, b, c);
+    return std::atan2(std::sqrt(dot3(c, c)), dot3(a, b)) * 57.2957795f;
+}
+
+void ss_hold_camera(const xr::SsBuildInfo& ssb, int kind, float eye[4], float tgt[4],
+                    float up[3], bool& haveUp,
+                    float tf[3], float tu[3], float tr[3], bool& haveTruck)
+{
+    AcquireSRWLockExclusive(&g_holdLock);
+    if (ssb.build != g_holdBuild) { g_holdBuild = ssb.build; g_holdIdx = 0; }
+    else ++g_holdIdx;
+    const uint32_t k = g_holdIdx;
+    if (ssb.first) {
+        if (k == 0) { g_holdValid = true; g_holdMoment = ssb.moment; g_holdCount = 0; }
+        if (g_holdValid && g_holdMoment == ssb.moment && k < kHeldCalls) {
+            HeldCamCall& c = g_holdCall[k];
+            c.kind = kind;
+            std::memcpy(c.eye, eye, sizeof(c.eye));
+            std::memcpy(c.tgt, tgt, sizeof(c.tgt));
+            std::memcpy(c.up, up, sizeof(c.up));
+            c.haveUp = haveUp;
+            std::memcpy(c.tf, tf, sizeof(c.tf));
+            std::memcpy(c.tu, tu, sizeof(c.tu));
+            std::memcpy(c.tr, tr, sizeof(c.tr));
+            c.haveTruck = haveTruck;
+            g_holdCount = k + 1;
+        }
+    } else {
+        if (k == 0) ++g_holdStats.seconds;
+        if (g_holdValid && g_holdMoment == ssb.moment && k < g_holdCount &&
+            g_holdCall[k].kind == kind) {
+            const HeldCamCall& c = g_holdCall[k];
+            const bool moved =
+                std::memcmp(eye, c.eye, 3 * sizeof(float)) != 0 ||
+                std::memcmp(tgt, c.tgt, 3 * sizeof(float)) != 0 ||
+                haveUp != c.haveUp ||
+                (haveUp && std::memcmp(up, c.up, sizeof(c.up)) != 0) ||
+                haveTruck != c.haveTruck ||
+                (haveTruck && (std::memcmp(tf, c.tf, sizeof(c.tf)) != 0 ||
+                               std::memcmp(tu, c.tu, sizeof(c.tu)) != 0));
+            if (moved) {
+                if (k == 0) ++g_holdStats.moved;
+                float fl[3] = {tgt[0] - eye[0], tgt[1] - eye[1], tgt[2] - eye[2]};
+                float fh[3] = {c.tgt[0] - c.eye[0], c.tgt[1] - c.eye[1], c.tgt[2] - c.eye[2]};
+                if (dot3(fl, fl) > 1.0e-8f && dot3(fh, fh) > 1.0e-8f) {
+                    norm3(fl); norm3(fh);
+                    g_holdStats.maxDeg = (std::max)(g_holdStats.maxDeg, angle_deg(fl, fh));
+                }
+                const float d[3] = {eye[0] - c.eye[0], eye[1] - c.eye[1], eye[2] - c.eye[2]};
+                g_holdStats.maxCm = (std::max)(g_holdStats.maxCm, 100.0f * std::sqrt(dot3(d, d)));
+                if (haveTruck && c.haveTruck)
+                    g_holdStats.maxTruckDeg = (std::max)(
+                        g_holdStats.maxTruckDeg,
+                        (std::max)(angle_deg(tf, c.tf), angle_deg(tu, c.tu)));
+            }
+            std::memcpy(eye, c.eye, sizeof(c.eye));
+            std::memcpy(tgt, c.tgt, sizeof(c.tgt));
+            std::memcpy(up, c.up, sizeof(c.up));
+            haveUp = c.haveUp;
+            std::memcpy(tf, c.tf, sizeof(c.tf));
+            std::memcpy(tu, c.tu, sizeof(c.tu));
+            std::memcpy(tr, c.tr, sizeof(c.tr));
+            haveTruck = c.haveTruck;
+        } else if (k == 0) {
+            ++g_holdStats.unmatched;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_holdLock);
+}
+
+// THE HEAD SMOOTHING. `cab` is the point of the truck the head rides on -- the
+// game's cockpit eye with the seat offset -- and `tf`/`tu` the truck's forward
+// and up. Out come an offset for the eye (`move`) and a turn for the look
+// (`tilt` radians about `tiltAxis`): the head carried as if the seat rode on
+// springs, the truck's jolts across and up and its roll and pitch smoothed in
+// the WORLD. The truck's own shaking, and the steps of its fixed 60 Hz physics
+// against a faster render, are what get smoothed (Tim, 2026-11-02).
+//   - Never along the truck's length, and never its heading. A lag along the
+//     length is the seat pushing into your back whenever the truck speeds up and
+//     the dashboard coming at you when it brakes, and at a steady speed a
+//     standing offset: 30 cm at 30 km/h for a 40 ms smoothing. A lagging heading
+//     would trail every turn of the wheel the same way. So only the truck's UP
+//     is smoothed, and the turn is a tilt: pitch and roll, nothing about the up.
+//   - The head's own movement and turning, the eye offset and the seat offset
+//     ride on top unsmoothed. Those are you, not the truck.
+//   - The second render of a Synched Sequential pair takes the first's result,
+//     so the two eyes of one moment never differ by a step of the filter -- a
+//     vertical one would be vertical disparity.
+//   - A jump (a teleport, a truck swap, a roll-over), a gap in the cockpit
+//     builds or the slider at 0 starts over at the truck, and both lags are
+//     capped, so a hard landing cannot leave the head outside the cab or the
+//     horizon far from the truck's.
+constexpr float  kSmoothMaxLagM     = 0.12f;
+constexpr float  kSmoothJumpM       = 0.5f;
+constexpr float  kSmoothMaxTiltRad  = 0.1745f;   // 10 deg
+constexpr float  kSmoothTiltJumpRad = 0.5236f;   // 30 deg from one build to the next
+constexpr double kSmoothGapS        = 0.25;
+SRWLOCK g_smoothLock = SRWLOCK_INIT;
+struct CabSmooth {
+    bool  valid = false;
+    float delta[3] = {};      // the offset last applied: smoothed point less cab
+    float point[3] = {};      // the smoothed point, world space
+    float up[3] = {};         // the smoothed truck up, world space
+    float tiltAxis[3] = {};   // the turn last applied, from the truck's up to it
+    float tilt = 0.0f;
+    LARGE_INTEGER t{};
+} g_cabSmooth;
+// For the periodic line in viewbuild_on_present(). Under g_smoothLock.
+struct CabSmoothStats {
+    uint32_t builds = 0, restarts = 0, capped = 0, tiltCapped = 0;
+    float    maxLagM = 0.0f, maxTiltRad = 0.0f;
+} g_cabSmoothStats;
+
+void smooth_cab(const float cab[3], const float tf[3], const float tu[3], bool reuse,
+                float move[3], float tiltAxis[3], float& tilt)
+{
+    move[0] = move[1] = move[2] = 0.0f;
+    tiltAxis[0] = tiltAxis[1] = tiltAxis[2] = 0.0f;
+    tilt = 0.0f;
+    const float tau = g_headSmoothingS.load();
+    static LARGE_INTEGER freq{};
+    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+
+    AcquireSRWLockExclusive(&g_smoothLock);
+    CabSmooth& st = g_cabSmooth;
+    if (!(tau > 0.0f)) {
+        st.valid = false;
+    } else if (reuse && st.valid) {
+        for (int i = 0; i < 3; ++i) { move[i] = st.delta[i]; tiltAxis[i] = st.tiltAxis[i]; }
+        tilt = st.tilt;
+    } else {
+        // The truck's axes, square to each other: forward, its up made square
+        // to forward, and across.
+        float f[3] = {tf[0], tf[1], tf[2]};
+        norm3(f);
+        const float uf = dot3(tu, f);
+        float u[3] = {tu[0] - f[0]*uf, tu[1] - f[1]*uf, tu[2] - f[2]*uf};
+        norm3(u);
+        float r[3]; cross3(u, f, r);
+
+        // How far the cab has got from the smoothed point, across and up -- its
+        // forward part is simply dropped: the point takes the cab's -- and how
+        // far the truck's up has tilted away from the smoothed one, about what.
+        const float e[3] = {cab[0] - st.point[0], cab[1] - st.point[1], cab[2] - st.point[2]};
+        float er = dot3(e, r), eu = dot3(e, u);
+        float axis[3]; cross3(u, st.up, axis);
+        const float sinT = std::sqrt(dot3(axis, axis));
+        float lagTilt = 0.0f;
+        if (sinT > 1.0e-7f) {
+            for (int i = 0; i < 3; ++i) axis[i] /= sinT;
+            lagTilt = std::atan2(sinT, dot3(u, st.up));
+        }
+        const double dt = double(now.QuadPart - st.t.QuadPart) / double(freq.QuadPart);
+        if (!st.valid || !(dt >= 0.0) || dt > kSmoothGapS ||
+            std::sqrt(er*er + eu*eu) > kSmoothJumpM || lagTilt > kSmoothTiltJumpRad) {
+            er = eu = 0.0f;
+            lagTilt = 0.0f;
+            ++g_cabSmoothStats.restarts;
+        } else {
+            const float keep = (float)std::exp(-dt / (double)tau);
+            er *= keep; eu *= keep; lagTilt *= keep;
+            const float lag = std::sqrt(er*er + eu*eu);
+            if (lag > kSmoothMaxLagM) {
+                er *= kSmoothMaxLagM / lag; eu *= kSmoothMaxLagM / lag;
+                ++g_cabSmoothStats.capped;
+            }
+            if (lagTilt > kSmoothMaxTiltRad) {
+                lagTilt = kSmoothMaxTiltRad;
+                ++g_cabSmoothStats.tiltCapped;
+            }
+            g_cabSmoothStats.maxLagM = (std::max)(g_cabSmoothStats.maxLagM,
+                                                  (std::min)(lag, kSmoothMaxLagM));
+            g_cabSmoothStats.maxTiltRad = (std::max)(g_cabSmoothStats.maxTiltRad, lagTilt);
+        }
+        for (int i = 0; i < 3; ++i) {
+            st.delta[i] = -(r[i]*er + u[i]*eu);
+            st.point[i] = cab[i] + st.delta[i];
+            move[i] = st.delta[i];
+        }
+        // The smoothed up: the truck's, turned back toward the old smoothed one
+        // by what is left of the lag. The look gets the same turn.
+        float su[3] = {u[0], u[1], u[2]};
+        if (lagTilt > 0.0f) rot_vec(su, axis, lagTilt);
+        for (int i = 0; i < 3; ++i) {
+            st.up[i] = su[i];
+            st.tiltAxis[i] = tiltAxis[i] = lagTilt > 0.0f ? axis[i] : 0.0f;
+        }
+        st.tilt = tilt = lagTilt;
+        st.t = now;
+        st.valid = true;
+        ++g_cabSmoothStats.builds;
+    }
+    ReleaseSRWLockExclusive(&g_smoothLock);
+}
+
 void* detour_fna(void* rcx, void* rdx, void* r8, void* r9){
     void* raw_ret = _ReturnAddress();
     void* useRdx = rdx, *useR8 = r8, *useR9 = r9;
@@ -1690,7 +2002,17 @@ void* detour_fna(void* rcx, void* rdx, void* r8, void* r9){
         // Mode 6 claims the cockpit's use of this same caller and does
         // The cockpit is claimed here too, and everything is done here for it:
         // rotation, lean and the AER +-IPD/2. See the note on this builder above.
-        const bool fnaCockpit = hooks::logic_mode() >= 0.75f &&
+        //
+        // NEVER THE MENU CAMERA, which does not build the cockpit. The garage
+        // is drawn by it, and the drive camera does not tick there, so
+        // logic_mode() keeps the cockpit's last value -- and the garage opened
+        // from the cab was claimed as the cockpit: levelled against the truck
+        // frame combine2 last published, with the seat offset and the head
+        // smoothing on top. That frame is the truck as the garage opened, so a
+        // truck standing rolled or pitched tilted the whole garage under a level
+        // UI (log 2026-11-03: ~80 cockpit builds a second in the garage with the
+        // drive camera idle and logicMode 1.00).
+        const bool fnaCockpit = !isMenuCam && hooks::logic_mode() >= 0.75f &&
                                 !hooks::in_map_view();
         bool isCam = isMenuCam ||
                      (caller==g_orbitCamGame &&
@@ -1705,7 +2027,13 @@ void* detour_fna(void* rcx, void* rdx, void* r8, void* r9){
                       (unsigned long long)caller, e[0],e[1],e[2]); }
         }
         if (isCam && rdx && r8) {
-            xr::advance_aer_parity();   // first main build per frame flips the AER eye
+            // First main build per frame flips the AER eye -- or, under Synched
+            // Sequential, chooses it by the moment this camera shows.
+            const bool gameplayCam = !isMenuCam && !hooks::in_map_view();
+            xr::advance_aer_parity(camera_fingerprint(reinterpret_cast<const float*>(rdx),
+                                                      reinterpret_cast<const float*>(r8),
+                                                      reinterpret_cast<const float*>(r9)),
+                                   gameplayCam);
             xr::note_camera_active();   // lets Present detect "no camera" (menu/loading)
             static bool loggedR9=false;
             if(!loggedR9 && r9){ loggedR9=true; float* u=reinterpret_cast<float*>(r9);
@@ -1713,6 +2041,26 @@ void* detour_fna(void* rcx, void* rdx, void* r8, void* r9){
             float* eye = reinterpret_cast<float*>(rdx);
             float* tgt = reinterpret_cast<float*>(r8);
             for(int i=0;i<4;++i){ eyeL[i]=eye[i]; tgtL[i]=tgt[i]; }
+            // The game's own up and the truck frame, read up front so that
+            // Synched Sequential can hold them along with the eye and target.
+            float gameUp[3] = {0.0f, 1.0f, 0.0f};
+            bool  haveGameUp = false;
+            if (r9) {
+                const float* gu = reinterpret_cast<const float*>(r9);
+                gameUp[0] = gu[0]; gameUp[1] = gu[1]; gameUp[2] = gu[2];
+                haveGameUp = true;
+            }
+            float tf[3] = {}, tu[3] = {}, tr[3] = {};
+            bool  haveTruck = truck_frame(tf, tu, tr);
+            xr::SsBuildInfo ssb;
+            bool ssSecond = false;
+            if (xr::ss_build_info(ssb)) {
+                const int kind = isMenuCam ? 3 : !gameplayCam ? 2 : fnaCockpit ? 1 : 0;
+                ss_hold_camera(ssb, kind, eyeL, tgtL, gameUp, haveGameUp, tf, tu, tr,
+                               haveTruck);
+                ssSecond = !ssb.first;
+            }
+            const float gameEye[3] = {eyeL[0], eyeL[1], eyeL[2]};
             float fwd[3]={tgtL[0]-eyeL[0], tgtL[1]-eyeL[1], tgtL[2]-eyeL[2]};
             float dist=std::sqrt(fwd[0]*fwd[0]+fwd[1]*fwd[1]+fwd[2]*fwd[2]);
             if (dist>1e-4f){
@@ -1738,9 +2086,8 @@ void* detour_fna(void* rcx, void* rdx, void* r8, void* r9){
                 // camera up in r9 -- which already carries the truck's tilt AND
                 // the stick look -- so the cockpit takes that instead.
                 float up[3] = {0.0f, 1.0f, 0.0f};
-                if (fnaCockpit && r9) {
-                    const float* gu = reinterpret_cast<const float*>(r9);
-                    float u[3] = {gu[0], gu[1], gu[2]};
+                if (fnaCockpit && haveGameUp) {
+                    float u[3] = {gameUp[0], gameUp[1], gameUp[2]};
                     if (dot3(u, u) > 1.0e-6f) {
                         norm3(u);
                         up[0]=u[0]; up[1]=u[1]; up[2]=u[2];
@@ -1752,10 +2099,38 @@ void* detour_fna(void* rcx, void* rdx, void* r8, void* r9){
                 // rotation -- the same ordering this had at combine2, which
                 // is what the locks require. The frame comes
                 // from combine2's previous build; see truck_frame().
-                if (fnaCockpit) {
-                    float tf[3], tu[3], tr[3];
-                    if (truck_frame(tf, tu, tr))
-                        apply_truck_frame_basis(tf, tu, tr, fwd, up);
+                if (fnaCockpit && haveTruck)
+                    apply_truck_frame_basis(tf, tu, tr, fwd, up);
+
+                // THE FIRST-PERSON OFFSET moves the seat, not the view: it goes
+                // on the chassis's own axes (truck_frame()), never on the look,
+                // locked or not -- so "up" stays toward the roof with the truck
+                // on its side. Right by this file's right = cross(up, fwd). In
+                // the cab's own centimetres, NOT divided by the world scale as
+                // the lean is: the seat stays put in the cab at any scale.
+                //
+                // THE HEAD SMOOTHING (smooth_cab) rides on the seat: the truck's
+                // roll and pitch come out of the look HERE, before the head's own
+                // rotation goes in on top, and its jolts across and up come back
+                // as `ride`, added to the eye with the seat at the end.
+                float seat[3] = {0.0f, 0.0f, 0.0f}, ride[3] = {0.0f, 0.0f, 0.0f};
+                if (fnaCockpit && haveTruck) {
+                    const float ox = g_cockpitOffset[0].load();
+                    const float oy = g_cockpitOffset[1].load();
+                    const float oz = g_cockpitOffset[2].load();
+                    if (ox != 0.0f || oy != 0.0f || oz != 0.0f) {
+                        float seatRight[3]; cross3(tu, tf, seatRight); norm3(seatRight);
+                        for(int i=0;i<3;++i)
+                            seat[i] = (seatRight[i]*ox + tu[i]*oy + tf[i]*oz) * kHeadPosScale;
+                    }
+                    const float cab[3] = {gameEye[0] + seat[0], gameEye[1] + seat[1],
+                                          gameEye[2] + seat[2]};
+                    float tiltAxis[3], tilt = 0.0f;
+                    smooth_cab(cab, tf, tu, ssSecond, ride, tiltAxis, tilt);
+                    if (tilt > 0.0f) {
+                        rot_vec(fwd, tiltAxis, tilt);
+                        rot_vec(up, tiltAxis, tilt);
+                    }
                 }
                 // tF/tU/tS = head POSITION (lean), projected onto the BASE
                 // (pre-head-rotation) axes. ipdS = AER +-IPD/2, projected onto
@@ -1820,26 +2195,23 @@ void* detour_fna(void* rcx, void* rdx, void* r8, void* r9){
                     // this one stage and the projection supplying none, there is
                     // no second contributor left to cancel against.
                     //
-                    // Map/garage/menu take the opposite eye side; see
-                    // kMapEyeSign for why that one asymmetry is real while every
-                    // other per-screen sign turned out not to be.
+                    // Map/garage/menu now take the SAME eye side as gameplay;
+                    // see kMapEyeSign for why the flip they had is gone.
                     {
                         const bool mapSide = (isMenuCam || hooks::in_map_view());
                         const float mapFlip = mapSide ? kMapEyeSign : 1.0f;
                         ipdS=-mapFlip*g_sideSign.load()*xr::eye_side_offset();
-                        // TELL THE REPROJECTION WHICH SIGN CONVENTION THIS IS.
-                        // The flip is a correction for how these screens render,
-                        // not a statement about where the camera sat, so a model
-                        // built on camera geometry must not inherit it -- see
-                        // kEyeAppliedMapSign. A LEVEL FLY-IN reaches here with
-                        // mapSide true via isMenuCam -- the CALL SITE, which no
-                        // screen-gate setting affects -- while the marker gate
-                        // calls the same frame a garage and leaves the
-                        // reprojection on. That is what left the synthesized eye
-                        // on the wrong side, measured at -1.1x true disparity.
+                        // TELL THE REPROJECTION WHICH SIGN CONVENTION THIS IS --
+                        // the opposite one only while the flip is in force. A
+                        // LEVEL FLY-IN reaches here with mapSide true via
+                        // isMenuCam -- the CALL SITE, which no screen-gate
+                        // setting affects -- while the marker gate calls the
+                        // same frame a garage and leaves the reprojection on;
+                        // with a flip in force that left the synthesized eye on
+                        // the wrong side, measured at -1.1x true disparity.
                         xr::record_applied_eye_offset(
                             ipdS, xr::kEyeAppliedAsCameraMove |
-                                  (mapSide ? xr::kEyeAppliedMapSign : 0));
+                                  ((mapSide && kMapEyeSign < 0.0f) ? xr::kEyeAppliedMapSign : 0));
                     }
                 } else {
                     int mode=g_mode.load(); float ramp=(GetTickCount()%3000)/3000.0f;
@@ -1970,17 +2342,72 @@ void* detour_fna(void* rcx, void* rdx, void* r8, void* r9){
                 const float* lf = baseOk ? baseFwd   : fwd;
                 for(int i=0;i<3;++i)
                     eyeL[i] += lr[i]*tS + lu[i]*tU + lf[i]*tF + camRight[i]*ipdS;
+                // The seat and the smoothed ride, worked out with the look above.
+                for(int i=0;i<3;++i)
+                    eyeL[i] += seat[i] + ride[i];
                 for(int i=0;i<3;++i) tgtL[i]= eyeL[i]+fwd[i]*dist;
                 useRdx=eyeL; useR8=tgtL;
                 upL[0]=camUp[0]; upL[1]=camUp[1]; upL[2]=camUp[2]; upL[3]=0.0f;
                 useR9 = upL;
+                // The direction this build hands the game, for working out at
+                // Present which build an image was drawn with (the map, garage
+                // and menus show the previous one -- xr::update_on_screen()).
+                // And the position, which tells the GPU's camera apart as this
+                // build's (xr::match_built_camera) on every screen, with the eye
+                // offset in it, which takes it back to the middle of the eyes for
+                // the world markers (marker_camera.h).
+                const float eyeOff[3] = {camRight[0]*ipdS, camRight[1]*ipdS, camRight[2]*ipdS};
+                xr::note_built_camera(fwd, isMenuCam || hooks::in_map_view(), eyeL,
+                                      isMenuCam ? xr::kBuilderMenu : xr::kBuilderGame, eyeOff);
             }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
     return real_fna(rcx, useRdx, useR8, useR9);
 }
 
+// THE SMALL-OBJECT CULL -- what it is and why the headset makes it bite is in
+// camera_fov.h. bool(rcx = camera, xmm1 = 1/tan(fov/2), r8 = AABB,
+// xmm3 = threshold): four arguments in the registers their positions are given
+// under the x64 convention, so declaring the floats as floats is all it takes
+// for them to arrive and be passed on intact (the rule detour_projbuild's note
+// spells out -- an all-pointer signature would not forward them).
+//
+// Only the FOV scale is changed. The camera, the box and the threshold go
+// through as they came, so everything else the test does -- the depth, the
+// aspect, the "behind the eye, keep it" early-out -- is the game's own.
+// combine::CAMERA set-perspective, hooked only to know who called it -- see
+// t_mirrorPerspective. (rcx = camera, xmm1 = fov, xmm2 = aspect, xmm3 = near, then
+// far, a depth-direction flag and a two-float pointer on the stack.) Every
+// argument is declared so that all of them are passed on intact; rdx is unused.
+using PFN_SETPERSP = void* (*)(void*, float, float, float, float, int, const void*);
+PFN_SETPERSP real_setperspective = nullptr;
+uintptr_t g_mirrorPerspRet = 0;
+void* detour_setperspective(void* cam, float fov, float aspect, float nearZ, float farZ,
+                            int depthDir, const void* range)
+{
+    t_mirrorPerspective =
+        reinterpret_cast<uintptr_t>(_ReturnAddress()) - g_moduleBase == g_mirrorPerspRet;
+    void* ret = real_setperspective(cam, fov, aspect, nearZ, farZ, depthDir, range);
+    t_mirrorPerspective = false;
+    return ret;
+}
+
+using PFN_SIZE_CULL = bool (*)(void*, float, const float*, float);
+PFN_SIZE_CULL real_size_cull = nullptr;
+bool detour_size_cull(void* camera, float fovScale, const float* box, float threshold)
+{
+    return real_size_cull(camera, fovScale * small_object_distance(), box, threshold);
+}
+
 } // namespace
+
+void take_ss_hold_stats(SsHoldStats& out)
+{
+    AcquireSRWLockExclusive(&g_holdLock);
+    out = g_holdStats;
+    g_holdStats = SsHoldStats{};
+    ReleaseSRWLockExclusive(&g_holdLock);
+}
 
 // Read-only. Nothing writes these any more, so what they report IS the game's
 // own idea of the FOV -- worth logging beside what we actually render.
@@ -2026,9 +2453,59 @@ void set_truck_yaw_lock_enabled(bool on)
     VRLOG("TRUCK YAW LOCK -> %s", on ? "ON" : "OFF");
 }
 
+void cockpit_offset(float& right, float& up, float& forward)
+{
+    right   = g_cockpitOffset[0].load();
+    up      = g_cockpitOffset[1].load();
+    forward = g_cockpitOffset[2].load();
+}
+
+void set_cockpit_offset(float right, float up, float forward)
+{
+    const float v[3] = {right, up, forward};
+    for (int i = 0; i < 3; ++i) {
+        float m = std::isfinite(v[i]) ? v[i] : 0.0f;
+        if (m < -0.5f) m = -0.5f;
+        if (m >  0.5f) m =  0.5f;
+        g_cockpitOffset[i].store(m);
+    }
+}
+
+float head_smoothing() { return g_headSmoothingS.load(); }
+
+void set_head_smoothing(float seconds)
+{
+    float s = std::isfinite(seconds) ? seconds : 0.0f;
+    if (s < 0.0f)  s = 0.0f;
+    if (s > 0.25f) s = 0.25f;
+    g_headSmoothingS.store(s);
+}
+
 // basis rather than assuming.
 void viewbuild_on_present(){
     update_map_by_pose();
+
+    // What the head smoothing did, every 10 s while it runs (smooth_cab).
+    {
+        static ULONGLONG t0 = 0;
+        const ULONGLONG now = GetTickCount64();
+        if (!t0) t0 = now;
+        if (now - t0 >= 10000) {
+            t0 = now;
+            AcquireSRWLockExclusive(&g_smoothLock);
+            const CabSmoothStats s = g_cabSmoothStats;
+            g_cabSmoothStats = CabSmoothStats{};
+            ReleaseSRWLockExclusive(&g_smoothLock);
+            if (s.builds)
+                VRLOG("head smoothing: %.0f ms over %u cockpit builds in 10 s -- largest lag "
+                      "%.1f cm across and up (%u held at the %.0f cm cap) and %.2f deg of "
+                      "roll and pitch (%u held at %.0f deg), %u restarts at the truck (a "
+                      "jump or a gap)", g_headSmoothingS.load() * 1000.0f, s.builds,
+                      s.maxLagM * 100.0f, s.capped, kSmoothMaxLagM * 100.0f,
+                      s.maxTiltRad * 57.2957795f, s.tiltCapped, kSmoothMaxTiltRad * 57.2957795f,
+                      s.restarts);
+        }
+    }
     // Per-Present reset for the locked site's invocation counter
     // (g_projInvocation). The per-frame total it keeps only feeds the
     // once-a-second log line now that the invocation selector UI is gone.
@@ -2191,6 +2668,7 @@ bool install_viewbuild_hook(){
     g_orbitCamMenu   = ga.orbitMenuRet;
     g_settingsPtr    = ga.settingsPtr;
     g_projOverrideCaller.store(ga.projMainRet);
+    g_mirrorPerspRet = ga.mirrorPerspRet;
 
     // THE VIEW BUILDER IS NOT HOOKED unless a diagnostic that reads it is
     // compiled in. Everything its detour does is behind kBuilderCensus,
@@ -2221,6 +2699,15 @@ bool install_viewbuild_hook(){
         hook_engine_fn("combine", ga.combine1, reinterpret_cast<void*>(&detour_combine), &real_combine);
     else
         VRLOG("combine hook NOT installed -- its main-camera call site was not found");
+    // Mirrors keep the game's FOV whatever their shape. Without the call site
+    // there is nothing for it to compare against, so it is not worth a hook.
+    if (g_mirrorPerspRet)
+        hook_engine_fn("camera set-perspective", ga.setPerspective,
+                       reinterpret_cast<void*>(&detour_setperspective), &real_setperspective);
+    // Small stones and debris at a monitor's distances rather than a third of
+    // them (camera_fov.h). Without it the game's own test simply stands.
+    hook_engine_fn("small-object cull", ga.sizeCull,
+                   reinterpret_cast<void*>(&detour_size_cull), &real_size_cull);
 
     // (The scattered-prop hooks at exe+0xC06C80 / +0xC06F60 that mode 5 used
     // were removed with it -- see the note at kRotRestamp. They ran ~150 times a

@@ -27,8 +27,8 @@
 // occludes its mark.
 namespace mirrormask {
 
-// True once the mask exists and DIBR shift is on -- the whole
-// path is inert otherwise, including the duplicated draws.
+// True while the mirror draws are being marked -- the whole path is inert
+// otherwise, including the duplicated draws.
 bool active();
 
 // Bound state saved across a marking draw. The duplicate has to leave the
@@ -59,9 +59,22 @@ void clear(ID3D11DeviceContext* ctx);
 // so a mask texel is a scene pixel.
 ID3D11ShaderResourceView* srv();
 
+// The mask itself, for the stale-eye warp to keep a copy of beside each eye's
+// retained frame (xr_mirror.cpp, retain_eye_for_warp), or null -- also while the
+// marking is off, when there is nothing in it to keep.
+ID3D11Texture2D* texture();
+
+// Mirror draws marked since the last call -- 0 with mirrors in view means the
+// mirror shader is not the one the build knows (shader_cull.cpp, kCullMirror).
+uint32_t take_mark_count();
+
 // Called from the swapchain Present hook: creates or resizes the mask, and
-// releases it when DIBR shift is not the active mode.
-void update(ID3D11Device* dev, uint32_t canvasW, uint32_t canvasH, bool dibrActive);
+// releases it when nothing wants it -- DIBR shift, or the motion-vector stale-
+// eye warp, which leaves mirrors out of its per-pixel motion for the same
+// reason DIBR shift does (render/reproject.cpp). `marking` says whether the next
+// render's mirror draws go into it: separate from `wanted` so that a pause keeps
+// the texture, and coming back does not reallocate it.
+void update(ID3D11Device* dev, uint32_t canvasW, uint32_t canvasH, bool wanted, bool marking);
 
 void shutdown();
 

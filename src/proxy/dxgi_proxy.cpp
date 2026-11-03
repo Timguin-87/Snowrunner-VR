@@ -4,6 +4,9 @@
 #include "hooks/viewbuild_hook.h"
 #include "hooks/pattern_scan.h"
 #include "hooks/game_addresses.h"
+#include "hooks/frame_sync.h"
+#include "hooks/resolution_hook.h"
+#include "hooks/marker_camera.h"
 #include "common/log.h"
 
 #include <dxgi1_6.h>
@@ -107,6 +110,12 @@ static void install_hooks_on(void** ppFactory)
         // CPU-side head tracking, stereo and the FOV lock: the camera-build
         // and projection hooks, at the addresses resolved just above.
         hooks::install_viewbuild_hook();
+        // The engine's frame callbacks, for Synched Sequential's freeze.
+        hooks::install_frame_sync();
+        // The engine's own resize, for the settings menu.
+        hooks::install_live_resize();
+        // The UI's camera, for the camera-pointer world marker fix.
+        hooks::install_marker_camera();
     }
 }
 

@@ -6,6 +6,7 @@
 #include "common/crash_log.h"
 #include "common/config.h"
 #include "xr/xr_mirror.h"
+#include "render/dlss.hpp"
 
 #include <MinHook.h>
 
@@ -22,6 +23,7 @@ PFN_RtlExitUserProcess real_RtlExitUserProcess = nullptr;
 
 void NTAPI Detour_RtlExitUserProcess(LONG status)
 {
+    dlss::shutdown();   // NGX too: it holds resources on the same device
     xr::shutdown_xr();
     real_RtlExitUserProcess(status);
 }

@@ -32,10 +32,13 @@
 // mirror is a handful, so the duplicate is not free -- the pixel shader is
 // trivial and the target is R8, but the vertex work is doubled for that
 // geometry. The whole path is inert unless the 6-DoF reprojection is actually
-// running, which is the only thing that reads it.
+// running, which is the only thing that reads it -- and the marking stands down
+// wherever that reprojection does not need it: the screens it cannot run on, and
+// while the motion-vector warp's fields are arriving, since those move the truck
+// by its own measured motion instead (dibrpolicy::rigid_mask_marks()).
 namespace rigidmask {
 
-// True once the mask exists and something wants it -- the whole path is inert
+// True while the truck draws are being marked -- the whole path is inert
 // otherwise, including the duplicated draws.
 bool active();
 
@@ -68,7 +71,8 @@ void clear(ID3D11DeviceContext* ctx);
 // pixel. Null when inactive.
 ID3D11ShaderResourceView* srv();
 
-// The underlying texture, for CopyResource into a per-eye retained copy.
+// The underlying texture, for CopyResource into a per-eye retained copy. Null
+// while the marking is off: there is then nothing in it to retain.
 //
 // THE REPROJECTION NEEDS THE MASK THAT BELONGS TO THE RETAINED FRAME, not the
 // one being built now: it reprojects the other eye's previous render, and this
@@ -77,8 +81,10 @@ ID3D11ShaderResourceView* srv();
 ID3D11Texture2D* texture();
 
 // Called from the swapchain Present hook: creates or resizes the mask, and
-// releases it when nothing wants it.
-void update(ID3D11Device* dev, uint32_t canvasW, uint32_t canvasH, bool wanted);
+// releases it when nothing wants it. `marking` says whether the next render's
+// truck draws go into it. Separate from `wanted` so that a pause keeps the
+// texture, and coming back does not reallocate it.
+void update(ID3D11Device* dev, uint32_t canvasW, uint32_t canvasH, bool wanted, bool marking);
 
 void shutdown();
 

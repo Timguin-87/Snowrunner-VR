@@ -13,8 +13,12 @@ namespace {
 // --- signatures -------------------------------------------------------------
 //
 // Written from build 0x6AB52F5D (the 2026-10-21 update) and checked against a
-// dump of it: each matches exactly once. Wildcarded, because each moves on its
-// own whenever the code around it changes:
+// dump of it and of 0x6AB53420, the Microsoft Store (Game Pass) build of the same
+// version: each matches exactly once in both, or has a second form that does.
+// That build is the same source compiled differently, so nearly everything still
+// matches as it is; where the compiler went another way, a signature ending in
+// Store is the same code in its shape. Wildcarded, because each moves on its own
+// whenever the code around it changes:
 //   - call targets and RIP-relative displacements: move with every relink;
 //   - STACK OFFSETS: the frame size in sub rsp, and every [rsp+x], [rax+x] or
 //     [r11+x] that is a local, a saved XMM register or a nonvolatile parked in
@@ -39,6 +43,15 @@ namespace {
 constexpr const char* kSigCameraCommit =
     "48 8B C4 F3 0F 11 50 18 48 89 50 10 55 53 56 57 41 55 41 56 "
     "48 8D A8 ?? ?? FF FF 48 81 EC ?? ?? 00 00 0F 29 70 ?? 48 8D B1 84 01 00 00";
+// The Store build saves more registers and every XMM up front, and keeps the
+// staged eye in r14: same opening, same field, nothing shared past the push list.
+constexpr const char* kSigCameraCommitStore =
+    "48 8B C4 F3 0F 11 50 18 48 89 50 10 55 53 56 57 41 54 41 55 41 56 41 57 "
+    "48 8D A8 ?? ?? FF FF 48 81 EC ?? ?? 00 00 48 C7 85 ?? ?? 00 00 FE FF FF FF "
+    "0F 29 70 ?? 0F 29 78 ?? 44 0F 29 40 ?? 44 0F 29 88 ?? ?? FF FF "
+    "44 0F 29 90 ?? ?? FF FF 44 0F 29 98 ?? ?? FF FF 44 0F 29 A0 ?? ?? FF FF "
+    "44 0F 29 A8 ?? ?? FF FF 44 0F 29 B0 ?? ?? FF FF 44 0F 29 B8 ?? ?? FF FF "
+    "48 8B D9 4C 8D B1 84 01 00 00";
 
 // The main render camera's build (docs/cockpit_camera.md): the function that
 // calls the view builder, combine #1 and combine #2, in that order. Not hooked
@@ -81,6 +94,30 @@ constexpr const char* kSigSetPerspective =
     "48 89 5C 24 ?? 57 48 81 EC ?? ?? 00 00 0F 57 C0 48 8B F9 0F 2F C8 76 08 "
     "F3 0F 11 89 08 01 00 00 0F 2F D0 76 08 F3 0F 11 91 0C 01 00 00";
 
+// The small-object cull: bool(rcx = combine::CAMERA, xmm1 = 1/tan(fov/2),
+// r8 = AABB min.xyz max.xyz, xmm3 = threshold). Half the box diagonal times
+// xmm1 over the centre's VIEW-SPACE depth, times the camera's aspect (+0x10C)
+// where that is larger, against the threshold -- 0.0444 at all three call
+// sites. Runs through the AABB loads and the two argument moves the detour
+// relies on: xmm3 -> xmm10 (threshold), xmm1 -> xmm11 (the FOV scale).
+constexpr const char* kSigSizeCull =
+    "48 8B C4 53 48 81 EC ?? ?? 00 00 F3 41 0F 10 20 48 8D 54 24 ?? "
+    "F3 41 0F 10 50 04 0F 28 C4 0F 29 70 ?? 48 8B D9 F3 41 0F 10 70 0C "
+    "F3 0F 58 C6 0F 29 78 ?? F3 41 0F 10 78 10 F3 0F 5C F4 44 0F 29 40 ?? "
+    "F3 45 0F 10 40 14 44 0F 29 48 ?? F3 44 0F 10 0D ?? ?? ?? ?? "
+    "F3 41 0F 59 C1 44 0F 29 50 ?? 44 0F 28 D3 44 0F 29 58 ?? 44 0F 28 D9";
+
+// Where the truck mirrors' cameras are built: the one call to set-perspective in
+// the loop over a truck's mirrors, found from the call itself, ending on its E8.
+// Runs through aspect = item[+0x98] / item[+0x9C] -- each mirror's own -- and the
+// camera at item+4 going in as `this`. That aspect is why a mirror cannot be told
+// from the main view by shape: a square mirror on a square canvas is a match.
+constexpr const char* kSigMirrorCameraCall =
+    "F3 42 0F 5E 94 36 9C 00 00 00 0F 47 C1 48 8D 0D ?? ?? ?? ?? "
+    "48 89 4C 24 ?? 49 8D 4C 24 04 89 44 24 ?? 0F 28 DF 41 0F 28 C9 "
+    "F3 0F 11 74 24 ?? E8";
+constexpr int kMirrorCameraCallE8 = 47;
+
 // fillOrbitView(rcx = view, rdx = eye, r8 = target, r9 = up). Opens on
 // target - eye.
 constexpr const char* kSigFnA =
@@ -98,11 +135,133 @@ constexpr const char* kSigMenuCamera =
 constexpr const char* kSigMenuCameraCall =
     "F3 0F 11 4C 24 ?? E8 ?? ?? ?? ?? 48 8D 4F 28 E8";
 constexpr int kMenuCameraCallE8 = 6;
+// The block holding that call, as a function of its own: the Store build did not
+// inline it, so there the call sits in here and neither signature above matches.
+// Steam has this function too and never calls it, which is why it comes last.
+constexpr const char* kSigMenuViewHelper =
+    "40 53 48 81 EC ?? ?? 00 00 48 8B D9 48 BA FF FF FF FF FF FF 00 FF "
+    "48 81 C1 38 01 00 00 48 8B 01 48 23 C2";
 
-// mov rax,[settings] / movss xmm1,[rax+0x64] / movss xmm2,[rax+0x60]: the
-// game reading its own FOV pair, inside the DRIVE_CAMERA commit.
+// mov rax,[settings] / movss xmmN,[rax+0x64]: the game reading its own FOV pair,
+// in the DRIVE_CAMERA commit and the function after it. Which register, and what
+// comes next, differs between builds and between those two, so a match says
+// little on its own -- the check is that every match names one global.
 constexpr const char* kSigSettingsRead =
-    "48 8B 05 ?? ?? ?? ?? F3 0F 10 48 64 F3 0F 10 50 60";
+    "48 8B 05 ?? ?? ?? ?? F3 0F 10 ?? 64";
+
+// The DXUT-style callback table being filled -- the one place both frame
+// callbacks are named, and in this order:
+//   lea rax,[OnFrameRender]  mov [reg+18h],rax
+//   lea rax,[OnFrameMove]    mov [reg+10h],rax
+//   lea rax,[...]            mov [reg+20h],rax
+// The table is in rbx on Steam and rdi in the Store build.
+// Not a function entry: each lea's own target is, and both are checked.
+constexpr const char* kSigCallbackTable =
+    "48 8D 05 ?? ?? ?? ?? 48 89 ?? 18 48 8D 05 ?? ?? ?? ?? 48 89 ?? 10 "
+    "48 8D 05 ?? ?? ?? ?? 48 89 ?? 20";
+constexpr int kCallbackRenderLea = 0;    // lea rax,[OnFrameRender]
+constexpr int kCallbackMoveLea   = 11;   // lea rax,[OnFrameMove]
+
+// Inside OnFrameMove: movss xmmN,[1/20] / cmp dword [flag],0 / je /
+// maxss xmmN,[1/60] -- the elapsed-time clamp and the flag it hangs on. The
+// registers differ between builds. The cmp is at +9.
+constexpr const char* kSigElapsedClampFlag =
+    "F3 44 0F 10 ?? ?? ?? ?? ?? 83 3D ?? ?? ?? ?? 00 74 ?? F3";
+constexpr int kElapsedClampCmp = 9;
+
+// The settings apply dispatching on what changed. Bit 0 (the display) and bit 7
+// (the window size) each call the display apply; between them is bit 8's own
+// call. One match gives both functions: the two calls have to agree, and the
+// function they sit in is the settings apply.
+constexpr const char* kSigSettingsDispatch =
+    "A8 01 74 05 E8 ?? ?? ?? ?? 0F BA E3 08 73 05 E8 ?? ?? ?? ?? 84 DB 79 05 E8";
+constexpr int kDispatchDisplayA = 4;
+constexpr int kDispatchDisplayB = 24;
+
+// The window apply reading the settings object, from the load of its global to
+// the two fields a live resize writes: mode at +0x3C, requested size at
+// +0x28/+0x2C, where -1 means none. The offsets are the point of it -- if they
+// move, this should fail, not leave the mod writing to whatever lives there now.
+constexpr const char* kSigWindowSettings =
+    "48 8B 0D ?? ?? ?? ?? 33 DB 38 1D ?? ?? ?? ?? B8 00 00 00 10 0F 45 D8 "
+    "83 79 3C 00 0F 85 ?? ?? ?? ?? 33 C0 48 89 BC 24 ?? ?? 00 00 "
+    "48 89 45 ?? C7 45 ?? 28 00 00 00 48 89 45 ?? 48 89 45 ?? 48 89 45 ?? 48 89 45 ?? "
+    "44 8B 41 28 41 83 F8 FF 74 ?? 8B 51 2C 83 FA FF 74";
+
+// THE UI'S CAMERA, ui3D_CAMERA_MR -- by class name (rtti_vtable), because it is
+// reached only through its vtable and has no caller to be found by. Every slot
+// below is checked AT that slot, not scanned for: each reads one of the
+// combine::CAMERA fields the replacement camera in marker_camera.cpp fills in,
+// and these are what fail if the engine ever moves one.
+constexpr const char* kUiCameraClass = ".?AVui3D_CAMERA_MR@@";
+// Update: the camera pointer at +0x18 = the getter's answer.
+constexpr int kUiCamSlotUpdate = 1;
+constexpr const char* kSigUiCamUpdate =
+    "40 53 48 83 EC ?? 48 8B D9 E8 ?? ?? ?? ?? 48 89 43 18 48 83 C4 ?? 5B C3";
+constexpr int kUiCamUpdateE8 = 9;
+// The getter: the active camera, (*global)->+0x10. Update is its only caller.
+constexpr const char* kSigUiCamGetter =
+    "48 83 EC ?? E8 ?? ?? ?? ?? 48 8B 00 48 8B 40 10 48 83 C4 ?? C3";
+// The eye: viewInv at +0x80, inverted on demand while its first dword is -1,
+// row 3 (+0xB0) the position.
+constexpr int kUiCamSlotPosition = 4;
+constexpr const char* kSigUiCamPosition =
+    "48 89 5C 24 ?? 57 48 83 EC ?? 48 8B 59 18 48 8B FA 48 85 DB 74 ?? "
+    "48 8D 8B 80 00 00 00 83 39 FF 75 ?? 4C 8B C3 33 D2 E8 ?? ?? ?? ?? "
+    "F3 0F 10 8B B8 00 00 00 F3 0F 10 83 B4 00 00 00 8B 83 B0 00 00 00";
+// World to view, through the view at the camera itself (+0x00).
+constexpr int kUiCamSlotToView = 9;
+constexpr const char* kSigUiCamToView =
+    "40 53 48 83 EC ?? 49 8B D8 4C 8B 41 18 4D 85 C0 74 ?? F3 0F 10 02 48 8D 4C 24 ?? "
+    "F3 0F 10 4A 04 F3 0F 11 44 24 ?? F3 0F 10 42 08 48 8D 54 24 ?? "
+    "F3 0F 11 44 24 ?? F3 0F 11 4C 24 ?? E8";
+// View to world, through viewInv.
+constexpr int kUiCamSlotToWorld = 10;
+constexpr const char* kSigUiCamToWorld =
+    "48 89 74 24 ?? 57 48 83 EC ?? 49 8B F8 48 8B F2 4C 8B 41 18 4D 85 C0 74 ?? "
+    "48 89 5C 24 ?? 49 8D 98 80 00 00 00 83 3B FF";
+// View to NDC, through the projection at +0x40: where a 2D marker lands.
+constexpr int kUiCamSlotToNdc = 11;
+constexpr const char* kSigUiCamToNdc =
+    "40 53 48 83 EC ?? 49 8B D8 4C 8B 41 18 4D 85 C0 74 ?? F3 0F 10 02 48 8D 4C 24 ?? "
+    "F3 0F 10 4A 04 49 83 C0 40";
+// The view and its inverse, copied out -- Scaleform's 3D markers take the view.
+constexpr int kUiCamSlotView = 12;
+constexpr const char* kSigUiCamView =
+    "40 53 48 83 EC ?? 48 8B DA 48 8B 51 18 48 85 D2 74 ?? 48 8D 4C 24 ?? E8";
+constexpr int kUiCamSlotViewInv = 13;
+constexpr const char* kSigUiCamViewInv =
+    "40 57 48 83 EC ?? 4C 8B 41 18 48 8B FA 4D 85 C0 74 ?? 48 89 5C 24 ?? "
+    "49 8D 98 80 00 00 00 83 3B FF";
+// 1/aspect (+0x10C), near and far (min and max of +0x110/+0x114) and the FOV
+// (+0x108, in degrees): the 3D markers' perspective is built from these.
+constexpr int kUiCamSlotInvAspect = 14;
+constexpr const char* kSigUiCamInvAspect =
+    "48 8B 41 18 48 85 C0 74 ?? F3 0F 10 05 ?? ?? ?? ?? F3 0F 5E 80 0C 01 00 00 C3";
+constexpr int kUiCamSlotNear = 15;
+constexpr const char* kSigUiCamNear =
+    "48 8B 41 18 48 85 C0 74 ?? F3 0F 10 80 14 01 00 00 F3 0F 5D 80 10 01 00 00 C3";
+constexpr int kUiCamSlotFar = 16;
+constexpr const char* kSigUiCamFar =
+    "48 8B 41 18 48 85 C0 74 ?? F3 0F 10 80 14 01 00 00 F3 0F 5F 80 10 01 00 00 C3";
+constexpr int kUiCamSlotFov = 17;
+constexpr const char* kSigUiCamFov =
+    "48 8B 41 18 48 85 C0 74 ?? F3 0F 10 80 08 01 00 00 F3 0F 59 05 ?? ?? ?? ?? C3";
+
+struct SlotCheck { int slot; const char* sig; const char* reads; };
+constexpr SlotCheck kUiCameraSlots[] = {
+    {kUiCamSlotUpdate,    kSigUiCamUpdate,    "the camera pointer at +0x18"},
+    {kUiCamSlotPosition,  kSigUiCamPosition,  "viewInv at +0x80"},
+    {kUiCamSlotToView,    kSigUiCamToView,    "the view at +0x00"},
+    {kUiCamSlotToWorld,   kSigUiCamToWorld,   "viewInv at +0x80"},
+    {kUiCamSlotToNdc,     kSigUiCamToNdc,     "the projection at +0x40"},
+    {kUiCamSlotView,      kSigUiCamView,      "the view at +0x00"},
+    {kUiCamSlotViewInv,   kSigUiCamViewInv,   "viewInv at +0x80"},
+    {kUiCamSlotInvAspect, kSigUiCamInvAspect, "the aspect at +0x10C"},
+    {kUiCamSlotNear,      kSigUiCamNear,      "near/far at +0x110"},
+    {kUiCamSlotFar,       kSigUiCamFar,       "near/far at +0x110"},
+    {kUiCamSlotFov,       kSigUiCamFov,       "the FOV at +0x108"},
+};
 
 // --- resolution ---------------------------------------------------------------
 
@@ -138,11 +297,13 @@ uintptr_t report(const char* name, uintptr_t rva, const char* how)
 
 // A function by its signature: exactly one match, and that match a function
 // entry. Two matches is a failure, not "take the first": it means the
-// signature no longer says which one it meant.
-uintptr_t by_signature(const char* name, const char* sig)
+// signature no longer says which one it meant. `storeSig`, where there is one,
+// is tried only when `sig` matches nowhere at all.
+uintptr_t by_signature(const char* name, const char* sig, const char* storeSig = nullptr)
 {
     uint8_t* hit = nullptr;
-    const int n = pattern_scan_all(g_exe, sig, &hit, 1);
+    int n = pattern_scan_all(g_exe, sig, &hit, 1);
+    if (n == 0 && storeSig) n = pattern_scan_all(g_exe, storeSig, &hit, 1);
     if (n != 1) {
         VRLOG("  %-22s NOT FOUND -- signature matches %d place(s)%s", name, n,
               n > 1 ? "; ambiguous, so none is used" : "");
@@ -316,12 +477,14 @@ void resolve()
           "calls it or by the name it looks up, never by a remembered offset:",
           exe_timestamp());
 
-    a.cameraCommit = report("camera commit", by_signature("camera commit", kSigCameraCommit), "signature");
+    a.cameraCommit = report("camera commit", by_signature("camera commit", kSigCameraCommit,
+                                                          kSigCameraCommitStore), "signature");
     a.viewBuilder  = report("view builder", by_signature("view builder", kSigViewBuilder), "signature");
     a.combine1     = report("combine1", by_signature("combine1", kSigCombine1), "signature");
     a.combine2     = report("combine2", by_signature("combine2", kSigCombine2), "signature");
     a.projBuild    = report("projection builder", by_signature("projection builder", kSigProjBuild), "signature");
     a.fna          = report("fna (orbit view)", by_signature("fna (orbit view)", kSigFnA), "signature");
+    a.sizeCull     = report("small-object cull", by_signature("small-object cull", kSigSizeCull), "signature");
 
     // The main camera build, two independent ways. Both answers must agree
     // when both exist; either alone is enough.
@@ -369,6 +532,13 @@ void resolve()
                 how = "call-site signature";
             }
         }
+        if (!ret && a.fna) {
+            // The Store build: its one call to fillOrbitView is the menu view,
+            // whichever of the two paths into the menu camera got there.
+            ret = unique_call("fna <- menu view helper",
+                              by_signature("menu view helper", kSigMenuViewHelper), a.fna);
+            how = "call in menu view helper";
+        }
         a.orbitMenuRet = report("fna <- main menu", ret, how);
         if (!ret) VRLOG("  %-22s NOT FOUND", "fna <- main menu");
     }
@@ -377,25 +547,155 @@ void resolve()
         const uintptr_t setPersp = by_signature("camera set-perspective", kSigSetPerspective);
         a.projMainRet = report("projection <- main", unique_call("projection <- main", setPersp, a.projBuild),
                                "call in camera set-perspective");
+
+        // The E8 at the end of the signature has to be a call to set-perspective,
+        // and the only one in that function.
+        a.setPerspective = setPersp;
+        uintptr_t mirror = 0;
+        uint8_t* hit = nullptr;
+        const int n = pattern_scan_all(g_exe, kSigMirrorCameraCall, &hit, 1);
+        if (n == 1 && setPersp &&
+            rva_of(rel32_target(hit + kMirrorCameraCallE8, 1, 5)) == setPersp)
+            mirror = unique_call("perspective <- mirror", owner_of(hit), setPersp);
+        a.mirrorPerspRet = report("perspective <- mirror", mirror, "call in mirror cameras");
+        if (!mirror)
+            VRLOG("  %-22s NOT FOUND -- signature matches %d place(s); mirrors are "
+                  "told apart by shape alone, so a square one gets the headset's FOV",
+                  "perspective <- mirror", n);
     }
 
     {
         // A RIP-relative load: the global is the instruction's own target, and
         // it has to land in a writable, non-executable section to be data.
-        uintptr_t g = 0;
-        uint8_t* hit = nullptr;
-        const int n = pattern_scan_all(g_exe, kSigSettingsRead, &hit, 1);
-        if (n == 1) {
-            uint8_t* tgt = rel32_target(hit, 3, 7);
-            MEMORY_BASIC_INFORMATION mbi{};
-            if (VirtualQuery(tgt, &mbi, sizeof(mbi)) && mbi.AllocationBase == g_exe &&
-                (mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY)))
-                g = rva_of(tgt);
+        // Two matches in each build known, and all of them must name it.
+        constexpr int kCap = 8;
+        uint8_t* hits[kCap] = {};
+        const int n = pattern_scan_all(g_exe, kSigSettingsRead, hits, kCap);
+        uint8_t* tgt = nullptr;
+        bool agree = n >= 1 && n <= kCap;
+        for (int i = 0; agree && i < n; ++i) {
+            uint8_t* t = rel32_target(hits[i], 3, 7);
+            agree = !tgt || t == tgt;
+            tgt = t;
         }
+        const uintptr_t g = agree && exe_data(tgt) ? rva_of(tgt) : 0;
         a.settingsPtr = report("settings global", g, "load in camera commit");
         if (!g)
             VRLOG("  %-22s NOT FOUND -- read signature matches %d place(s)%s",
-                  "settings global", n, n == 1 ? ", but not a load from writable data" : "");
+                  "settings global", n, agree ? ", but not a load from writable data"
+                                              : ", which do not name one global");
+    }
+
+    {
+        // Both callbacks out of one match of the table being filled, each
+        // accepted only as a function entry.
+        uintptr_t fm = 0, fr = 0;
+        uint8_t* hit = nullptr;
+        const int n = pattern_scan_all(g_exe, kSigCallbackTable, &hit, 1);
+        if (n == 1) {
+            uint8_t* r = rel32_target(hit + kCallbackRenderLea, 3, 7);
+            uint8_t* m = rel32_target(hit + kCallbackMoveLea, 3, 7);
+            if (is_function_entry(r) && is_function_entry(m)) {
+                fr = rva_of(r);
+                fm = rva_of(m);
+            }
+        }
+        a.frameMove   = report("OnFrameMove", fm, "callback table");
+        a.frameRender = report("OnFrameRender", fr, "callback table");
+        if (!fm || !fr)
+            VRLOG("  %-22s NOT FOUND -- table signature matches %d place(s)%s",
+                  "frame callbacks", n, n == 1 ? ", but not at function entries" : "");
+    }
+
+    {
+        uintptr_t g = 0;
+        uint8_t* hit = nullptr;
+        const int n = pattern_scan_all(g_exe, kSigElapsedClampFlag, &hit, 1);
+        if (n == 1) {
+            uint8_t* tgt = rel32_target(hit + kElapsedClampCmp, 2, 7);
+            if (exe_data(tgt) && !(reinterpret_cast<uintptr_t>(tgt) & 3))
+                g = rva_of(tgt);
+        }
+        a.elapsedClampFlag = report("elapsed clamp flag", g, "compare in OnFrameMove");
+        if (!g)
+            VRLOG("  %-22s NOT FOUND -- signature matches %d place(s)", "elapsed clamp flag", n);
+    }
+
+    {
+        // The settings apply has to be entered from OnFrameMove and from nowhere
+        // else, and the display apply only from it: that is the guard against
+        // resizing during a load, which would deadlock (game_addresses.h).
+        uintptr_t settings = 0, display = 0;
+        uint8_t* hit = nullptr;
+        const int n = pattern_scan_all(g_exe, kSigSettingsDispatch, &hit, 1);
+        if (n == 1 && a.frameMove) {
+            uint8_t* da = rel32_target(hit + kDispatchDisplayA, 1, 5);
+            uint8_t* db = rel32_target(hit + kDispatchDisplayB, 1, 5);
+            const uintptr_t owner = owner_of(hit);
+            const std::vector<uint8_t*> in = find_calls_to(g_exe, g_base + owner);
+            bool onlyHere = owner && da == db && is_function_entry(da) && in.size() == 1 &&
+                            owner_of(in[0]) == a.frameMove;
+            for (uint8_t* site : find_calls_to(g_exe, da))
+                onlyHere = onlyHere && owner_of(site) == owner;
+            if (onlyHere) {
+                settings = owner;
+                display  = rva_of(da);
+            }
+        }
+        a.settingsApply = report("settings apply", settings, "dispatch, called by OnFrameMove");
+        a.displayApply  = report("display apply", display, "dispatch in settings apply");
+        if (!settings)
+            VRLOG("  %-22s NOT FOUND -- signature matches %d place(s); a resolution or "
+                  "DLSS change waits for a restart", "settings apply", n);
+
+        // Read from the window apply, which the display apply has to call.
+        uintptr_t cfg = 0;
+        uint8_t* read = nullptr;
+        const int m = pattern_scan_all(g_exe, kSigWindowSettings, &read, 1);
+        if (m == 1 && display && calls_from(display, owner_of(read)).size() == 1) {
+            uint8_t* tgt = rel32_target(read, 3, 7);
+            if (exe_data(tgt)) cfg = rva_of(tgt);
+        }
+        a.windowSettings = report("window settings", cfg, "load in window apply");
+        if (!cfg)
+            VRLOG("  %-22s NOT FOUND -- signature matches %d place(s)", "window settings", m);
+    }
+
+    {
+        // Through the class's vtable, and accepted only when every slot the
+        // replacement camera has to satisfy still reads the field it did, and
+        // the getter Update calls has no other caller -- so the pointer it sets
+        // is the UI's alone, and replacing it touches nothing but the UI.
+        uintptr_t upd = 0;
+        const char* why = nullptr;
+        char reason[96];
+        void** vt = rtti_vtable(g_exe, kUiCameraClass, &why);
+        if (vt) {
+            for (const SlotCheck& c : kUiCameraSlots) {
+                if (!pattern_matches_at(vt[c.slot], c.sig)) {
+                    snprintf(reason, sizeof(reason), "vtable slot %d no longer reads %s",
+                             c.slot, c.reads);
+                    why = reason;
+                    break;
+                }
+            }
+        }
+        if (vt && !why) {
+            uint8_t* u = static_cast<uint8_t*>(vt[kUiCamSlotUpdate]);
+            uint8_t* getter = rel32_target(u + kUiCamUpdateE8, 1, 5);
+            if (!is_function_entry(u))
+                why = "Update is not a function entry";
+            else if (!pattern_matches_at(getter, kSigUiCamGetter))
+                why = "Update no longer reads the active camera";
+            else if (find_calls_to(g_exe, getter).size() != 1)
+                why = "the active-camera read has callers besides Update";
+            else
+                upd = rva_of(u);
+        }
+        a.uiCameraUpdate = report("ui camera update", upd, "class ui3D_CAMERA_MR, vtable slot 1");
+        if (!upd)
+            VRLOG("  %-22s NOT FOUND -- %s; the camera-pointer world marker fix stays off",
+                  "ui camera update", why ? why : "unknown");
     }
 
     report_globals("XInputGetState ptrs", "XInputGetState", a.xinputGetState,
@@ -407,9 +707,10 @@ void resolve()
         VRLOG("game addresses: all %d found", g_wanted);
     else
         VRLOG("game addresses: %d of %d found -- whatever needs the missing ones stays "
-              "OFF. This game build is newer than the mod's signatures: set "
-              "DumpGameCode=true in Snowrunner_VR_config.txt, run once, and update them "
-              "from the dump.", g_found, g_wanted);
+              "OFF. The mod's signatures do not cover this game build (a newer patch, "
+              "or another store's build of the game): set DumpGameCode=true in "
+              "Snowrunner_VR_config.txt, run once, and update them from the "
+              "snowrunner_image_*.bin it writes beside dxgi.dll.", g_found, g_wanted);
 }
 
 } // namespace

@@ -42,10 +42,15 @@ bool menu_wants_quad(uint32_t& outW, uint32_t& outH);
 
 // The settings panel's own current pixel rect within the full desktop-sized
 // draw data (captured from ImGui::GetWindowPos()/GetWindowSize() in
-// draw_settings_window()) -- lets the quad layer crop to just the panel
-// instead of submitting a mostly-empty, desktop-window-sized texture. Only
+// draw_settings_window()) -- the quad layer centres the panel by it. Only
 // meaningful when menu_wants_quad() is true.
 bool menu_panel_rect(int& x, int& y, int& w, int& h);
+
+// Everything the menu drew this frame: the panel plus any tooltip, popup or
+// open combo list, which are windows of their own and can reach past it. The
+// quad layer crops to this instead of submitting a mostly-empty,
+// desktop-window-sized texture.
+bool menu_drawn_rect(int& x, int& y, int& w, int& h);
 
 // Renders this Present's already-built draw data (see menu_hook_update())
 // into an arbitrary render target -- e.g. an XR swapchain image wrapped in
@@ -74,14 +79,14 @@ void     set_menu_toggle_gamepad_combo(uint32_t xinputButtonMask);
 float mod_ui_scale();
 void  set_mod_ui_scale(float scale);
 
-// Width of the settings panel's quad in the headset, in metres: a fixed width
-// at 100% times the UI size the panel was built at, so the slider makes the
-// whole panel bigger in the headset. Its height follows the panel's aspect.
-float menu_quad_width_m();
+// The size of one panel pixel in the headset, in metres, a metre away. Fixed:
+// a bigger window is a bigger quad, and the UI size slider -- which scales the
+// pixels -- makes the whole panel bigger in the headset.
+float menu_quad_metres_per_px();
 
-// The tallest that quad can be and still be seen whole -- it is head-locked --
-// from the field of view the XR side submits; 0 = unknown. The panel scrolls
-// rather than grow past it.
-void  set_menu_quad_max_height_m(float m);
+// The widest and tallest that quad can be and still be seen whole -- it is
+// head-locked -- from the field of view; 0 = unknown. The window cannot be
+// dragged past them, and scrolls instead.
+void  set_menu_quad_max_size_m(float w, float h);
 
 } // namespace hooks

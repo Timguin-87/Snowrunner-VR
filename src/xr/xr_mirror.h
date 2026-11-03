@@ -20,8 +20,9 @@ namespace xr {
 
 // Head pose relative to the recenter origin, consumed by the camera hook.
 // Angles in radians; position offset in metres in the recentered head frame
-// (x = right, y = up, z = backward, per OpenXR). `valid` is false until the
-// first successful locate.
+// (x = right, y = up, z = backward, per OpenXR), divided by world_scale() -- the
+// camera's travel, not the head's. `valid` is false until the first successful
+// locate.
 struct HeadLook {
     bool  valid = false;
     float yaw = 0, pitch = 0, roll = 0;
@@ -37,13 +38,44 @@ HeadLook head_look();
 // alternate frame renders one eye. 0 until stereo is up.
 float eye_side_offset();
 
-// THE RENDER PATH IS ALWAYS AER -- one XR frame per Present, one eye genuinely
-// rendered, the other supplied. There is no render-method selector any more:
-// "Double AER" was measured to be identical to it and is gone, and the frame
-// warp that used to sit beside them as a third mode is the DIBR SHIFT option
-// below, because it was never a different way of driving XR -- only a different
-// way of producing the eye that was not rendered. The two settings that remain
-// are independent and compose.
+// WORLD SCALE: how big the world looks, 1 = life size, clamped to [0.5, 2].
+// Every 3D view is rendered with the runtime's IPD divided by this, and with the
+// head's travel divided by it (head_look()), so 2 renders the eyes half as far
+// apart, moves the camera half as far as the head, and the world reads twice
+// the size. Turning stays one to one, and the declared eye poses stay the
+// runtime's own.
+float world_scale();
+void  set_world_scale(float scale);
+
+// THE RENDER METHOD. Both render one eye per game frame and run one XR frame
+// per Present; they differ in which MOMENT each eye shows.
+//
+//   ALTERNATE EYE (AER)  every frame is a new moment, for one eye; the other
+//                        eye is supplied -- warped forward, or reprojected by
+//                        depth (the two options below, which compose).
+//   SYNCHED SEQUENTIAL   the game's time is frozen on every second frame
+//                        (hooks/frame_sync.h), so frames come in pairs that
+//                        render the SAME moment, one per eye. Both eyes are
+//                        real renders of one instant, submitted together; the
+//                        world moves on once per pair, and the runtime's own
+//                        reprojection fills the display rate in between.
+//
+// "Double AER", removed 2026-08-24, also paired frames -- two DIFFERENT
+// moments -- and bought nothing; the freeze is what makes a pair one instant.
+enum RenderMethod { kRenderAER = 0, kRenderSynchedSequential = 1 };
+int  render_method();
+void set_render_method(int method);   // refuses Synched Sequential if unavailable
+bool synched_sequential_available();  // the frame callbacks were found and hooked
+const char* render_method_key(int method);                 // config spelling
+bool render_method_from_key(const char* key, int& method);
+
+// The stale-eye warp and DIBR shift below are AER's: they supply the eye that
+// was not rendered, and under Synched Sequential every eye is rendered.
+// Their SETTINGS are kept as they are while Synched Sequential runs (the menu
+// hides them, the config keeps them); everything that would otherwise act on
+// them asks these instead, which are false whenever it is in effect.
+bool dibr_shift_active();
+bool warp_active();
 
 // STALE EYE WARP. Bring the un-rendered eye's own last real render to the
 // current instant instead of resubmitting it unchanged. On by default; this is
@@ -64,6 +96,11 @@ void set_warp_enabled(bool on);
 //   2  headset + game 6-DoF    that, plus a depth reprojection by the camera's
 //                              translation. Supersedes the homography wherever
 //                              it lands, so level 1 is what fills the rest.
+//   3  ... + motion vectors    that, with every pixel moved by the motion the
+//                              GAME measured for it (render/motion_field.hpp)
+//                              instead of the rigid-truck mask. Needs the
+//                              game's TAA on; a frame without a field falls
+//                              back to level 2 exactly.
 //
 // set_warp_type() clamps out of range to 0 and logs. warp_type_key()/_from_key()
 // are stable config tokens ("Headset"/"GameRotation"/"Game6Dof"), separate from
@@ -72,7 +109,7 @@ void set_warp_enabled(bool on);
 // Which pixels the 6-DoF level treats as rigid with the camera is decided by
 // render/rigid_mask.hpp -- a coverage mask of the truck's own shaders, not a
 // tunable. There is nothing to configure there.
-constexpr int kWarpTypeCount = 3;
+constexpr int kWarpTypeCount = 4;
 int  warp_type();
 void set_warp_type(int type);
 
@@ -83,6 +120,7 @@ void set_warp_type(int type);
 // to be provisioned for it).
 bool warp_uses_game_rot();
 bool warp_uses_6dof();
+bool warp_uses_motion();   // level 3: the game's motion vectors move the pixels
 const char* warp_type_key(int type);                        // nullptr if out of range
 bool warp_type_from_key(const char* key, int& outType);     // case-insensitive
 
@@ -104,10 +142,10 @@ void warp_source_stats(WarpSourceStats& out);
 
 
 // DIBR SHIFT. Reproject the rendered eye into the other one using scene depth,
-// rather than leaving that eye entirely to the stale-eye warp. Off by default:
-// it is the sole consumer of depth_probe's scene-depth capture, so that whole
-// pipeline (a full-res R32_FLOAT texture plus up to kCaptureTail compute
-// dispatches every frame) gates on this rather than running for everyone.
+// rather than leaving that eye entirely to the stale-eye warp. Off by default.
+// It shares depth_probe's scene-depth capture with the 6-DoF warps: full-res
+// R32_FLOAT textures plus one compute dispatch per scene pass, every frame, so
+// that pipeline gates on either of them being in use.
 //
 // The two settings compose rather than exclude: the shift lands where it has
 // depth and a source, and the stale-eye warp fills every pixel it could not
@@ -115,32 +153,36 @@ void warp_source_stats(WarpSourceStats& out);
 bool dibr_shift_enabled();
 void set_dibr_shift_enabled(bool on);
 
-// Map/garage screen: how much composited_fov_scale() shrinks the compositor
-// window (and, in lockstep, the game's own render FOV) while hooks::in_map_view()
-// is true. 1.0 = no shrink, smaller = smaller render plane. Config-file / UI
-// tunable; clamped to [0.05, 1.0].
 // BASE render size, 0.30 - 1.00. Shrinks the compositor window and the game's
 // own render FOV together, so a lower value renders less scene into fewer
-// pixels with no stretch. Everything downstream re-derives from it, and
-// map_window_shrink() below is a percentage OF this -- not of the headset's
-// native FOV -- so the two compose instead of competing.
+// pixels with no stretch. Everything downstream re-derives from it, the map
+// included.
 float render_fov_scale();
 void  set_render_fov_scale(float s);
 
-float map_window_shrink();
-void  set_map_window_shrink(float v);
+// The 3D map's UI as a share of the rendered view, about the same centre: 1.0
+// covers all of it, smaller shows the game's UI on a smaller quad. The world
+// markers stay on their map features at any value (they are placed for the quad
+// as submitted); features outside the smaller quad lose their icons. Without
+// the marker camera (hooks::marker_camera_available()) the map's render and
+// window shrink to this size instead, with the UI over all of it. No effect on
+// a 2D map. Clamped to [0.2, 1.0].
+float map_ui_scale();
+void  set_map_ui_scale(float v);
 
-// Vertical recenter (radians), applied as a pose pitch at composition-layer
-// submission -- see g_vertOffset in xr_mirror.cpp. Config-file / UI tunable,
-// clamped to [-0.5, 0.5].
+// Vertical recenter (radians): a tilt of the whole eye, applied to the game's
+// camera and the submitted pose together -- see g_vertOffset in xr_mirror.cpp.
+// Config-file / UI tunable, clamped to [-0.5, 0.5].
 float vertical_recenter();
 void  set_vertical_recenter(float radians);
 
 // The headset's OWN vertical offset, radians, negative = the display is centred
 // below the optical axis. Read from the runtime's per-eye angleUp/angleDown and
-// applied automatically at submission, in addition to vertical_recenter(). 0
-// until the runtime has reported a frustum. For the settings UI, so the manual
-// slider can be read as what it adds rather than as the whole correction.
+// applied automatically as the same kind of tilt, in addition to
+// vertical_recenter() -- except under off-centre projection, whose render
+// already covers it. 0 until the runtime has reported a frustum. For the
+// settings UI, so the manual slider can be read as what it adds rather than as
+// the whole correction.
 float fov_center_pitch();
 
 
@@ -151,12 +193,11 @@ float fov_center_pitch();
 // where that quad goes.
 //
 // The MAP ignores the mode and size controls: it is forced head-locked at the
-// render's own angular size, which is the only placement where a screen-space
-// marker still lands on the map feature it belongs to. It DOES follow the
-// distance -- hung on the eye its capture came from, so that eye stays exact
-// whatever the distance is, and the distance sets the depth the other eye sees
-// it at. Its apparent size is unaffected: the map plane's size is derived from
-// the distance to hold the rendered view's subtense exactly.
+// render's own angular size times map_ui_scale(), about the render's centre.
+// It DOES follow the distance -- hung on the eye its capture came from, and the
+// distance sets the depth the eyes see it at. Its apparent size is unaffected:
+// the map plane's size is derived from the distance to hold that share of the
+// rendered view's subtense exactly.
 //
 // Size and distance are both in METRES and both real: the plane behaves like a
 // physical board, so moving it further away makes it look smaller. Apparent
@@ -186,6 +227,32 @@ void  set_ui_plane_distance(float metres);
 // A world-pinned plane is moved ONLY by request_recenter() -- the explicit
 // one. A camera-mode change or a truck swap leaves it exactly where it is.
 
+// THE PLANE AS A GAME CAMERA SEES IT, for the world markers
+// (hooks/marker_camera.h). `eye`/`fwd`: a camera's position and forward axis in
+// the game's world, as its view matrix has them. The camera is matched to the
+// build it came from, and the answer is where the UI quad sits relative to the
+// middle of that build's two eyes, in the game camera's axes (x right, y up,
+// z forward), in metres: the quad's centre, its unit right and up axes, the
+// unit normal pointing away from the eyes into it, and its size. Pinned or
+// head-locked, whichever the last submitted quad was. `origin` is that middle
+// point in the game, as an offset from `eye` in the game's world axes -- the
+// build's eye offset, taken back off.
+//
+// False whenever there is no such plane to describe: no session, a 2D screen,
+// no quad submitted yet, or a camera that matches no recent build.
+struct UiPlaneInCamera {
+    float center[3] = {}, right[3] = {}, up[3] = {}, normal[3] = {};
+    float origin[3] = {};
+    float width = 0.0f, height = 0.0f;
+    // For the log: which build and eye it was matched to, how far off, and
+    // whether the quad was pinned.
+    uint32_t build = 0;
+    int      eye = 0;
+    float    matchM = 0.0f;
+    bool     pinned = false;
+};
+bool ui_plane_in_camera(const float eye[3], const float fwd[3], UiPlaneInCamera& out);
+
 
 // Aspect-preserving variant: scales origW x origH by the same factor on both
 // axes (no squash from forcing square).
@@ -199,15 +266,106 @@ bool  desired_render_size_for(uint32_t origW, uint32_t origH, uint32_t& outW, ui
 bool  native_eye_size(uint32_t& w, uint32_t& h);
 
 // The game's real backbuffer size, i.e. the pixel space viewports are
-// expressed in -- what is actually being rendered, not what the (currently
-// disabled) resolution-forcing experiment would ask for. False before the
-// first Present.
+// expressed in -- what is actually being rendered. False before the first
+// Present. Not always the headset image size: see upscale_canvas().
 bool  render_canvas_wh(uint32_t& w, uint32_t& h);
+
+// DLSS UPSCALING (render/dlss.hpp): true when the eye images are LARGER than
+// the game's frame -- the session was started with an upscaling mode, so the
+// game renders at that mode's size and DLSS brings each eye up to w x h, the
+// size the eye swapchains were created at. Fixed for the session. While it
+// holds, DIBR shift is off: it reprojects the game's frame by its depth into
+// the other eye, both on one pixel grid, and the eye images are on another.
+bool  upscale_canvas(uint32_t& w, uint32_t& h);
 
 // Called by the camera hooks at the start of the main-camera build; the first
 // call per frame advances the AER eye parity (keeps offset + routing in lockstep).
-void  advance_aer_parity();
+//
+// Under Synched Sequential the first call per frame CHOOSES the eye instead of
+// flipping it: the first render of a moment is the left eye, its frozen repeat
+// the right. `cameraFingerprint` is a hash of the game's own camera input for
+// this build, taken before any of ours is applied; a change marks the first
+// render of a new moment, which is how the render lag (0 on the menus, 1
+// in-game) is learned. 0 = no fingerprint from this site. `gameplayCamera`: the
+// in-game drive camera (cockpit or orbit), where the camera's own stick motion
+// says nothing about the lag -- see ss_choose_eye().
+void  advance_aer_parity(uint64_t cameraFingerprint = 0, bool gameplayCamera = false);
 
+// The frame being built under Synched Sequential: its build number (one per
+// frame, counted as the camera builds that turn the frame over), the moment it
+// shows and whether it is the first render of that moment. False when Synched
+// Sequential is not in effect. For the camera hooks, after advance_aer_parity().
+struct SsBuildInfo {
+    uint32_t build  = 0;
+    uint32_t moment = 0;
+    bool     first  = false;
+};
+bool ss_build_info(SsBuildInfo& out);
+
+// The main camera build's final camera direction (after our head rotation),
+// and whether it is a map / garage / menu camera. Each build leaves a record;
+// every Present works out which build its image was actually drawn with -- the
+// latest in gameplay, the one before on those screens (measured) -- and routes
+// and declares that image by that build. See update_on_screen().
+// `eye`: the camera POSITION it handed the game, after the head and eye
+// offsets -- what identifies the GPU camera as this build (match_built_camera).
+// `builder`: which of the game's camera builders it came from (CameraBuilder).
+// `eyeOffset`: the eye offset inside `eye`, in the game's world axes -- `eye`
+// less it is the middle of the two eyes, where the world markers are projected
+// from (ui_plane_in_camera).
+enum CameraBuilder : int { kBuilderUnknown = 0, kBuilderGame = 1, kBuilderMenu = 2 };
+void note_built_camera(const float fwd[3], bool previousBuildScreen,
+                       const float eye[3] = nullptr, int builder = kBuilderUnknown,
+                       const float eyeOffset[3] = nullptr);
+
+// THE SCREEN, FROM THE CAMERA ON IT: which camera builder made the camera of
+// the image at the latest Present -- kBuilderMenu on the main menu and the
+// garage and map opened from it, kBuilderGame in gameplay and on the garage,
+// map and pause menu reached from a drive; kBuilderUnknown when the image's
+// build is not known. Per frame and positive, unlike the timers and marker
+// lists: it changes on the first image the other camera renders.
+int onscreen_camera_builder();
+
+// WHICH BUILD A GPU CAMERA CAME FROM, by content: the newest of the recent
+// builds whose recorded camera sits within `tolM` of `eye` and looks along
+// `fwd` (either sign, within 2 deg). Every build's camera is distinct -- the
+// eye offset alone separates the two renders of a pair -- so a camera that
+// sits on one IS that build, whatever the screen and whenever it is uploaded.
+// Asked at upload time (cbuffer_hook.cpp), where "newest" can only reach the
+// builds that existed then: two identical cameras in a row (a still head on a
+// still screen) resolve to the one the render could have taken. False when no
+// recorded camera is that close. `distM`: its distance.
+bool match_built_camera(const float eye[3], const float fwd[3], float tolM,
+                        uint32_t& build, float& distM);
+
+// The newest build (one per frame, counted as the camera builds that turn the
+// frame over).
+uint32_t current_build();
+
+// Any of the recent builds recorded its camera (note_built_camera with an eye).
+bool have_built_camera();
+
+// Synched Sequential in effect (asked for, and the freeze running).
+bool synched_sequential_active();
+
+// An XR session is up and frames are going to the headset. False on the flat
+// screen (no OpenXR, or the AER-only fallback).
+bool xr_session_running();
+
+// THE RENDER IN PROGRESS, for passes the game runs late in its frame (DLSS in
+// place of its TAA resolve): the eye its camera was built for, and the moment
+// it shows -- under Synched Sequential the SS moment, which both renders of a
+// pair share; otherwise the build itself, every render its own moment. Taken
+// from the build whose camera the GPU is using: the one the render's camera
+// was recognised as at upload (cbuffer_hook.cpp), or the newest build then.
+// False if that build's record is gone.
+struct RenderInfo {
+    uint32_t build = 0;       // the camera build it was drawn with
+    int      eye = 0;
+    uint32_t moment = 0;
+    bool     synched = false;
+};
+bool render_in_progress(RenderInfo& out);
 
 // Called by the camera hooks (cockpit/orbit) every time they run. Lets
 // Present's fallback parity-advance detect "no camera active" (menu/loading
@@ -415,6 +573,16 @@ void mirror_on_present(IDXGISwapChain* swapchain);
 // Called from the ResizeBuffers detour: releases cached backbuffer-derived
 // resources so they are rebuilt against the new size.
 void mirror_on_resize();
+
+// Either side of a resize the mod asked the engine for (resolution_hook.cpp),
+// both between two Presents. A resize the game makes on its own passes by these:
+// a fullscreen toggle leaves the eye images as they are, as it always has.
+//
+// before: nothing of the XR frame may still be running while the device resets.
+// on: the frame is this size from now on, and the eye images follow it at the
+// next Present.
+void before_game_resize();
+void on_game_resized(uint32_t w, uint32_t h);
 
 // Closes the XR session and instance, children first. Called once from the
 // ExitProcess hook so the runtime releases everything while the game's device

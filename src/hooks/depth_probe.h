@@ -22,8 +22,9 @@ void depth_probe_on_present(IDXGISwapChain* swapchain);
 // DIBR shift Phase 1 -- scene depth acquisition.
 //
 // The scene depth does NOT survive to Present (measured: cleared by then), so
-// it is copied once per frame, mid-frame, into a texture we own
-// (R32_FLOAT_X8X24_TYPELESS, REVERSE-Z: near=1, far=0).
+// it is copied mid-frame into a texture we own (R32_FLOAT_X8X24_TYPELESS,
+// REVERSE-Z: near=1, far=0): once at the game's TAA resolve when it runs, else
+// accumulated over the frame's depth passes.
 //
 // One captured frame's depth, with the identity and the camera it was captured
 // under. The camera travels WITH the depth deliberately: reading the projection
@@ -50,6 +51,17 @@ struct SceneDepth {
 // can detect it, so the only safe response was to decline -- thousands of times
 // per session. Selecting by identity converts those into warped frames.
 bool scene_depth_for_eye(int eye, SceneDepth& out);
+
+// From ui_hook.cpp's Draw detour at the game's TAA resolve, on the immediate
+// context: reads the finished scene depth in one go, in place of accumulating
+// it over the frame's depth passes. See the note in depth_probe.cpp for what
+// that rests on. Frames with no resolve accumulate, as with TAA off.
+void depth_capture_at_resolve(ID3D11DeviceContext* ctx);
+
+// The setting (DepthAtTaaResolve): off accumulates even with TAA running. There
+// to compare the two; the "GPU time" log line reports what each costs.
+bool depth_at_resolve();
+void set_depth_at_resolve(bool on);
 
 // Make the probe blind to render-target changes the MOD itself makes, for the
 // duration of one of its own capture passes. Thread-local, so a deferred

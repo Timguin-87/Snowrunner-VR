@@ -1,5 +1,9 @@
 #include "hooks/resolution_hook.h"
+#include "hooks/game_addresses.h"
 #include "hooks/swapchain_hook.h"
+#include "render/dlss.hpp"
+#include "xr/xr_mirror.h"
+#include "common/config.h"
 #include "common/log.h"
 
 #include <windows.h>
@@ -17,6 +21,22 @@ namespace {
 
 std::atomic<int>  g_forceW{0}, g_forceH{0};
 std::atomic<bool> g_installed{false};
+
+// The window's client size: the forced size, or -- under a DLSS upscaling mode --
+// that mode's render size, with the forced size then describing the headset image
+// instead. Set at install time for the CreateWindowExW detour, and by each live
+// apply after that, so moving the slider alone changes neither.
+std::atomic<int>  g_winW{0}, g_winH{0};
+std::atomic<int>  g_upMode{0};            // dlss::Mode the window is sized for; 0 = off
+std::atomic<int>  g_upOutW{0}, g_upOutH{0};
+std::atomic<bool> g_upApplied{false};     // ...and it really is that size
+
+std::atomic<bool> g_windowHooks{false};   // the hooks below are in (a size set, or 'auto')
+std::atomic<HWND> g_mainWindow{nullptr};  // the game's main window, as they found it
+
+// The live apply, see below.
+std::atomic<bool>      g_applyWanted{false};
+std::atomic<ULONGLONG> g_applyAskedAt{0};
 
 uintptr_t g_exeBase = 0;
 uintptr_t g_exeEnd  = 0;
@@ -205,24 +225,34 @@ HWND WINAPI Detour_CreateWindowExW(DWORD exStyle, LPCWSTR cls, LPCWSTR name, DWO
     // Only the first top-level, captioned, explicitly-sized window created by
     // game code is touched -- that is the main window, and the log line below
     // makes it obvious if this ever picks the wrong one.
-    static std::atomic<bool> s_forced{false};
-    const int fw = g_forceW.load(), fh = g_forceH.load();
-    if (fw > 0 && fh > 0 && caller_is_exe(ret) && !(style & WS_CHILD) &&
-        (style & WS_CAPTION) && w > 0 && h > 0) {
+    //
+    // FOUND EVEN WITH NO SIZE TO FORCE. A first launch (ForceGameResolution=auto)
+    // creates the window at the game's own size and only learns the headset's
+    // once a runtime is up; the live apply then resizes this window, so it has to
+    // know which one it is.
+    static std::atomic<bool> s_found{false};
+    const int fw = g_winW.load(), fh = g_winH.load();
+    bool isMain = false;
+    if (caller_is_exe(ret) && !(style & WS_CHILD) && (style & WS_CAPTION) && w > 0 && h > 0) {
         bool expected = false;
-        if (s_forced.compare_exchange_strong(expected, true)) {
-            RECT want{ 0, 0, fw, fh };
-            AdjustWindowRectEx(&want, style, menu != nullptr, exStyle);
-            const int newW = want.right - want.left, newH = want.bottom - want.top;
-            VRLOG("resolution: overriding main window %dx%d -> %dx%d (client %dx%d + frame %dx%d)",
-                  w, h, newW, newH, fw, fh, newW - fw, newH - fh);
-            w = newW;
-            h = newH;
-        }
+        isMain = s_found.compare_exchange_strong(expected, true);
+    }
+    if (isMain && fw > 0 && fh > 0) {
+        RECT want{ 0, 0, fw, fh };
+        AdjustWindowRectEx(&want, style, menu != nullptr, exStyle);
+        const int newW = want.right - want.left, newH = want.bottom - want.top;
+        VRLOG("resolution: overriding main window %dx%d -> %dx%d (client %dx%d + frame %dx%d)",
+              w, h, newW, newH, fw, fh, newW - fw, newH - fh);
+        w = newW;
+        h = newH;
+        if (g_upMode.load() != dlss::kOff) g_upApplied.store(true);
+    } else if (isMain) {
+        VRLOG("resolution: main window created at the game's own %dx%d -- no size set yet", w, h);
     }
 
     HWND hwnd = real_CreateWindowExW(exStyle, cls, name, style, x, y, w, h,
                                      parent, menu, inst, param);
+    if (isMain) g_mainWindow.store(hwnd);
     if (!hwnd || !caller_is_exe(ret) || (style & WS_CHILD))
         return hwnd;
 
@@ -291,6 +321,129 @@ bool hook_api(const wchar_t* mod, const char* name, Fn detour, Fn* original)
     return MH_EnableHook(target) == MH_OK;
 }
 
+// --------------------------------------------------------------------------
+// the live apply
+// --------------------------------------------------------------------------
+//
+// THE ENGINE RESIZES ITSELF, IF ASKED IN ITS OWN TERMS. Its settings apply calls
+// its display apply when the requested size changes, and that does the whole job:
+// window, device lost, device reset, swapchain, every render target. So the size
+// goes where the display apply reads it, and the display apply runs.
+//
+// FROM A HOOK ON THE SETTINGS APPLY AND NOWHERE ELSE. Device lost waits with no
+// timeout on the load job in progress, so the display apply hangs the game during
+// a load -- the first version called it from OnFrameMove and did exactly that.
+// OnFrameMove only reaches the settings apply when nothing is loading, so a detour
+// there inherits the whole guard, and a request made during a load simply waits.
+//
+// THE REQUEST IS PUT BACK AFTERWARDS, because the settings apply re-reads the
+// object from the game's own variables and compares the two: a size left behind
+// would read as a change, on whichever frame the player next touched a video
+// setting, and resize the window back to what those variables say. Restored, the
+// object is exactly as it is after a launch, when the window disagrees with it
+// and nothing minds.
+//
+// THE CLAMP is the two limits of docs/resolution_clamp_strategies.md §2 again. The
+// window apply takes the size down to the monitor's work area, so that is enlarged
+// for this one call; the window manager's ceiling is WM_GETMINMAXINFO above, which
+// follows g_forceW. MoveWindow is the only thing this ever moves past the desktop.
+constexpr LONG kSpoofedWorkArea = 16384;   // D3D11's own largest texture
+constexpr int  kCfgRequestW = 0x28, kCfgRequestH = 0x2C, kCfgMode = 0x3C;
+
+using PFN_GetMonitorInfoA = BOOL (WINAPI*)(HMONITOR, LPMONITORINFO);
+using PFN_SettingsApply   = void (*)(void*);
+using PFN_DisplayApply    = void (*)();
+
+PFN_GetMonitorInfoA real_GetMonitorInfoA = nullptr;
+PFN_SettingsApply   real_SettingsApply   = nullptr;
+PFN_DisplayApply    g_displayApply       = nullptr;
+std::atomic<bool>   g_spoofWorkArea{false};
+uint8_t**           g_settings = nullptr;
+
+BOOL WINAPI Detour_GetMonitorInfoA(HMONITOR mon, LPMONITORINFO mi)
+{
+    void* ret = _ReturnAddress();
+    const BOOL ok = real_GetMonitorInfoA(mon, mi);
+    if (ok && mi && g_spoofWorkArea.load() && caller_is_exe(ret)) {
+        mi->rcWork.right  = mi->rcWork.left + kSpoofedWorkArea;
+        mi->rcWork.bottom = mi->rcWork.top + kSpoofedWorkArea;
+    }
+    return ok;
+}
+
+void client_size(HWND hwnd, int& w, int& h)
+{
+    RECT cr{};
+    GetClientRect(hwnd, &cr);
+    w = cr.right - cr.left;
+    h = cr.bottom - cr.top;
+}
+
+// The engine's own resize, to a client size of w x h.
+void run_display_apply(int w, int h)
+{
+    uint8_t* cfg = *g_settings;
+    int* reqW = reinterpret_cast<int*>(cfg + kCfgRequestW);
+    int* reqH = reinterpret_cast<int*>(cfg + kCfgRequestH);
+    const int oldW = *reqW, oldH = *reqH;
+
+    xr::before_game_resize();
+    *reqW = w;
+    *reqH = h;
+    g_spoofWorkArea.store(true);
+    g_displayApply();
+    g_spoofWorkArea.store(false);
+    *reqW = oldW;
+    *reqH = oldH;
+}
+
+void apply_resolution()
+{
+    const HWND hwnd = g_mainWindow.load();
+    const int outW = g_forceW.load(), outH = g_forceH.load();
+    if (!live_resize_available() || outW <= 0 || outH <= 0) return;
+
+    // The same rule as install_resolution_hooks().
+    const int mode = dlss::mode();
+    const int upMode = dlss::compiled_in() && dlss::is_upscaling(mode) ? mode : (int)dlss::kOff;
+    int rw = outW, rh = outH;
+    dlss::render_size_for(upMode, outW, outH, rw, rh);
+
+    int gotW = 0, gotH = 0;
+    client_size(hwnd, gotW, gotH);
+    if (gotW != rw || gotH != rh) {
+        const ULONGLONG t0 = GetTickCount64();
+        run_display_apply(rw, rh);
+        const int wasW = gotW, wasH = gotH;
+        client_size(hwnd, gotW, gotH);
+        VRLOG("resolution: the game resized %dx%d -> %dx%d in %llu ms%s", wasW, wasH, gotW, gotH,
+              GetTickCount64() - t0, gotW == rw && gotH == rh ? "" : " -- NOT the size asked for");
+    }
+
+    // What the window turned out to be, whatever was asked for: a clamped one is
+    // no render size for DLSS, and keeps the 1:1 canvas (xr_mirror.cpp).
+    const bool upscaling = upMode != dlss::kOff && gotW == rw && gotH == rh;
+    g_winW.store(gotW);
+    g_winH.store(gotH);
+    g_upOutW.store(outW);
+    g_upOutH.store(outH);
+    g_upMode.store(upscaling ? upMode : (int)dlss::kOff);
+    g_upApplied.store(upscaling);
+    if (upscaling)
+        VRLOG("resolution: DLSS %s -- the game renders at %dx%d, and DLSS brings each eye up "
+              "to %dx%d", dlss::mode_name(upMode), gotW, gotH, outW, outH);
+
+    dlss::on_resized();
+    xr::on_game_resized((uint32_t)gotW, (uint32_t)gotH);
+}
+
+void Detour_SettingsApply(void* self)
+{
+    if (g_applyWanted.exchange(false))
+        apply_resolution();
+    real_SettingsApply(self);
+}
+
 } // namespace
 
 void install_resolution_hooks()
@@ -302,12 +455,38 @@ void install_resolution_hooks()
     init_exe_range();
 
     const int w = g_forceW.load(), h = g_forceH.load();
-    if (w <= 0 || h <= 0) {
-        // Nothing to force: leave the game's window handling completely alone
-        // rather than installing pass-through detours on it.
-        VRLOG("resolution: not installed (ForceGameResolution=off)");
+    const bool sized = w > 0 && h > 0;
+    if (!sized && !vrcfg::resolution_unset()) {
+        // ForceGameResolution=off: leave the game's window handling completely
+        // alone rather than installing pass-through detours on it.
+        VRLOG("resolution: not installed (ForceGameResolution=off)%s",
+              dlss::is_upscaling(dlss::mode())
+                  ? " -- DLSS upscaling needs it: it sets the headset image size"
+                  : "");
         return;
     }
+    // 'auto' -- the first launch -- has no size yet either, but is about to get
+    // one: the first-run notice (menu_hook.cpp) reads it from the headset and
+    // applies it to the running game. That apply needs what these hooks provide,
+    // the window ceiling and the main window's handle, so they go in now with
+    // nothing forced: the window is created exactly as it would be without them.
+
+    // DLSS UPSCALING: the game renders at the mode's render size and DLSS
+    // brings each eye up to the forced size at Present (render/dlss.hpp). The
+    // window is the one place the engine takes its render size from, so this
+    // is where a mode the config starts with has to act.
+    int cw = w, ch = h;
+    const int upMode = dlss::mode();
+    if (sized && dlss::compiled_in() && dlss::is_upscaling(upMode)) {
+        dlss::render_size_for(upMode, w, h, cw, ch);
+        g_upMode.store(upMode);
+        g_upOutW.store(w);
+        g_upOutH.store(h);
+        VRLOG("resolution: DLSS %s -- the game renders at %dx%d, and DLSS brings each "
+              "eye up to %dx%d", dlss::mode_name(upMode), cw, ch, w, h);
+    }
+    g_winW.store(cw);
+    g_winH.store(ch);
 
     const bool okCreate = hook_api(L"user32", "CreateWindowExW",
                                    &Detour_CreateWindowExW, &real_CreateWindowExW);
@@ -315,30 +494,91 @@ void install_resolution_hooks()
     // back by the window manager -- see the WM_GETMINMAXINFO comment above.
     const bool okClass  = hook_api(L"user32", "RegisterClassW",
                                    &Detour_RegisterClassW, &real_RegisterClassW);
-    VRLOG("resolution: forcing %dx%d -- CreateWindowExW hook %s, RegisterClassW hook %s",
-          w, h, okCreate ? "ok" : "FAILED", okClass ? "ok" : "FAILED");
+    g_windowHooks.store(okCreate && okClass);
+    if (sized)
+        VRLOG("resolution: forcing %dx%d -- CreateWindowExW hook %s, RegisterClassW hook %s",
+              cw, ch, okCreate ? "ok" : "FAILED", okClass ? "ok" : "FAILED");
+    else
+        VRLOG("resolution: no size yet (ForceGameResolution=auto) -- the game's own size until "
+              "the headset's is applied; CreateWindowExW hook %s, RegisterClassW hook %s",
+              okCreate ? "ok" : "FAILED", okClass ? "ok" : "FAILED");
 }
 
-// REMOVED 2026-08-24: apply_resolution_now(), the live-resize path behind the
-// settings UI's "Apply resolution now" button.
+void install_live_resize()
+{
+    static std::atomic<bool> s_done{false};
+    if (s_done.exchange(true)) return;
+
+    const GameAddresses& a = game_addresses();
+    if (!a.settingsApply || !a.displayApply || !a.windowSettings) {
+        VRLOG("resolution: no live apply -- the engine's addresses were not found, so a new "
+              "size or DLSS mode waits for a restart");
+        return;
+    }
+    if (!g_windowHooks.load()) {
+        VRLOG("resolution: no live apply this session -- the window hooks are not in "
+              "(ForceGameResolution=off, or they failed above), so a new size waits for a "
+              "restart");
+        return;
+    }
+
+    uint8_t* base = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    g_settings     = reinterpret_cast<uint8_t**>(base + a.windowSettings);
+    g_displayApply = reinterpret_cast<PFN_DisplayApply>(base + a.displayApply);
+
+    const bool okMonitor = hook_api(L"user32", "GetMonitorInfoA", &Detour_GetMonitorInfoA,
+                                    &real_GetMonitorInfoA);
+    void* target = base + a.settingsApply;
+    const bool okApply = okMonitor &&
+                         MH_CreateHook(target, reinterpret_cast<void*>(&Detour_SettingsApply),
+                                       reinterpret_cast<void**>(&real_SettingsApply)) == MH_OK &&
+                         MH_EnableHook(target) == MH_OK;
+    if (!okApply) real_SettingsApply = nullptr;
+    VRLOG("resolution: live apply %s", okApply ? "ready" : "hook FAILED -- changes wait for a restart");
+}
+
+bool live_resize_available()
+{
+    if (!real_SettingsApply || !g_mainWindow.load() || !*g_settings) return false;
+    return *reinterpret_cast<const int*>(*g_settings + kCfgMode) == 0;
+}
+
+void request_resolution_apply()
+{
+    if (!live_resize_available()) return;
+    g_applyAskedAt.store(GetTickCount64());
+    g_applyWanted.store(true);
+}
+
+bool resolution_apply_waiting()
+{
+    constexpr ULONGLONG kOneFrameIsNotWaiting = 250;
+    return g_applyWanted.load() && GetTickCount64() - g_applyAskedAt.load() > kOneFrameIsNotWaiting;
+}
+
+// A LIVE RESIZE FROM OUTSIDE THE ENGINE DOES NOT WORK, and this is the record of
+// why, because it looks as if it does. apply_resolution_now(), removed 2026-08-24,
+// sat behind an "Apply resolution now" button and drove IDXGISwapChain::ResizeTarget
+// -> ResizeBuffers, the same pair the game's own video settings and its fullscreen
+// toggle use. Both calls succeeded. But the engine does not re-derive its render
+// size from a swapchain it did not resize itself, so the picture was resized
+// without being re-rendered.
 //
-// It drove IDXGISwapChain::ResizeTarget -> ResizeBuffers, the same pair the
-// game's own video settings and its fullscreen toggle use, and both calls
-// succeeded -- which is why it looked promising. It still did not work: the
-// engine does not re-derive its render size from a swapchain it did not resize
-// itself, so the picture was resized without being re-rendered. The window is
-// the source of truth only at CreateWindowExW, which is where
-// set_force_resolution() applies and why a restart is the honest answer.
-//
-// Do not rebuild this on the evidence that the calls succeed. They always did.
-//
-// find_main_window() went with it -- an EnumWindows search for the process's
-// largest visible window, which existed because the live path had to locate a
-// window install_resolution_hooks() may never have seen (it no-ops when no size
-// is set, so there is no remembered HWND). Nothing else ever needed one.
+// Do not rebuild that on the evidence that the calls succeed. They always did. The
+// live apply above works because the engine runs its own device reset.
 
 void set_force_resolution(int w, int h) { g_forceW.store(w); g_forceH.store(h); }
 int  force_resolution_w()               { return g_forceW.load(); }
 int  force_resolution_h()               { return g_forceH.load(); }
+
+bool upscale_session(int& outW, int& outH, int& renderW, int& renderH)
+{
+    if (!g_upApplied.load()) return false;
+    outW = g_upOutW.load();  outH = g_upOutH.load();
+    renderW = g_winW.load(); renderH = g_winH.load();
+    return outW > 0 && outH > 0 && renderW > 0 && renderH > 0;
+}
+
+int upscale_mode_applied() { return g_upApplied.load() ? g_upMode.load() : (int)dlss::kOff; }
 
 } // namespace hooks

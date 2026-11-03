@@ -64,6 +64,12 @@ int current_draw_role();
 // role differently from the rest.
 uint64_t current_draw_hash();
 
+// The bound pixel shader is the game's TAA resolve (EDGE_AA), recognised at
+// creation by the velocity texture its reflection data names. Same thread-
+// local scheme as current_draw_role(). Read by ui_hook.cpp's Draw detour,
+// where render/dlss.cpp takes the draw over. See docs/dlss_investigation.md.
+bool current_draw_is_taa_resolve();
+
 // --- hot path, called from ui_hook.cpp's draw detours --------------------
 // `elemCount` is the draw's index or vertex count. It is recorded per shader
 // and is what separates real geometry from a fullscreen pass: tonemap,
@@ -86,7 +92,13 @@ void note_ps_state_lost();
 // happened to include the blit shader would black out the image being used to
 // judge the search. Bracket our own draws with this and they are ignored
 // entirely: not culled, not registered, not counted.
-void set_self_render(bool on);
+//
+// Returns what it was, and a bracket that can run inside another one -- DLSS's
+// at Present, anything reachable from both a draw detour and Present -- puts
+// that back instead of switching it off. Switching it off is what used to end
+// Present's own bracket halfway, after which the mask shaders rebuilt later in
+// that Present were created as the game's.
+bool set_self_render(bool on);
 
 // --- named shaders -------------------------------------------------------
 // Found once with the search below, and a DXBC hash is a property of the GAME

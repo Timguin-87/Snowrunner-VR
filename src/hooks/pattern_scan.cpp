@@ -76,6 +76,38 @@ PRUNTIME_FUNCTION primary_function(const void* p, DWORD64& imageBase)
 
 std::atomic<bool> g_dumpGameCode{false};
 
+// The compare alone, apart from anything with a destructor: MSVC will not put
+// __try in a function that needs object unwinding.
+bool compare_at(const uint8_t* at, const uint8_t* bytes, const uint8_t* wild, size_t n)
+{
+    __try {
+        for (size_t j = 0; j < n; ++j)
+            if (!wild[j] && at[j] != bytes[j])
+                return false;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Initialized, non-executable sections; `readOnly` drops the writable ones.
+template <typename Fn>
+void for_each_data_section(HMODULE module, bool readOnly, Fn&& fn)
+{
+    IMAGE_NT_HEADERS* nt = nt_headers(module);
+    if (!nt) return;
+    auto* base = reinterpret_cast<uint8_t*>(module);
+    auto* section = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+        const DWORD ch = section->Characteristics;
+        if (!(ch & IMAGE_SCN_CNT_INITIALIZED_DATA) || (ch & IMAGE_SCN_MEM_EXECUTE))
+            continue;
+        if (readOnly && (ch & IMAGE_SCN_MEM_WRITE))
+            continue;
+        fn(base + section->VirtualAddress, (size_t)section->Misc.VirtualSize);
+    }
+}
+
 } // namespace
 
 int pattern_scan_all(HMODULE module, const char* ida_pattern, uint8_t** out, int cap)
@@ -261,6 +293,93 @@ std::vector<uint8_t*> find_cstrings(HMODULE module, const char* s)
         }
     }
     return out;
+}
+
+bool pattern_matches_at(const void* p, const char* ida_pattern)
+{
+    Pattern pat;
+    if (!p || !parse(ida_pattern, pat))
+        return false;
+    const std::vector<uint8_t> wild(pat.wildcard.begin(), pat.wildcard.end());
+    return compare_at(static_cast<const uint8_t*>(p), pat.bytes.data(), wild.data(),
+                      pat.bytes.size());
+}
+
+void** rtti_vtable(HMODULE module, const char* mangledName, const char** why)
+{
+    auto fail = [why](const char* reason) -> void** {
+        if (why) *why = reason;
+        return nullptr;
+    };
+    const size_t len = mangledName ? strlen(mangledName) : 0;
+    if (!nt_headers(module) || !len)
+        return fail("no image or no name");
+    auto* base = reinterpret_cast<uint8_t*>(module);
+
+    // THE TYPEDESCRIPTOR: {vftable, spare, name}, name at +0x10, 8-aligned.
+    // The runtime writes into it (the undecorated-name cache), so it lives in
+    // WRITABLE data -- which find_cstrings, read-only by design, never sees.
+    uint8_t* td = nullptr;
+    int tds = 0;
+    for_each_data_section(module, false, [&](uint8_t* begin, size_t size) {
+        if (size < len + 1 + 0x10) return;
+        uint8_t* const last = begin + size - (len + 1);
+        for (uint8_t* p = begin + 0x10; p <= last; ++p) {
+            p = static_cast<uint8_t*>(memchr(p, (unsigned char)mangledName[0],
+                                             (size_t)(last - p) + 1));
+            if (!p) break;
+            if (memcmp(p, mangledName, len + 1) == 0 &&
+                !(reinterpret_cast<uintptr_t>(p - 0x10) & 7)) {
+                td = p - 0x10;
+                ++tds;
+            }
+        }
+    });
+    if (tds != 1)
+        return fail(tds ? "the type name is in the image more than once"
+                        : "the type name is not in the image");
+    const uint32_t tdRva = static_cast<uint32_t>(td - base);
+
+    // THE PRIMARY COMPLETEOBJECTLOCATOR: signature 1 (x64 image-relative),
+    // offset 0 -- the vtable at the top of the object, not a base class's --
+    // pTypeDescriptor naming the descriptor above, and pSelf its own RVA.
+    uint8_t* col = nullptr;
+    int cols = 0;
+    for_each_data_section(module, true, [&](uint8_t* begin, size_t size) {
+        if (size < 0x18) return;
+        uint8_t* const last = begin + size - 0x18;
+        for (uint8_t* p = begin; p <= last; p += 4) {
+            const uint32_t* c = reinterpret_cast<const uint32_t*>(p);
+            if (c[3] == tdRva && c[0] == 1 && c[1] == 0 &&
+                c[5] == static_cast<uint32_t>(p - base)) {
+                col = p;
+                ++cols;
+            }
+        }
+    });
+    if (cols != 1)
+        return fail(cols ? "more than one object locator names the type"
+                         : "no object locator names the type");
+
+    // THE VTABLE: the one read-only pointer to that locator sits at vtable[-1].
+    uint8_t* vt = nullptr;
+    int vts = 0;
+    const uint64_t want = reinterpret_cast<uint64_t>(col);
+    for_each_data_section(module, true, [&](uint8_t* begin, size_t size) {
+        if (size < 16) return;
+        uint8_t* const last = begin + size - 16;
+        for (uint8_t* p = begin; p <= last; p += 8) {
+            if (*reinterpret_cast<const uint64_t*>(p) == want) {
+                vt = p + 8;
+                ++vts;
+            }
+        }
+    });
+    if (vts != 1)
+        return fail(vts ? "more than one vtable points at the locator"
+                        : "no vtable points at the locator");
+    if (why) *why = nullptr;
+    return reinterpret_cast<void**>(vt);
 }
 
 void** import_slot(HMODULE module, const char* dll, const char* fn)

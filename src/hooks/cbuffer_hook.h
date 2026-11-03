@@ -25,6 +25,25 @@ void install_cbuffer_hook(IDXGISwapChain* swapchain);
 // to convert reverse-Z depth into view-space Z. False until first seen.
 bool main_camera_matrices(float view[16], float viewProj[16]);
 
+// The same snapshot with the game's g_tmViewProjPrev as well: its PREVIOUS
+// frame's camera, carrying THIS frame's jitter -- what its velocity pass
+// measures moving objects against (docs/dlss_investigation.md).
+bool main_camera_matrices(float view[16], float viewProj[16], float viewProjPrev[16]);
+
+// WHICH BUILD THE SNAPSHOT ABOVE IS -- the render's own camera, by build.
+// `seq` counts main-camera uploads. `build`: the camera build its camera sits
+// on (xr::match_built_camera), 0 when it was not recognised as one;
+// `newestAt`: the newest build when it was uploaded, which is the one a
+// render takes. `how`: how it was recognised as the main view (cbuffer_hook.cpp,
+// classify_cam). False until the first snapshot.
+struct CamSnapInfo {
+    uint32_t seq = 0;
+    uint32_t build = 0;
+    uint32_t newestAt = 0;
+    int      how = 0;
+};
+bool main_camera_snap(CamSnapInfo& out);
+
 // (ui_scale_factor() lived here, driving ui_hook.cpp's viewport shrink. Both
 // are gone: the UI is a composition layer now and its size is the layer's own,
 // in metres -- xr::ui_plane_size().)
@@ -76,25 +95,15 @@ bool     imm_camera_is_main();
 // guard above can never do anything.
 uint32_t non_main_camera_commits();
 
-// The PS constant-buffer slot CB_DYNAMIC_UI is bound at, confirmed via
-// D3DReflect and PSSetConstantBuffers logging. Shared with ui_hook.cpp so
-// both sides agree on the same slot number.
-constexpr int kMarkerCbSlot = 4;
-
-// True if the given constant-buffer pointer (whatever is CURRENTLY bound at
-// kMarkerCbSlot -- fetch it live with PSGetConstantBuffers, don't cache) is
-// one of the two known marker shaders' CBs AND its last-written screen
-// position differs from anything seen last frame. False (today's behaviour)
-// if the pointer isn't a tracked marker CB at all, or its position matches.
-bool marker_cb_position_is_dynamic(void* buf);
-
-// Promotes this frame's observed marker positions to "previous frame" for
-// the next comparison, and clears the current set. Call once per Present.
+// The periodic line on how the main view's camera was recognised. Call once
+// per Present.
+//
+// (The SHADER-DRAW world marker fix lived here and in ui_hook.cpp: draws of two
+// known marker shaders whose screen position had moved since the last frame
+// were kept in the scene instead of the UI plane. A marker that held still read
+// as static, and static UI that animated read as a marker, so it misfired both
+// ways. Removed 2026-11-02 with the setting that chose between it, the plain
+// UI plane and the camera pointer: the camera pointer is how the markers are
+// placed now -- marker_camera.h.)
 void cbuffer_hook_on_present();
-
-// Toggle for the whole static/dynamic marker classification. OFF reverts
-// redirect_if_ui() to stock behaviour -- every kCullUi draw goes to the
-// plane unconditionally, exactly as before this feature existed.
-bool world_marker_fix_enabled();
-void set_world_marker_fix_enabled(bool on);
 } // namespace hooks

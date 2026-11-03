@@ -1,19 +1,26 @@
 #include "xr/xr_mirror.h"
 #include "hooks/depth_probe.h"
+#include "hooks/frame_sync.h"
 #include "hooks/cbuffer_hook.h"
 #include "hooks/camera_hook.h"      // logic_camera_idle_ms()
 #include "hooks/shader_cull.h"       // the screen fingerprint
 #include "hooks/viewbuild_hook.h"
 #include "hooks/ui_hook.h"
 #include "hooks/menu_hook.h"
+#include "hooks/resolution_hook.h"
+#include "hooks/marker_camera.h"    // marker_camera_placing()
 #include "render/dibr.hpp"
 #include "render/reproject.hpp"
 #include "render/rigid_mask.hpp"
+#include "render/mirror_mask.hpp"
 #include "render/frame_dump.hpp"
 #include "render/smudge_layer.hpp"
 #include "render/winch_layer.hpp"
 #include "render/ui_layer.hpp"
 #include "render/cursor_overlay.hpp"
+#include "render/dlss.hpp"
+#include "render/motion_field.hpp"
+#include "render/motion_overlay.hpp"
 #include "xr/xr_input.h"
 #include "common/dibr_policy.h"
 #include "common/log.h"
@@ -41,6 +48,8 @@ namespace {
 // One latch so a failed init logs once and then stays quiet in passthrough.
 bool g_failed = false;
 bool g_inited = false;
+// The engine resized the game's frame for us: see follow_game_frame().
+std::atomic<bool> g_frameResized{false};
 
 // AER: per-eye side offset the camera hooks read (± IPD/2 for the current eye).
 std::atomic<float> g_eyeSide{0.0f};
@@ -49,8 +58,202 @@ std::atomic<bool>  g_stereo{false};
 // Present, so the offset and the eye routing come from the same event and can't
 // desync under deferred/multithreaded rendering. Present only marks a new frame.
 std::atomic<int>   g_frameEye{0};       // eye of the frame currently being rendered
+// The eye of the image in the backbuffer at this Present -- the eye of the
+// camera build it was DRAWN with, which on the map, garage and menus is not the
+// latest one (see BuildRec and update_on_screen()). -1 = not known; routing
+// then falls back to g_frameEye.
+std::atomic<int>   g_onScreenEye{-1};
 std::atomic<bool>  g_newFrame{false};   // set at Present; consumed by the first camera build
 std::atomic<float> g_ipd{0.062f};
+// The rendered separation is g_ipd / this (world_scale()), and the camera's
+// travel the head's / this (head_look()). Config is authoritative.
+std::atomic<float> g_worldScale{1.0f};
+
+// THE RENDER METHOD (xr_mirror.h). What the settings ask for; Synched
+// Sequential is only in effect while the freeze actually runs, which needs the
+// frame callbacks hooked and an XR session -- see synched_active().
+std::atomic<int>   g_renderMethod{kRenderAER};
+// SYNCHED SEQUENTIAL. How many updates behind its update a render is: 0 on the
+// menus, 1 in-game (measured), learned from the camera in ss_choose_eye().
+std::atomic<int>   g_ssLag{0};
+// The frame being built, chosen at its first camera build and read at its
+// Present: bit 63 valid, bit 62 first render of its moment, low 32 bits the
+// moment (the index of the real update it shows).
+std::atomic<uint64_t> g_ssFrame{0};
+// Lag learning. Touched only by the one camera build per frame that wins
+// g_newFrame, so frames take turns rather than racing. `g_ssObsHist`: the
+// latest observations, newest in bit 0.
+uint64_t g_ssPrevFp = 0;
+int      g_ssObs = -1, g_ssObsRun = 0;
+uint32_t g_ssObsHist = 0;
+// For the periodic log line: new moments seen at a real / a frozen update,
+// pairs completed, and second renders that found no first to pair with.
+std::atomic<uint32_t> g_ssNewMoment[2] = {}, g_ssPairs{0}, g_ssOrphans{0};
+// Frames with a camera build, by the kind of update just run -- a frozen
+// update that builds no camera would leave its eye unrendered -- and frames
+// with none at all (skipped, as in AER).
+std::atomic<uint32_t> g_ssBuilds[2] = {}, g_ssStalled{0};
+// The headset's frames under Synched Sequential, and the time spent waiting
+// for them in xrWaitFrame -- with one per PAIR, the wait is the headroom left
+// for rendering both eyes inside one refresh.
+std::atomic<uint32_t> g_ssXrFrames{0}, g_ssWaitUs{0};
+// The latest XR frame's predicted display time and period, for the Presents
+// that run none (ss_first_eye_present). 0 = none yet. Present thread only.
+XrTime     g_lastDisplayTime   = 0;
+XrDuration g_lastDisplayPeriod = 0;
+
+// WHICH CAMERA BUILD EACH PRESENT SHOWS. In gameplay the image at a Present is
+// drawn with that frame's own camera build; on the map, in the garage and on
+// the menus with the build BEFORE it. Measured 2026-10-27 with a 2 deg yaw bump
+// on every fourth build of the title-screen camera: in 16 of 16 the GPU-side
+// camera carried it one Present late. So every build leaves a record here --
+// its Synched Sequential choice, the views it was built from and the camera
+// direction it handed the game -- and a Present reads the record of the build
+// its image actually came from: build count minus g_presLag.
+//
+// This is also what the AER eye flip on those screens (kMapEyeSign,
+// viewbuild_hook.cpp) has been compensating: an image one build behind is
+// routed to the other eye, and flipping that eye's offset puts the depth back
+// -- while each eye's declared pose stays a frame off, which is why those
+// screens never felt like gameplay.
+struct BuildRec {
+    uint32_t build = 0;            // g_advFlips of the frame it belongs to; 0 = empty
+    int      eye = -1;             // the eye it was built for
+    uint64_t ss = 0;               // g_ssFrame chosen for it (Synched Sequential)
+    float    fwd[3] = {0, 0, 0};   // the camera direction handed to the game
+    bool     haveFwd = false;
+    float    eyePos[3] = {0, 0, 0};  // ...and its position, after the head and eye offsets
+    bool     haveEyePos = false;
+    float    eyeOff[3] = {0, 0, 0};  // ...the eye offset in it: eyePos less this is the head
+    bool     haveEyeOff = false;
+    int      builder = 0;            // CameraBuilder: which game builder made it
+    bool     prevScreen = false;   // a map / garage / menu camera
+    XrView   views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+    bool     haveViews = false;
+};
+constexpr uint32_t kBuildRing = 8;
+BuildRec g_buildRec[kBuildRing];            // guarded by g_buildRecLock
+SRWLOCK  g_buildRecLock = SRWLOCK_INIT;
+std::atomic<int> g_presLag{0};
+// The build whose image is in the backbuffer at this Present, and its views --
+// set by update_on_screen() at the top of every Present.
+BuildRec g_onScreenRec;                     // Present thread only
+bool     g_onScreenValid = false;           // Present thread only
+// Voting state, Present thread only. `g_lagMeasured`: the lag in force came
+// from votes rather than from the screen.
+int       g_lagVote = -1, g_lagRun = 0;
+ULONGLONG g_lagVoteTick = 0;
+bool      g_lagMeasured = false;
+// The main-camera snapshot the latest Present consumed (cbuffer_hook's
+// CamSnapInfo::seq): an upload after it belongs to the frame being rendered.
+// Written at Present, read at the TAA resolve -- the same thread here, atomic
+// regardless.
+std::atomic<uint32_t> g_snapSeqSeen{0};
+std::atomic<bool>     g_snapSeqValid{false};
+// Presents by where their build came from: the render's camera on a build, the
+// newest build when it was uploaded, the old vote/screen measure. Present
+// thread only; for the periodic line.
+uint32_t g_onScreenBy[3] = {0, 0, 0};
+// The camera builder of the image at the latest Present (onscreen_camera_builder).
+std::atomic<int> g_onScreenBuilder{0};
+// Set by set_render_method(); the Present thread drops any half-built pair.
+std::atomic<bool>  g_ssReset{false};
+
+// How far the middle of the eyes travelled in the world from one camera build to
+// another: each build's eye with its own eye offset taken back off. Zero when the
+// ring no longer holds either. For the motion-vector overlay, which shows motion
+// relative to the head (render/motion_overlay.hpp).
+void head_move_between(uint32_t from, uint32_t to, float out[3])
+{
+    out[0] = out[1] = out[2] = 0.0f;
+    if (!from || !to) return;
+    AcquireSRWLockShared(&g_buildRecLock);
+    const BuildRec& a = g_buildRec[from % kBuildRing];
+    const BuildRec& b = g_buildRec[to % kBuildRing];
+    if (a.build == from && b.build == to && a.haveEyePos && a.haveEyeOff &&
+        b.haveEyePos && b.haveEyeOff) {
+        for (int i = 0; i < 3; ++i)
+            out[i] = (b.eyePos[i] - b.eyeOff[i]) - (a.eyePos[i] - a.eyeOff[i]);
+    }
+    ReleaseSRWLockShared(&g_buildRecLock);
+}
+
+// Synched Sequential IN EFFECT: asked for, and the freeze running. The freeze
+// needs the frame callbacks hooked and is held off without an XR session (see
+// mirror_on_present), so asking is not enough.
+bool synched_active()
+{
+    return g_renderMethod.load() == kRenderSynchedSequential && hooks::frame_freeze_on();
+}
+
+// WHICH EYE GOES FIRST alternates per pair: L,R then R,L then L,R. At every
+// pair boundary the game's "previous frame" is then the SAME eye -- its own
+// last render, one moment back -- so the first render of each pair gets exact
+// same-eye motion vectors, history and previous depth from the game, the two
+// eyes taking turns, and only the second render of a pair needs DLSS's vectors
+// converted (render/dlss.cpp). With a fixed order one eye was always the one
+// converting. `moment` is the index of the real update shown, and those are
+// two apart, so bit 1 flips from pair to pair.
+int ss_first_eye(uint32_t moment) { return (int)((moment >> 1) & 1u); }
+
+// WHICH EYE THE FRAME BEING BUILT IS FOR, under Synched Sequential: the first
+// render of a moment, then its frozen repeat with the other eye -- which eye
+// starts is ss_first_eye().
+//
+// Which render is which depends on which update the frame SHOWS, and that is
+// not always the update just run: in-game the render runs one update behind,
+// on the menus it does not (both measured, docs/same_frame_stereo.md). So the
+// lag is learned, from the camera. The game's own camera input -- `fp`,
+// hashed before any of ours is applied -- changes when a new moment's state
+// reaches it, and the update shown is then a real one: a change right after the
+// frozen repeat means the render is one behind. Two agreeing observations in a
+// row are needed to switch, so one odd frame cannot flip the eyes. A camera
+// that is not moving teaches nothing, and the lag stays what it was.
+//
+// EXCEPT IN GAMEPLAY, where a change after a REAL update proves nothing. The
+// camera's own motion -- the stick swinging the orbit round the truck -- is
+// applied by the update it is run in, on every screen; only what the camera
+// FOLLOWS (the truck, the world) runs a frame late in-game. With the truck
+// parked and the camera swinging, every change came after a real update and
+// the lag was taught the menus' 0 (seen in the log 2026-10-28), and with both
+// moving the observations alternate and teach nothing. So on the gameplay
+// camera the lag only ever goes UP, on two changes after a frozen update among
+// the latest four -- which only something running a frame late can produce.
+int ss_choose_eye(uint64_t fp, bool gameplay)
+{
+    const uint32_t cur = hooks::frame_update_index();
+    g_ssBuilds[hooks::frame_update_frozen(cur) ? 1 : 0].fetch_add(1);
+    if (fp != 0) {
+        if (g_ssPrevFp != 0 && fp != g_ssPrevFp) {
+            const int obs = hooks::frame_update_frozen(cur) ? 1 : 0;
+            g_ssNewMoment[obs].fetch_add(1);
+            if (obs == g_ssObs) ++g_ssObsRun;
+            else { g_ssObs = obs; g_ssObsRun = 1; }
+            g_ssObsHist = (g_ssObsHist << 1) | (uint32_t)obs;
+            int want = -1;
+            if (gameplay) {
+                const uint32_t h = g_ssObsHist;
+                const int recent = (int)((h & 1u) + ((h >> 1) & 1u) + ((h >> 2) & 1u) +
+                                         ((h >> 3) & 1u));
+                if (obs == 1 && recent >= 2) want = 1;
+            } else if (g_ssObsRun >= 2) {
+                want = obs;
+            }
+            if (want >= 0 && want != g_ssLag.load()) {
+                g_ssLag.store(want);
+                hooks::set_frame_render_lag(want);
+                VRLOG("Synched Sequential: renders now run %d update(s) behind (%s)", want,
+                      want ? "in-game" : "menus");
+            }
+        }
+        g_ssPrevFp = fp;
+    }
+    const uint32_t shown = cur - (uint32_t)g_ssLag.load();
+    const bool first = !hooks::frame_update_frozen(shown);
+    const uint32_t moment = first ? shown : shown - 1;
+    g_ssFrame.store((1ull << 63) | (first ? (1ull << 62) : 0ull) | moment);
+    return ss_first_eye(moment) ^ (first ? 0 : 1);
+}
 std::atomic<int>   g_advCalls{0}, g_advFlips{0}, g_presents{0};  // parity diagnostics
 
 // Presents on which the MAIN CAMERA VIEW MATRIX SEEN BY THE GPU changed. This is
@@ -64,45 +267,46 @@ std::atomic<int>   g_viewChanges{0};
 // A 16-entry ring plus a settable pipeline delay used to sit here: the AER eye
 // offset was once baked at camera-BUILD time on deferred worker threads, one or
 // two frames before Present routed the pixels, so the routing had to look
-// backwards to find the parity that matched what it was holding. That offset
-// now lives in the projection-builder hook, which runs at present rate and
-// applies essentially at render time, so the skew is gone -- the delay has
-// defaulted to 0 (a pure pass-through: write the current eye, read it straight
-// back) and had no live keybinding left. Removed 2026-08-18.
+// backwards to find the parity that matched what it was holding. Removed
+// 2026-08-18 once gameplay's skew was gone.
 //
-// Eye IDENTITY does not depend on this in any case: xr::applied_eye() publishes
-// the index and the offset that produced it as one atomic, recorded at the
-// build, so identity travels with the content instead of being inferred here.
-// The frame dump prints both -- `eye=` is this routing value, `aeEye=` the
-// ground truth -- so a disagreement between them is what a real skew would look
-// like.
-int present_route_eye() { return g_frameEye.load() & 1; }
+// THE SKEW CAME BACK, as a fact about screens rather than a setting. On the map,
+// the garage and the menus the image at a Present IS drawn with the camera
+// built a frame earlier (measured 2026-10-27, see BuildRec) -- which the
+// per-screen eye flip kMapEyeSign had been papering over. So routing reads the
+// eye of the build ON SCREEN, worked out once per Present by update_on_screen()
+// from which build's camera the GPU actually used; in gameplay that is the
+// latest build, exactly as before.
+int present_route_eye()
+{
+    const int e = g_onScreenEye.load();
+    return e >= 0 ? (e & 1) : (g_frameEye.load() & 1);
+}
 
-// Map screen: shrink both the compositor's PROJECTED WINDOW (the composition
-// layer's angular extent, at the two submission sites below) AND the GAME's
-// own render FOV (via render_hfov_deg() -> viewbuild_hook.cpp's PROJ LOCK) by
-// this SAME factor, applied in TANGENT space at both ends so the two agree
-// exactly (they did not before 2026-08-06 -- see render_hfov_deg()). Shrinking only the
-// window while leaving the game's FOV full broke the "submitted FOV ==
-// rendered FOV" invariant the compositor submission code already documented
-// -- confirmed in-headset as visible stretch/distortion. Keeping both
-// consumers on this single function is what keeps them from drifting apart
-// again. Deliberately does NOT include the removed Final-FOV angle trim.
-std::atomic<float> g_mapWindowShrink{0.4f};   // config is authoritative
-// BASE render size: the same mechanism as the map shrink above -- compositor
-// window and the game's own render FOV moved together, in tangent space -- but
-// applied everywhere rather than only on the map screen. Lowering it renders a
-// narrower FOV into a smaller window, which is the honest way to buy
+// THE MAP'S UI, as a share of the rendered view, about the same centre. The
+// map renders at the render size like everything else; only the quad its UI is
+// shown on shrinks. The world markers follow it without being told --
+// hooks/marker_camera.cpp builds their camera from the quad as submitted.
+//
+// (A map window shrink, MapWindowShrink, used to sit here: the map's render FOV
+// and its compositor window shrunk together. Removed 2026-11-03, when this took
+// over the job of keeping the map's UI inside the sweet spot of the lenses. It
+// survives only as the fallback in composited_fov_scale().)
+std::atomic<float> g_mapUiScale{0.4f};        // config is authoritative
+// BASE render size: the compositor window and the game's own render FOV moved
+// together, applied in TANGENT space at both ends so the two agree exactly
+// (they did not before 2026-08-06 -- see render_hfov_deg()). Lowering it renders
+// a narrower FOV into a smaller window, which is the honest way to buy
 // performance: fewer pixels AND less scene, with no stretch, because the
-// "submitted FOV == rendered FOV" invariant is preserved at both ends.
+// "submitted FOV == rendered FOV" invariant is preserved at both ends. Shrinking
+// only the window while leaving the game's FOV full broke that invariant --
+// confirmed in-headset as visible stretch/distortion.
 //
 // It sits INSIDE composited_fov_scale() rather than beside it, and that is the
 // whole design: every consumer -- eye_frustum_half_angles() at submission,
 // render_hfov_deg() driving PROJ LOCK, the culling margin -- already calls this
 // function, so they all re-derive from the new base with no extra plumbing and
-// cannot be left behind. The map shrink then multiplies ON TOP, making it a
-// percentage of the possibly-already-shrunk render FOV rather than of the
-// headset's native FOV.
+// cannot be left behind.
 //
 // Deliberately NOT combined with the removed Final-FOV trim, which lived in angle space and
 // means something different -- see its comment above.
@@ -110,12 +314,15 @@ std::atomic<float> g_renderFovScale{1.00f};
 float composited_fov_scale()
 {
     float s = g_renderFovScale.load();
-    // NOT IN 2D. The shrink scales the render FOV and the submitted window
-    // together, so in 3D it reads as a smaller window with the same content. On
-    // a flat panel the panel size comes from the UI slider instead, so all the
-    // shrink would do is render a narrower slice of the map into the same
-    // panel -- i.e. crop and magnify it. Its 40% default would do that hard.
-    if (hooks::in_map_view() && !flat_screen_active()) s *= g_mapWindowShrink.load();
+    // A GAME BUILD WITHOUT THE MARKER CAMERA. The game then places the map's
+    // icons through its own camera, onto the whole window, so the UI can only
+    // be smaller if the window is: on the map, the render and the window shrink
+    // to the map UI size together, as the removed map window shrink did, and the
+    // UI covers all of it (build_ui_quad_layer). Not in 2D, where the panel size
+    // comes from the UI plane settings and a narrower render would only crop the
+    // map.
+    if (!hooks::marker_camera_available() && hooks::in_map_view() && !flat_screen_active())
+        s *= g_mapUiScale.load();
     return s;
 }
 // (A rendered_fov_scale() helper used to live here, returning
@@ -125,10 +332,11 @@ float composited_fov_scale()
 // scales the angle, the window scale must scale the tangent to match how
 // eye_frustum_half_angles() applies it at submission. render_hfov_deg() now
 // applies each in its own space; see there.)
-// Vertical recenter amount (radians), applied as a pure pose pitch at
-// composition-layer submission -- for correcting a vertically-miscentred
-// image (e.g. black bar at bottom, image sitting too high). Positive pitches
-// the gaze direction down (reveals more at the bottom). Config-file / in-game
+// Vertical recenter amount (radians), a tilt of the whole eye -- the game's
+// camera and the submitted pose together (submitted_vertical_pitch()) -- for
+// correcting a vertically-miscentred image (e.g. black bar at bottom, image
+// sitting too high). It moves which part of the world is drawn, never where
+// the world is. Positive turns the view up. Config-file / in-game
 // settings UI tunable so it can be re-derived/A-B-tested live against the
 // vertical FOV-asymmetry bias (docs/vr_framework_learnings.md Fix 1) without
 // a rebuild.
@@ -147,9 +355,8 @@ std::atomic<float> g_vertOffset{0.0f};
 // build_ui_quad_layer().
 //
 // Placement is two cases, not one:
-//   MAP/GARAGE   forced head-locked at the render's own angular size, so a
-//                screen-space marker lands on the same ray it would have if it
-//                were still painted into the eye image. Nothing here applies.
+//   MAP          forced head-locked at the render's own angular size times
+//                g_mapUiScale, about the same centre. Nothing here applies.
 //   EVERYTHING   a real width in metres at a real distance in metres, placed
 //   ELSE         either head-locked or pinned in the world. The two are
 //                independent the way physical objects are: moving it away
@@ -162,6 +369,12 @@ std::atomic<float> g_uiPlaneDistM{7.00f};               // config is authoritati
 // fraction-of-the-view sizing produced at its 50% default on a ~100 deg
 // headset -- i.e. the defaults look like they always did.
 std::atomic<float> g_uiPlaneSizeM{8.00f};               // config is authoritative
+// THE UI QUAD AS LAST SUBMITTED: its size and whether it was pinned. Read on
+// the game's update thread by ui_plane_in_camera(), which has to describe the
+// plane the compositor was actually given rather than derive its own.
+std::atomic<float> g_uiQuadWidthM{0.0f};
+std::atomic<float> g_uiQuadHeightM{0.0f};
+std::atomic<bool>  g_uiQuadPinned{false};
 
 // WORLD-PINNED POSE, in the runtime's own space -- which is what makes it
 // survive a recenter. xr::request_recenter() re-snaps g_originQuat/g_originPos,
@@ -260,6 +473,19 @@ std::atomic<bool> g_uiPlaneFailed{false};
 SRWLOCK  g_renderViewLock = SRWLOCK_INIT;
 XrView   g_renderView[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
 bool     g_renderViewValid = false;      // guarded by g_renderViewLock
+// SYNCHED SEQUENTIAL: the views both renders of one moment are built from,
+// latched at the Present before its first render and held through the
+// second -- so the pair shares one head pose as well as one moment. Also
+// guarded by g_renderViewLock; record_applied_eye_offset() snapshots these
+// instead of g.lastView while they are valid.
+XrView   g_ssViews[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+bool     g_ssViewsValid = false;
+// The views of the camera build whose image is ON SCREEN this Present -- what
+// that image was actually rendered from, and so what both AER and Synched
+// Sequential declare for it. Also under g_renderViewLock; set by
+// update_on_screen().
+XrView   g_onScreenViews[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+bool     g_onScreenViewsValid = false;
 
 SRWLOCK  g_cantLock = SRWLOCK_INIT;
 float    g_cantQuat[2][4] = {{0,0,0,1}, {0,0,0,1}};  // per-eye, guarded by g_cantLock
@@ -356,6 +582,10 @@ constexpr float kDibrRightIsScreenRight = +1.0f;
 // for, and its failure mode is disocclusion artefacts rather than a clean
 // fallback.
 std::atomic<bool> g_dibrShift{false};
+// DIBR shift as it runs, rather than as set: off while DLSS upscales, because
+// it reprojects the game's frame into the other eye on the frame's own pixel
+// grid, and the eye images are then on a larger one (upscale_canvas()).
+bool dibr_shift_runs();
 
 // Stale-eye warp on/off. Nothing else switches it off, and without this there
 // is no way to tell "the warp is wrong" from "what it is warping is wrong".
@@ -388,8 +618,14 @@ std::atomic<bool> g_warpEnabled{true};   // config is authoritative (WarpEnabled
 // Defaults to the headset pose: the stronger levels change what every warped
 // frame is built from, and their failure mode is a warp tracking something
 // other than your head, which is worse than the under-correction it replaces.
-enum WarpType { kWarpHeadset = 0, kWarpGameRot = 1, kWarp6Dof = 2 };
-std::atomic<int> g_warpType{kWarpGameRot};   // config is authoritative
+//   kWarpMotion    kWarp6Dof with the game's own motion vectors moving each pixel
+//                  (render/motion_field.hpp) where the rigid-truck mask used to
+//                  classify it -- the mask and the truck-frame handling were
+//                  stand-ins for vectors the engine was believed not to have.
+//                  Needs the game's TAA, which draws the velocity buffer; every
+//                  frame without a usable field runs kWarp6Dof exactly.
+enum WarpType { kWarpHeadset = 0, kWarpGameRot = 1, kWarp6Dof = 2, kWarpMotion = 3 };
+std::atomic<int> g_warpType{kWarpMotion};   // config is authoritative
 
 
 // How many times the rendered-camera warp has run vs fallen back to the pose
@@ -707,7 +943,7 @@ void mat3_mul(const float A[9], const float B[9], float out[9])
 // from the CURRENT image's pixel, this projects to where that same world ray
 // appears in the OLD (retained) image. Two separate K's -- not one shared --
 // because FOV can differ between when the retained eye was captured and now
-// (composited_fov_scale() changes on F5/F6 and map-view entry/exit).
+// (composited_fov_scale() changes with the render size slider).
 // cx=cy=0.5 is safe specifically because this file always submits symmetric
 // frusta (angleLeft=-angleRight, angleUp=-angleDown) -- not a general
 // assumption. Also returns the relative rotation angle (radians) via
@@ -881,7 +1117,11 @@ struct XrState {
     bool running            = false;
 
     int64_t swapFormat = 0;
+    // The eye images (the swapchains), and the game's frame. The same size,
+    // except when DLSS upscales: then the frame is the render size and the
+    // eye images are what DLSS brings it up to -- see upscale_canvas().
     uint32_t width = 0, height = 0;
+    uint32_t bbWidth = 0, bbHeight = 0;
 
     std::vector<ComPtr<ID3D11RenderTargetView>> rtvs[2];  // per eye, one per XR image
     XrView   lastView[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};  // last located eye poses/FOVs
@@ -900,6 +1140,22 @@ struct XrState {
     // per-eye like eyeFresh/lastView (the stale eye is resubmitted as-is).
     // {0,0},{0,0} = not yet drawn -> callers fall back to the full image.
     XrRect2Di blitRect[2] = {};
+
+    // SYNCHED SEQUENTIAL. Each eye's finished image waits here -- composited
+    // exactly as AER would put it in the swapchain -- until the other render
+    // of the same moment arrives; then both go into the swapchains together.
+    // Released one at a time, a new left eye would sit beside the previous
+    // pair's right eye for a frame, which is AER again.
+    ComPtr<ID3D11Texture2D>        ssPending[2];
+    ComPtr<ID3D11RenderTargetView> ssPendingRtv[2];
+    uint32_t  ssPendingPair[2]  = {0, 0};
+    bool      ssPendingValid[2] = {false, false};
+    XrView    ssPendingView[2][2] = {{{XR_TYPE_VIEW}, {XR_TYPE_VIEW}}, {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}}};
+    XrRect2Di ssPendingRect[2]  = {};
+    // The pair in the swapchains, and the views it was rendered from -- what
+    // every Present declares until the next pair is complete.
+    bool      ssCommitted = false;
+    XrView    ssCommittedView[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
 
     // Blit pipeline (backbuffer -> XR image, handles BGRA/size differences).
     ComPtr<ID3D11Device>          device;
@@ -937,7 +1193,7 @@ struct XrState {
     DXGI_FORMAT prevEyeFormat[2] = {DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN};
     uint32_t    prevEyeW[2] = {0, 0}, prevEyeH[2] = {0, 0};
     bool        prevEyeValid[2] = {false, false};   // false until that eye's first real render
-    float       prevEyeOrient[2][4] = {{0,0,0,1}, {0,0,0,1}};  // orientation AT CAPTURE (lastView[eye].pose.orientation)
+    float       prevEyeOrient[2][4] = {{0,0,0,1}, {0,0,0,1}};  // orientation AT CAPTURE, as rendered (rendered_orientation())
     float       prevEyeHalfAngleH[2] = {0, 0}, prevEyeHalfAngleV[2] = {0, 0};  // frustum half-angles AT CAPTURE
     // Principal point AT CAPTURE, 0.5/0.5 unless the eye was rendered
     // off-centre. Stored beside the angles because they describe one frustum
@@ -997,9 +1253,19 @@ struct XrState {
     // per eye for the same reason the depth is: rigidmask's live texture is
     // cleared every Present and describes whichever eye the game rendered
     // last, which is not the eye being synthesized.
+    // Valid only when copied with this eye's latest retain: the mask is not
+    // drawn at all while the motion-vector warp's fields are arriving.
     ComPtr<ID3D11Texture2D>          prevEyeRigid[2];
     ComPtr<ID3D11ShaderResourceView> prevEyeRigidSrv[2];
     UINT     prevEyeRigidW[2] = {0, 0}, prevEyeRigidH[2] = {0, 0};
+    bool     prevEyeRigidValid[2] = {false, false};
+    // The retained frame's MIRRORS, for the motion-vector warp, which leaves
+    // them to the rotation-only base (render/reproject.hpp, mirrorMaskSrv).
+    // Valid only when copied with this eye's latest retain.
+    ComPtr<ID3D11Texture2D>          prevEyeMirror[2];
+    ComPtr<ID3D11ShaderResourceView> prevEyeMirrorSrv[2];
+    UINT     prevEyeMirrorW[2] = {0, 0}, prevEyeMirrorH[2] = {0, 0};
+    bool     prevEyeMirrorValid[2] = {false, false};
     float    prevEyeViewProj[2][16] = {};
     // The VIEW as well as the viewProj: the rigid branch needs the camera's
     // position at the retained instant, and only the view carries it.
@@ -1011,6 +1277,9 @@ struct XrState {
     float    prevEyeProjB[2] = {0.1f, 0.1f};
     bool     prevEyeProjValid[2] = {false, false};
     bool     prevEyeMatricesValid[2] = {false, false};
+    // The camera build the retained image was drawn with (0 = not known): the
+    // motion-vector warp only applies a field measured against THIS image.
+    uint32_t prevEyeBuild[2] = {0, 0};
     DXGI_FORMAT dibrFillFormat = DXGI_FORMAT_UNKNOWN;
     uint32_t    dibrFillW = 0, dibrFillH = 0;
 
@@ -1046,6 +1315,9 @@ struct XrState {
     bool uiQuadImageValid = false;
     int  uiQuadIdle = 0;
 } g;
+
+bool upscaled_canvas() { return g.bbWidth && (g.width != g.bbWidth || g.height != g.bbHeight); }
+bool dibr_shift_runs() { return g_dibrShift.load() && !upscaled_canvas(); }
 
 // --- DIBR shift projection parameters, derived live from the game's own camera CB ---
 // proj = viewProj * view^-1; the depth row gives z_ndc = A + B/z_view, and
@@ -1669,6 +1941,36 @@ bool ensure_prev_eye_rigid(int eye)
     return true;
 }
 
+// Same as ensure_prev_eye_rigid(), for the mirror mask.
+bool ensure_prev_eye_mirror(int eye, ID3D11Texture2D* live)
+{
+    if (!live || !g.device) return false;
+    D3D11_TEXTURE2D_DESC sd{};
+    live->GetDesc(&sd);
+    if (g.prevEyeMirror[eye] &&
+        g.prevEyeMirrorW[eye] == sd.Width && g.prevEyeMirrorH[eye] == sd.Height)
+        return true;
+    g.prevEyeMirror[eye].Reset();
+    g.prevEyeMirrorSrv[eye].Reset();
+    g.prevEyeMirrorW[eye] = g.prevEyeMirrorH[eye] = 0;
+    D3D11_TEXTURE2D_DESC td = sd;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    td.CPUAccessFlags = 0;
+    td.MiscFlags = 0;
+    if (FAILED(g.device->CreateTexture2D(&td, nullptr, &g.prevEyeMirror[eye])) ||
+        FAILED(g.device->CreateShaderResourceView(g.prevEyeMirror[eye].Get(), nullptr,
+                                                  &g.prevEyeMirrorSrv[eye]))) {
+        VRLOG("prevEyeMirror[%d] create failed (%ux%u)", eye, sd.Width, sd.Height);
+        g.prevEyeMirror[eye].Reset();
+        g.prevEyeMirrorSrv[eye].Reset();
+        return false;
+    }
+    g.prevEyeMirrorW[eye] = sd.Width;
+    g.prevEyeMirrorH[eye] = sd.Height;
+    return true;
+}
+
 bool ensure_prev_eye_depth(int eye)
 {
     hooks::SceneDepth probe{};
@@ -1888,6 +2190,79 @@ bool running_under_wine()
 constexpr bool kTestSingleQuadOnWindows = false;
 bool single_quad_runtime() { return kTestSingleQuadOnWindows || running_under_wine(); }
 
+// THE EYE IMAGES FOR A GAME FRAME OF THIS SIZE: the same size, unless DLSS
+// upscales. Then the frame is its mode's render size, and the eye images are the
+// size it is scaled up to (ForceGameResolution), which DLSS brings each eye up to
+// at Present. Only when the frame really is that render size -- anything else (a
+// window clamped by Windows, a fullscreen switch before the first Present) keeps
+// the 1:1 canvas, where a stretch could at least not distort.
+void eye_size_for_frame(uint32_t frameW, uint32_t frameH, uint32_t& w, uint32_t& h)
+{
+    w = frameW;
+    h = frameH;
+    int ow = 0, oh = 0, rw = 0, rh = 0;
+    if (!hooks::upscale_session(ow, oh, rw, rh)) return;
+    if ((int)frameW == rw && (int)frameH == rh) {
+        w = (uint32_t)ow;
+        h = (uint32_t)oh;
+        VRLOG("XR canvas: %ux%u eye images from a %ux%u game frame -- DLSS %s upscales each eye",
+              w, h, frameW, frameH, dlss::mode_name(hooks::upscale_mode_applied()));
+    } else {
+        VRLOG("DLSS upscaling: the game's frame is %ux%u, not the %dx%d its window was sized "
+              "to -- no upscaling", frameW, frameH, rw, rh);
+    }
+}
+
+// Two swapchains (one per eye) — AER routes alternate backbuffers into each, and
+// both are submitted every frame (the stale eye is resubmitted). On failure
+// whatever was made so far is left in `sc` and `rtvs` for the caller to destroy.
+bool create_eye_images(ID3D11Device* dev, uint32_t w, uint32_t h, XrSwapchain (&sc)[2],
+                       std::vector<ComPtr<ID3D11RenderTargetView>> (&rtvs)[2])
+{
+    for (int eye = 0; eye < 2; ++eye) {
+        XrSwapchainCreateInfo xsci{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+        xsci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+        xsci.format = g.swapFormat;
+        xsci.width = w;
+        xsci.height = h;
+        xsci.sampleCount = 1;
+        xsci.faceCount = 1;
+        xsci.arraySize = 1;
+        xsci.mipCount = 1;
+        XR_TRY(xrCreateSwapchain(g.session, &xsci, &sc[eye]), "xrCreateSwapchain");
+
+        uint32_t imgCount = 0;
+        xrEnumerateSwapchainImages(sc[eye], 0, &imgCount, nullptr);
+        std::vector<XrSwapchainImageD3D11KHR> images(imgCount, {XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR});
+        XR_TRY(xrEnumerateSwapchainImages(sc[eye], imgCount, &imgCount,
+                                          (XrSwapchainImageBaseHeader*)images.data()),
+               "xrEnumerateSwapchainImages");
+        rtvs[eye].resize(imgCount);
+        for (uint32_t i = 0; i < imgCount; ++i) {
+            D3D11_RENDER_TARGET_VIEW_DESC rd{};
+            rd.Format = (DXGI_FORMAT)g.swapFormat;
+            rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+            if (FAILED(dev->CreateRenderTargetView(images[i].texture, &rd, &rtvs[eye][i]))) {
+                VRLOG("XR image RTV create failed");
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+void destroy_eye_images(XrSwapchain (&sc)[2],
+                        std::vector<ComPtr<ID3D11RenderTargetView>> (&rtvs)[2])
+{
+    for (int eye = 0; eye < 2; ++eye) {
+        rtvs[eye].clear();     // our views on its images go before it
+        if (sc[eye] != XR_NULL_HANDLE) {
+            xrDestroySwapchain(sc[eye]);
+            sc[eye] = XR_NULL_HANDLE;
+        }
+    }
+}
+
 bool init(IDXGISwapChain* swapchain)
 {
     running_under_wine();   // decided, and logged, before anything depends on it
@@ -1906,8 +2281,9 @@ bool init(IDXGISwapChain* swapchain)
     // the simple 1:1 relationship: whatever the backbuffer actually is, the
     // XR canvas mirrors it exactly, same as before all resolution experiments.
     {
-        g.width  = scd.BufferDesc.Width;
-        g.height = scd.BufferDesc.Height;
+        g.bbWidth  = scd.BufferDesc.Width;
+        g.bbHeight = scd.BufferDesc.Height;
+        eye_size_for_frame(g.bbWidth, g.bbHeight, g.width, g.height);
     }
 
     // The runtime's own recommendation, logged against what we are actually
@@ -1983,37 +2359,8 @@ bool init(IDXGISwapChain* swapchain)
     if (!g.swapFormat && !formats.empty())
         g.swapFormat = formats[0];
 
-    // Two swapchains (one per eye) — AER routes alternate backbuffers into each,
-    // and both are submitted every frame (the stale eye is resubmitted).
-    for (int eye = 0; eye < 2; ++eye) {
-        XrSwapchainCreateInfo xsci{XR_TYPE_SWAPCHAIN_CREATE_INFO};
-        xsci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
-        xsci.format = g.swapFormat;
-        xsci.width = g.width;
-        xsci.height = g.height;
-        xsci.sampleCount = 1;
-        xsci.faceCount = 1;
-        xsci.arraySize = 1;
-        xsci.mipCount = 1;
-        XR_TRY(xrCreateSwapchain(g.session, &xsci, &g.swapchain[eye]), "xrCreateSwapchain");
-
-        uint32_t imgCount = 0;
-        xrEnumerateSwapchainImages(g.swapchain[eye], 0, &imgCount, nullptr);
-        std::vector<XrSwapchainImageD3D11KHR> images(imgCount, {XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR});
-        XR_TRY(xrEnumerateSwapchainImages(g.swapchain[eye], imgCount, &imgCount,
-                                          (XrSwapchainImageBaseHeader*)images.data()),
-               "xrEnumerateSwapchainImages");
-        g.rtvs[eye].resize(imgCount);
-        for (uint32_t i = 0; i < imgCount; ++i) {
-            D3D11_RENDER_TARGET_VIEW_DESC rd{};
-            rd.Format = (DXGI_FORMAT)g.swapFormat;
-            rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
-            if (FAILED(dev->CreateRenderTargetView(images[i].texture, &rd, &g.rtvs[eye][i]))) {
-                VRLOG("XR image RTV create failed");
-                return false;
-            }
-        }
-    }
+    if (!create_eye_images(dev.Get(), g.width, g.height, g.swapchain, g.rtvs))
+        return false;
 
     if (!build_blit(dev.Get()))
         return false;
@@ -2385,12 +2732,24 @@ void eye_frustum_base(uint32_t eye, float& aspect, float& baseH)
 // hand-dialled VerticalRecenter of -8 deg that only happened to be right for
 // this headset.
 //
-// Applied as a pitch on the SUBMITTED pose, which is the same mechanism the
-// manual slider already uses -- the content is rendered unpitched and we tell
-// the compositor it points lower than it does, so it lands lower on the
-// display. Not as an asymmetric angleUp/angleDown, which was tried and reverted
-// (docs/vr_framework_learnings.md Fix 1): declaring symmetric content under an
-// asymmetric window warps it.
+// Applied as a TILT OF THE WHOLE EYE: the camera is pitched by it (head_look())
+// and the submitted pose is pitched by the same amount (rendered_orientation()),
+// so the symmetric frustum is aimed at the middle of the panel and the world
+// still lands where it really is. Not as an asymmetric angleUp/angleDown, which
+// was tried and reverted (docs/vr_framework_learnings.md Fix 1): declaring
+// symmetric content under an asymmetric window warps it.
+//
+// IT USED TO TILT ONLY THE DECLARED POSE, with the content rendered level --
+// telling the compositor the image pointed lower than it did. That moves the
+// image down the panel, and the whole world with it: displayed rotated by the
+// tilt in the HEAD's frame, a rotation that swings with the head. Inside a 3D
+// scene nothing shows it, because everything moves together. A world-pinned
+// quad is the one thing the compositor places truthfully, so it had to be
+// counter-rotated to stay on that displaced world -- and on the screens where
+// the quad is all there is (intro, loading, the pause menu) it then rolled
+// visibly as the head turned left and right. Fixed 2026-10-29 by rendering the
+// tilt instead of only declaring it; place_ui_plane_quad() lost its
+// correction with it.
 //
 // CACHED like g_cachedBaseHFov, and for the same reason -- this is a fixed
 // property of the optics, and resampling a semantically constant value every
@@ -2423,14 +2782,44 @@ float fov_center_pitch_cached()
     return pitch;
 }
 
-// THE PITCH ACTUALLY SUBMITTED: the optics' own offset plus whatever the user
-// dialled in on top. Every site that pitches a pose or a quad uses this one
-// function, because a quad left on the manual term alone would drift off centre
-// by exactly the automatic one -- the same failure the manual term already had
+// THE EYE'S VERTICAL TILT: the optics' own offset plus whatever the user
+// dialled in on top. The camera (head_look()), the submitted pose
+// (rendered_orientation()) and the head-locked quads all use this one function,
+// because a quad left on the manual term alone would drift off centre by
+// exactly the automatic one -- the same failure the manual term already had
 // before the quads were taught to follow it.
+//
+// NO AUTOMATIC TERM UNDER OFF-CENTRE PROJECTION. That render already IS the
+// eye's own lopsided frustum, aimed down the optical axis, so it covers the
+// panel exactly; tilting it as well would push it off the top by the same
+// amount. It used to be added anyway.
 float submitted_vertical_pitch()
 {
-    return fov_center_pitch_cached() + g_vertOffset.load();
+    const float automatic = offcenter_projection() ? 0.0f : fov_center_pitch_cached();
+    return automatic + g_vertOffset.load();
+}
+
+// That tilt as a rotation about the eye's own right axis. Positive turns the
+// view up (OpenXR: +Y up, -Z forward).
+Quat vertical_tilt()
+{
+    const float half = submitted_vertical_pitch() * 0.5f;
+    return {std::sin(half), 0.0f, 0.0f, std::cos(half)};
+}
+
+// THE ORIENTATION A FRAME IS RENDERED AT, given the runtime eye orientation it
+// was built from: that eye's synthetic test cant, then the vertical tilt, both
+// in the eye's own frame -- the rotations head_look() hands the camera, in the
+// same order. The submission declares exactly this, and the stale-eye warp maps
+// between two of these, so neither describes a frame other than the one drawn.
+//
+// The HARDWARE cant needs nothing here: the runtime's eye pose already
+// contains it, and head_look() adds it to the camera to match.
+Quat rendered_orientation(const XrQuaternionf& eyeOrientation, int eye)
+{
+    const Quat q{eyeOrientation.x, eyeOrientation.y, eyeOrientation.z,
+                 eyeOrientation.w};
+    return mul(mul(q, debug_cant(eye)), vertical_tilt());
 }
 
 // Frustum half-angles actually submitted for `eye` under its current
@@ -2466,7 +2855,7 @@ void eye_frustum_half_angles(uint32_t eye, float& hh, float& vh)
     float aspect, baseH;
     eye_frustum_base(eye, aspect, baseH);
     // Horizontal is declared at exactly the headset's own horizontal FOV (times
-    // the map window scale), which is what PROJ LOCK rendered -- so the image
+    // the render size), which is what PROJ LOCK rendered -- so the image
     // spans the display's full width and is never cropped left/right, whatever
     // shape the canvas is. Vertical follows the CONTENT's aspect, because that
     // is what the game's projection used for p11. If the canvas is squarer than
@@ -2509,7 +2898,11 @@ XrPosef reference_view_pose(uint32_t eye)
 {
     XrPosef out = g.lastView[eye].pose;
     AcquireSRWLockShared(&g_renderViewLock);
-    if (g_renderViewValid) out = g_renderView[eye].pose;
+    // The build ON SCREEN, which is not the latest one on the map, garage and
+    // menus -- see update_on_screen(). Declaring the latest build's pose there
+    // put every eye a frame of head motion away from what it showed.
+    if (g_onScreenViewsValid)   out = g_onScreenViews[eye].pose;
+    else if (g_renderViewValid) out = g_renderView[eye].pose;
     ReleaseSRWLockShared(&g_renderViewLock);
     return out;
 }
@@ -2616,18 +3009,21 @@ bool ensure_menu_swapchain(uint32_t w, uint32_t h)
     return true;
 }
 
-// The smaller of the up/down half-angles of the eye views last submitted, in
-// radians; 0 until the first projection layer. See build_menu_quad_layer.
+// The smaller of the up/down half-angles of the eye views last submitted, and
+// the smaller of the left/right ones that both eyes can see, in radians; 0
+// until the first projection layer. See build_menu_quad_layer.
 std::atomic<float> g_submittedHalfV{0.0f};
+std::atomic<float> g_submittedHalfH{0.0f};
 
 // Builds and renders a headset-visible quad layer for the mod settings panel
 // when (and only when) the menu is open, reusing the SAME ImGui draw data
 // hooks::menu_hook_update() already built earlier this Present (see
 // swapchain_hook.cpp's Detour_Present ordering) -- never rebuilt here. Head-
 // locked (viewSpace): floats a fixed distance in front of the eyes regardless
-// of head orientation, so no pose math is needed. Cropped to just the
-// settings panel's own bounds (hooks::menu_panel_rect()) rather than the
-// whole (mostly empty) desktop-sized texture.
+// of head orientation, so no pose math is needed. Cropped to what the menu
+// actually drew -- the panel and any tooltip or popup reaching past it
+// (hooks::menu_drawn_rect()) -- rather than the whole (mostly empty)
+// desktop-sized texture.
 bool build_menu_quad_layer(XrCompositionLayerQuad& quad)
 {
     uint32_t w = 0, h = 0;
@@ -2655,38 +3051,48 @@ bool build_menu_quad_layer(XrCompositionLayerQuad& quad)
     XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
     xrReleaseSwapchainImage(g.menuSwapchain, &ri);
 
+    // THE PANEL places the quad; WHAT WAS DRAWN sizes it. A tooltip or popup
+    // reaching past the panel grows the quad around it, and the panel stays
+    // exactly where it was.
     int px = 0, py = 0, pw = 0, ph = 0;
-    if (!hooks::menu_panel_rect(px, py, pw, ph)) {
-        px = 0; py = 0; pw = (int)w; ph = (int)h;   // fall back to the whole texture
-    }
-    // Small padding so the panel's drop shadow/border isn't clipped.
+    if (!hooks::menu_panel_rect(px, py, pw, ph))
+        return false;   // not laid out yet -- nothing to place it by
+    int dx = px, dy = py, dw = pw, dh = ph;
+    hooks::menu_drawn_rect(dx, dy, dw, dh);   // leaves the panel's rect if none
+    // Small padding so the window border isn't clipped.
     constexpr int kPad = 12;
-    px = (std::max)(0, px - kPad);
-    py = (std::max)(0, py - kPad);
-    pw = (std::min)((int)w - px, pw + kPad * 2);
-    ph = (std::min)((int)h - py, ph + kPad * 2);
+    const int x0 = (std::max)(0, dx - kPad);
+    const int y0 = (std::max)(0, dy - kPad);
+    const int x1 = (std::min)((int)w, dx + dw + kPad);
+    const int y1 = (std::min)((int)h, dy + dh + kPad);
+    if (x1 <= x0 || y1 <= y0)
+        return false;   // dragged entirely off the texture
 
-    // Width in metres from the menu's UI size (hooks::menu_quad_width_m: 0.42 m
-    // at 100%), at a comfortable reading distance; height follows the cropped
-    // panel's own pixel aspect ratio so the UI isn't stretched.
+    // ONE PIXEL, ONE SIZE: metres per panel pixel, a metre away
+    // (hooks::menu_quad_metres_per_px -- the default-width panel is 0.42 m at
+    // 100%). The quad is as big as what it shows, so dragging the window wider
+    // makes the panel wider in the headset rather than smaller, and the UI size
+    // slider -- which scales the pixels -- makes all of it bigger.
     //
-    // The width SCALES with the UI size. It used to be fixed, so a bigger UI
-    // packed more pixels into the same quad and only the text grew against the
-    // widgets around it -- the panel itself never got any bigger to look at.
-    const float quadWidthM = hooks::menu_quad_width_m();
+    // It used to be a fixed WIDTH in metres for whatever the crop came to, and
+    // the window sized itself to its content: every tab with a longer line, and
+    // every popup the crop had to take in, shrank the whole panel.
+    const float mpp = hooks::menu_quad_metres_per_px();
     constexpr float kQuadDistM = 1.0f;
-    float aspect = (pw > 0) ? (float)ph / (float)pw : 1.0f;
 
-    // How tall the panel may get before it scrolls instead (hooks reads this
+    // How big the panel may get before it scrolls instead (hooks reads this
     // next frame): the quad is head-locked, so anything past the edge of the
-    // view could never be looked at. The smaller of the two eyes' up/down
-    // half-angles as SUBMITTED -- the map view shrinks them -- and a share of
-    // that, so the panel ends well inside the picture rather than at its rim.
+    // view could never be looked at. The smaller of the two eyes' half-angles
+    // -- vertically as SUBMITTED, which the map view shrinks; horizontally what
+    // BOTH eyes can see -- and a share of that, so the panel ends well inside
+    // the picture rather than at its rim.
     {
-        constexpr float kMenuFovShare = 0.6f;
-        const float half = g_submittedHalfV.load();
-        hooks::set_menu_quad_max_height_m(
-            half > 0.0f ? 2.0f * kQuadDistM * std::tan(half * kMenuFovShare) : 0.0f);
+        constexpr float kMenuFovShareV = 0.6f, kMenuFovShareH = 0.8f;
+        const float halfV = g_submittedHalfV.load();
+        const float halfH = g_submittedHalfH.load();
+        hooks::set_menu_quad_max_size_m(
+            halfH > 0.0f ? 2.0f * kQuadDistM * std::tan(halfH * kMenuFovShareH) : 0.0f,
+            halfV > 0.0f ? 2.0f * kQuadDistM * std::tan(halfV * kMenuFovShareV) : 0.0f);
     }
 
     quad.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
@@ -2694,12 +3100,12 @@ bool build_menu_quad_layer(XrCompositionLayerQuad& quad)
     quad.space = g.viewSpace;   // head-locked
     quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
     quad.subImage.swapchain = g.menuSwapchain;
-    quad.subImage.imageRect = {{px, py}, {pw, ph}};
+    quad.subImage.imageRect = {{x0, y0}, {x1 - x0, y1 - y0}};
     quad.subImage.imageArrayIndex = 0;
-    // Follow the vertical recenter. The projection layer pitches each eye by
-    // this angle (see g_vertOffset in the submission code), so a quad left at
-    // identity sits wherever the UNPITCHED forward pointed -- i.e. it drifts off
-    // centre by exactly the recenter amount, which is what made the top run off
+    // Follow the vertical tilt. Every eye is rendered and declared tilted by
+    // this angle (see submitted_vertical_pitch()), so the middle of the image
+    // is that far off the head's forward, and a quad left at identity would
+    // sit off centre by exactly the tilt -- which is what made the top run off
     // the rendered image.
     //
     // Both the orientation AND the position are rotated: turning the quad alone
@@ -2707,11 +3113,16 @@ bool build_menu_quad_layer(XrCompositionLayerQuad& quad)
     // pitch takes the view forward toward +Y, so the panel rides up with it.
     const float vpitch = submitted_vertical_pitch();
     const float vhalf  = vpitch * 0.5f;
-    quad.pose.orientation = {std::sin(vhalf), 0.0f, 0.0f, std::cos(vhalf)};
-    quad.pose.position = {0.0f,
-                          kQuadDistM * std::sin(vpitch),
-                          -kQuadDistM * std::cos(vpitch)};
-    quad.size = {quadWidthM, quadWidthM * aspect};
+    const Quat  q{std::sin(vhalf), 0.0f, 0.0f, std::cos(vhalf)};
+    // The PANEL's centre goes straight ahead along that tilt; the crop's centre
+    // is wherever the extra windows put it relative to that (image y is down,
+    // the quad's y is up).
+    const float offX =  ((float)(x0 + x1) * 0.5f - ((float)px + (float)pw * 0.5f)) * mpp;
+    const float offY = -((float)(y0 + y1) * 0.5f - ((float)py + (float)ph * 0.5f)) * mpp;
+    const Vec3  c = rotate(q, {offX, offY, -kQuadDistM});
+    quad.pose.orientation = {q.x, q.y, q.z, q.w};
+    quad.pose.position = {c.x, c.y, c.z};
+    quad.size = {(float)(x1 - x0) * mpp, (float)(y1 - y0) * mpp};
     return true;
 }
 
@@ -2828,20 +3239,23 @@ Quat level_look(Quat q)
 // (IPD/2)/distance in each eye, and only something effectively infinite lined
 // up. That assumed the plane had to serve both eyes equally.
 //
-// It does not. The capture comes from ONE eye (kUiCaptureEye) and the plane is
-// hung on THAT eye -- centred on its position, along its axis, subtending its
-// frustum -- so the capture eye overlays its own render exactly at ANY
-// distance. Distance is free, and what it changes is the OTHER eye: shifted by
-// roughly IPD/d, which is real stereo depth rather than a misalignment.
+// It does not. The plane is hung on ONE eye (kUiCaptureEye) -- centred on its
+// position, along its axis, subtending its frustum -- and the map's markers are
+// placed for the plane itself, from between the eyes (hooks/marker_camera.h),
+// which holds at ANY distance. Where the markers are the game's own, the
+// capture comes from that one eye and overlays its own render exactly, at any
+// distance too. Either way distance is free, and what it changes is real
+// stereo depth rather than a misalignment.
 //
 // So there is nothing map-specific left to tune, and it follows the UI plane's
 // own distance. The map's SIZE still tracks that distance (it is derived as
 // 2*d*tan(hh)) so its apparent size never moves -- only the depth it sits at.
 
-// Which eye's UI reaches the plane. Fixed rather than chosen: any consistent
-// answer removes the alternation, and a stable one keeps world-projected UI
-// (map markers, waypoint pips) sitting on a single eye's projection instead of
-// switching between two.
+// Which eye's UI reaches the plane on the screens where it cannot be both eyes'
+// (build_ui_quad_layer), and the eye a head-locked plane hangs on everywhere.
+// Fixed rather than chosen: any consistent answer removes the alternation, and
+// a stable one keeps UI the game projected itself sitting on a single eye's
+// projection instead of switching between two.
 constexpr int kUiCaptureEye = 0;
 
 // And which eye's WINCH MARKERS reach both eyes, for the same reason and with
@@ -2920,24 +3334,24 @@ void place_ui_plane_quad(XrCompositionLayerQuad& quad, XrTime displayTime,
 {
     const float dist = g_uiPlaneDistM.load();
 
-    // THE VERTICAL PITCH, used by both placements below.
+    // THE VERTICAL TILT, for the head-locked placement below.
     //
-    // It is there because the projection layer declares every eye at
-    // (eyePose * pitch(voff)), so a quad left at identity sits voff off the
-    // image it is drawn over. Head-locked applies it as a LOCAL rotation in
-    // viewSpace; the pinned branch has to conjugate it about the head, which is
-    // where the small residual roll comes from -- see the note there.
+    // Every eye is rendered and declared tilted by it (rendered_orientation()),
+    // so the middle of the image sits that far below the head's forward, and a
+    // head-locked quad has to be tilted the same to sit on it. The world-pinned
+    // placement needs none of it: the tilt is in the camera as well as the
+    // declared pose, so the world is displayed where it really is, and a quad
+    // pinned in it simply stays on it.
     //
     // ZERO ON A FLAT SCREEN, because in 2D there IS no projection layer -- the
-    // scene is a quad too and pv[] is never submitted. Nothing is displaced, so
-    // correcting for it would just push the panel off the forward you are
-    // actually looking down, and roll it on the way.
+    // scene is a quad too and pv[] is never submitted, and the game's camera
+    // carries no tilt there (head_look()).
     const float vpitchRad = flat_screen_active() ? 0.0f : submitted_vertical_pitch();
 
-    // THE HEAD, located once for both placements below. The world-pinned one
-    // needs it every frame to follow the vertical-recenter displacement; the
-    // map's eye-relative one needs it to express the capture eye in the quad's
-    // own space. Without it both fall back to plain head-centred placement.
+    // THE HEAD, located once for both placements below. The world pin is taken
+    // from it; the map's eye-relative placement needs it to express the
+    // capture eye in the quad's own space. Without it both fall back to plain
+    // head-centred placement.
     XrSpaceLocation loc{XR_TYPE_SPACE_LOCATION};
     constexpr XrSpaceLocationFlags kNeedLoc =
         XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT;
@@ -2986,66 +3400,18 @@ void place_ui_plane_quad(XrCompositionLayerQuad& quad, XrTime displayTime,
             // the pin was taken. Distance is read live so the slider still
             // moves the plane along that ray after pinning.
             const Vec3 off = rotate(qp, {0.0f, 0.0f, -dist});
-            const Vec3 pp{pivot.x + off.x, pivot.y + off.y, pivot.z + off.z};
 
-            // THE WORLD IS NOT WHERE THE RUNTIME THINKS IT IS, and a plane
-            // pinned in the runtime's space has to be moved to match.
-            //
-            // The vertical recenter is faked by DECLARING each eye at
-            // (eyePose * pitch(voff)) while rendering from the true one, so the
-            // projection layer's whole world is displayed rotated by voff. Quad
-            // layers do not use that declared pose -- the compositor locates
-            // them itself -- so a truthfully placed quad sits voff off the world
-            // it is drawn over. Rotating the quad by R = qh * pitch(voff) *
-            // qh^-1 about the head cancels that. voff = 0 makes R identity and
-            // this whole block a no-op.
-            //
-            // THE RESIDUAL IS A SMALL YAW-DEPENDENT ROLL, and it is ACCEPTED.
-            // R's axis is the head's current right axis, so it swings as the
-            // head turns; on a world-pinned plane that is a roll about the
-            // plane's own normal, worst where you are turned furthest from it.
-            // Visible as the intro logos rolling slightly when you look left
-            // and right, because there the plane is the only thing on screen.
-            //
-            // MEASURED 2026-09-20, all three arrangements, so none of them gets
-            // tried again:
-            //
-            //   R on BOTH (this)     small roll, one direction   <- kept
-            //   R on POSITION only   MUCH worse -- the two are one rigid
-            //                        rotation of the plane about the head, and
-            //                        half of it slides the panel around you
-            //                        without turning it to face you
-            //   R on NEITHER         rolls the OPPOSITE way
-            //
-            // That last result is the informative one: removing R does not
-            // remove the roll, it reverses it. So R is not the source -- it is
-            // very nearly the right correction and overshoots slightly, and
-            // something of opposite sign is in the chain with it. The remaining
-            // error is smaller than either extreme, which is why this is where
-            // it stays.
-            //
-            // The real fix is upstream and is NOT in this block: stop faking the
-            // vertical centring through the eye pose, and fold it into the
-            // projection instead. Then nothing downstream needs compensating and
-            // both branches lose the problem rather than trading its symptoms.
-            //
-            // The per-eye debug cant is deliberately NOT folded in: it differs
-            // between the eyes, and one quad has only one pose. It is a test
-            // knob that sits at 0 on real hardware.
-            const float vhalf = vpitchRad * 0.5f;
-            const Quat  pv{std::sin(vhalf), 0.0f, 0.0f, std::cos(vhalf)};
-            const Quat  R = mul(mul(qh, pv), conj(qh));
-            const Vec3  rel{pp.x - loc.pose.position.x,
-                            pp.y - loc.pose.position.y,
-                            pp.z - loc.pose.position.z};
-            const Vec3  rot = rotate(R, rel);
-            const Quat  qs = mul(R, qp);
-
+            // EXACTLY WHERE IT WAS PINNED, with no correction. There used to be
+            // one: while the vertical tilt was only DECLARED, the projection
+            // layer showed the whole world rotated by it about the head, and
+            // this quad was rotated by the same amount to stay on that world --
+            // which, with nothing else on screen (intro, loading, the pause
+            // menu), read as the plane rolling when you looked left and right.
+            // The camera is tilted as well now (head_look()), the world is
+            // where the runtime thinks it is, and a pinned plane needs nothing.
             quad.space = g.space;
-            quad.pose.orientation = {qs.x, qs.y, qs.z, qs.w};
-            quad.pose.position = {loc.pose.position.x + rot.x,
-                                  loc.pose.position.y + rot.y,
-                                  loc.pose.position.z + rot.z};
+            quad.pose.orientation = {qp.x, qp.y, qp.z, qp.w};
+            quad.pose.position = {pivot.x + off.x, pivot.y + off.y, pivot.z + off.z};
             pinned = true;
         }
     }
@@ -3097,6 +3463,11 @@ void place_ui_plane_quad(XrCompositionLayerQuad& quad, XrTime displayTime,
         // acquired visible parallax. Keep every head-locked UI plane on the
         // eye that actually produced its texture; size remains an independent
         // presentation choice, but pose identity no longer changes by screen.
+        //
+        // While the world markers are placed from between the eyes the texture
+        // is every frame's rather than this eye's, and the plane stays here all
+        // the same: those markers are placed for wherever the plane is
+        // (ui_plane_in_camera), and static UI has no eye of its own.
         if (haveHead) {
             const XrView& ev = g.lastView[kUiCaptureEye];
             const Quat qe{ev.pose.orientation.x, ev.pose.orientation.y,
@@ -3121,8 +3492,8 @@ void place_ui_plane_quad(XrCompositionLayerQuad& quad, XrTime displayTime,
 
 // Builds (and renders) the game UI's own composition layer. Head-locked or
 // pinned in the world, sized as a fraction of the render's own angular extent
-// -- except on the map, which is forced to the full extent so screen-space
-// markers line up with the map underneath them.
+// -- except on the map, which is forced head-locked at the map UI scale of the
+// full extent, with its markers placed for that plane.
 // THE SCENE, ON A PLANE. 2D mode's whole substance: the frame that would have
 // gone to the eye projection is shown on a quad instead, and the projection is
 // not submitted at all.
@@ -3231,11 +3602,17 @@ bool build_ui_quad_layer(XrCompositionLayerQuad& quad, XrTime displayTime)
     if (hh <= 1.0e-4f || vh <= 1.0e-4f)
         return false;
 
-    // ONE EYE'S UI, HALF THE RATE -- and this is where that eye is chosen, on
-    // the finished frame rather than from inside its draws (see
-    // redirect_if_ui). present_route_eye() is what the frame just rendered as,
-    // read after all of it: no race with the parity flip, and no exposure to
-    // the ~1% of Presents that carry no camera build.
+    // EVERY FRAME'S UI while the world markers are placed from between the eyes
+    // (hooks::marker_camera_placing()): then nothing in the UI depends on which
+    // eye a frame was rendered for, and either frame's is both eyes' UI.
+    //
+    // OTHERWISE ONE EYE'S UI, HALF THE RATE -- anything the game projected
+    // itself is in the eye's frame where it was drawn, and two frames would hand
+    // the plane two positions for it. This is where that eye is chosen, on the
+    // finished frame rather than from inside its draws (see redirect_if_ui).
+    // present_route_eye() is what the frame just rendered as, read after all of
+    // it: no race with the parity flip, and no exposure to the ~1% of Presents
+    // that carry no camera build.
     //
     // On the frames whose capture is discarded there is nothing to blit, and
     // the quad simply re-submits the image it last released: an XR swapchain
@@ -3252,7 +3629,8 @@ bool build_ui_quad_layer(XrCompositionLayerQuad& quad, XrTime displayTime)
     // plane instead of leaving the last image up.
     constexpr int kMaxUiQuadIdle = 4;
     const bool haveCapture = uilayer::drew_this_frame();
-    const bool wantEye     = (present_route_eye() == kUiCaptureEye);
+    const bool wantEye     = hooks::marker_camera_placing() ||
+                             present_route_eye() == kUiCaptureEye;
     if (haveCapture && (wantEye || g.uiQuadIdle >= kMaxUiQuadIdle)) {
         if (!refresh_ui_quad_image(src, w, h)) return false;
         g.uiQuadImageValid = true;
@@ -3283,19 +3661,28 @@ bool build_ui_quad_layer(XrCompositionLayerQuad& quad, XrTime displayTime)
     // is what the game drew into, so tan(vh)/tan(hh) is the shape that keeps
     // the UI unstretched.
     //
-    // THE MAP'S 3D SIZING IS NOT A MATTER OF TASTE: it subtends exactly the
-    // rendered view so a screen-space marker still points at the map feature
-    // under it, and neither slider applies. In 2D that reasoning is gone --
-    // the scene is on a plane of its own and the UI has to match THAT, so both
-    // planes take the UI size and the markers line up on the panel instead.
+    // THE MAP IN 3D is the rendered view's own extent, scaled about its centre
+    // by the map UI size, and neither slider applies. At 1 it overlays the
+    // render as the UI was drawn into it. Smaller, the markers still point at
+    // the map features under them, because their camera is built from this
+    // quad as submitted (ui_plane_in_camera); anything outside the smaller
+    // plane has no icon. Without that camera the window itself is the map UI
+    // size (composited_fov_scale()) and the UI covers all of it. In 2D that
+    // reasoning is gone -- the scene is on a plane of its own and the UI has to
+    // match THAT, so both planes take the UI size and the markers line up on
+    // the panel instead.
     const bool  mapLocked = hooks::in_map_view() && !flat_screen_active();
     const float dist   = g_uiPlaneDistM.load();
     const float shape  = std::tan(vh) / std::tan(hh);
-    const float widthM = mapLocked ? (2.0f * dist * std::tan(hh))
+    const float mapUi  = hooks::marker_camera_available() ? g_mapUiScale.load() : 1.0f;
+    const float widthM = mapLocked ? (2.0f * dist * std::tan(hh) * mapUi)
                                    : g_uiPlaneSizeM.load();
     quad.size = {widthM, widthM * shape};
 
     place_ui_plane_quad(quad, displayTime, mapLocked);
+    g_uiQuadWidthM.store(quad.size.width);
+    g_uiQuadHeightM.store(quad.size.height);
+    g_uiQuadPinned.store(quad.space == g.space);
     return true;
 }
 
@@ -3350,6 +3737,7 @@ void retain_eye_for_warp(uint32_t eye, ID3D11Texture2D* src = nullptr)
     }
     if (!ensure_prev_eye_tex((int)eye)) return;
     g.ctx->CopyResource(g.prevEyeTex[eye].Get(), src ? src : g.staging.Get());
+    g.prevEyeBuild[eye] = g_onScreenValid ? g_onScreenRec.build : 0;
 
     // RETAIN THE DEPTH AND THE CAMERA TOO, for the 6-DoF reprojection. Only
     // while it is switched on: this is a full-resolution copy, and the rotation
@@ -3375,9 +3763,21 @@ void retain_eye_for_warp(uint32_t eye, ID3D11Texture2D* src = nullptr)
                     // at reprojection time: swapchain_hook clears it later in
                     // this same Present, and by the time the other eye is
                     // synthesized it would describe the wrong eye's truck.
+                    g.prevEyeRigidValid[eye] = false;
                     if (ID3D11Texture2D* liveMask = rigidmask::texture()) {
-                        if (ensure_prev_eye_rigid((int)eye))
+                        if (ensure_prev_eye_rigid((int)eye)) {
                             g.ctx->CopyResource(g.prevEyeRigid[eye].Get(), liveMask);
+                            g.prevEyeRigidValid[eye] = true;
+                        }
+                    }
+                    // The mirrors of THIS frame too, for the same reason.
+                    g.prevEyeMirrorValid[eye] = false;
+                    if (warp_uses_motion()) {
+                        ID3D11Texture2D* liveMirror = mirrormask::texture();
+                        if (liveMirror && ensure_prev_eye_mirror((int)eye, liveMirror)) {
+                            g.ctx->CopyResource(g.prevEyeMirror[eye].Get(), liveMirror);
+                            g.prevEyeMirrorValid[eye] = true;
+                        }
                     }
                     std::memcpy(g.prevEyeViewProj[eye], viewProj, sizeof(viewProj));
                     std::memcpy(g.prevEyeView[eye], view, sizeof(view));
@@ -3392,8 +3792,9 @@ void retain_eye_for_warp(uint32_t eye, ID3D11Texture2D* src = nullptr)
     // The instant this image was RENDERED at, not the later locate that
     // happened to be current when it was retained -- see reference_view_pose().
     // The warp's source and target are now both render instants, so it maps
-    // between two things that were really rendered.
-    const XrQuaternionf q = reference_view_pose(eye).orientation;
+    // between two things that were really rendered. Tilted as the camera was,
+    // so source and target are both what was drawn (rendered_orientation()).
+    const Quat q = rendered_orientation(reference_view_pose(eye).orientation, (int)eye);
     g.prevEyeOrient[eye][0] = q.x; g.prevEyeOrient[eye][1] = q.y;
     g.prevEyeOrient[eye][2] = q.z; g.prevEyeOrient[eye][3] = q.w;
     if (!eye_warp_intrinsics((int)eye, g.prevEyeHalfAngleH[eye], g.prevEyeHalfAngleV[eye],
@@ -3496,7 +3897,8 @@ bool warp_homography_for(uint32_t stale, float hhNew, float vhNew,
     // Carry the stale eye to THIS frame's render instant, not to the current
     // locate. That is what the fresh eye already is, so both eyes end up in one
     // reference frame and the compositor moves them together.
-    const XrQuaternionf qn = reference_view_pose(stale).orientation;
+    const Quat qn = rendered_orientation(reference_view_pose(stale).orientation,
+                                         (int)stale);
     const float qNew[4] = {qn.x, qn.y, qn.z, qn.w};
 
     // THE TARGET INTRINSICS, taken here rather than from the caller. Both
@@ -3519,7 +3921,13 @@ bool warp_homography_for(uint32_t stale, float hhNew, float vhNew,
         qNew, hhNew, vhNew, &poseAngle, cx, cy);
 
     if (warp_uses_game_rot() && g.prevEyeCamValid[stale]) {
-        const bool cockpit = cockpit_camera();
+        // Only while the cockpit is actually being DRIVEN. logic_mode() keeps
+        // reading cockpit after a drive, in the garage and on the pause menu,
+        // and since the main camera is recognised on those screens too
+        // (cbuffer_hook.cpp, classify_cam) the rendered rotation there is the
+        // garage's orbiting camera -- the case this path must not take.
+        const bool cockpit = cockpit_camera() &&
+                             hooks::logic_camera_idle_ms() <= kDibrIdleMs;
         float mNew[9] = {};
         const bool rebuilt = rendered_cam_rot(mNew) &&
             std::memcmp(mNew, g.prevEyeCamRot[stale], sizeof(mNew)) != 0;
@@ -3557,24 +3965,28 @@ bool warp_homography_for(uint32_t stale, float hhNew, float vhNew,
 //
 // It assumes the eye offset MOVES THE CAMERA -- it displaces the view matrix
 // laterally and reprojects by the difference. That holds in gameplay, where the
-// cockpit and orbit cameras really are offset in world space.
+// cockpit and orbit cameras really are offset in world space, and since
+// 2026-10-27 it holds everywhere else too.
 //
-// It is false on the map, the garage and the main menu. Those screens hang
-// their AER eye offset on a SEPARATE projection site, applying it as a
-// projection-matrix shift with the OPPOSITE sign (kMapEyeSign in
-// viewbuild_hook.cpp), while xr::applied_eye() keeps reporting the gameplay
-// sign recorded at camera build. So the reprojection displaces by a value that
-// is both the wrong magnitude and the wrong direction, and since it alternates
-// with the eye it oscillates -- by an amount proportional to local disparity,
-// which is why it shows on near, high-frequency edges (the menu's bushes) and
-// not on distant ground. viewbuild_hook.cpp's note on kMapEyeSign describes the
-// identical failure reached by a different route, measured from a frame dump.
+// The map, the garage and the menus used to be left out, because they hung their
+// eye offset on a separate projection site with the opposite sign. So the
+// reprojection displaced by the wrong magnitude in the wrong direction, and since
+// that alternates with the eye it oscillated -- on near, high-frequency edges
+// (the menu's bushes) and not on distant ground. Neither is true now: those
+// cameras take their offset at the same build as gameplay (2026-08-12), with the
+// same sign (kMapEyeSign). What IS different there is that the image at a Present
+// is a build behind the latest, which apply_stale_6dof() and the depth capture
+// both allow for by asking the build the image was drawn with.
 //
-// THE ROTATION WARP IS NOT GATED and still runs on every screen: it is built
+// So a panning map and a turning garage go through the same warp as a drive. On
+// a flat 2D screen the eye offset is zero, and it declines on the separation.
+//
+// THE ROTATION WARP IS NOT GATED and runs wherever this declines: it is built
 // from the head pose and a homography, neither of which cares how the eye
 // offset was applied. Only the depth-based reprojection is restricted.
+
 // THE SCREENS WHERE NOTHING IS BEING DRIVEN and plain AER is simply correct.
-// Gates both the DIBR shift fallback and the 6-DoF model below.
+// Gates the DIBR shift fallback.
 //
 // It asks for a screen to be POSITIVELY IDENTIFIED rather than inferred from a
 // failure to identify anything, which is the distinction the whole thing turns
@@ -3600,6 +4012,9 @@ bool warp_homography_for(uint32_t stale, float hhNew, float vhNew,
 bool on_static_screen()
 {
     if (!hooks::logic_camera_ever_ticked()) return true;
+    // The main-menu camera rendered this image: a menu screen, positively and
+    // from the first frame of it (onscreen_camera_builder).
+    if (g_onScreenBuilder.load() == kBuilderMenu) return true;
     if (hooks::screen_gate_direct()) {
         // THE MAP ALONE. The garage never qualified: it has no marker list,
         // and the engine's own DRIVE_CAMERA mode enum turned out to be
@@ -3615,17 +4030,20 @@ bool on_static_screen()
     return !hooks::in_gameplay();
 }
 
-// The two screen-shaped guards, plus the two facts the applied-eye record can
-// now be asked for directly. See dibrpolicy::sixdof_model_applies() for what
-// each one rules out and why inferring them from screen identity left the level
-// fly-in falling through both.
+// NOTHING IS BEING DRIVEN: a static screen, or the drive camera has stopped, which
+// is what answers for the garage and the pause menu.
+bool nothing_driven()
+{
+    return on_static_screen() || hooks::logic_camera_idle_ms() > kDibrIdleMs;
+}
+
+// The facts the applied-eye record can be asked for directly. See
+// dibrpolicy::sixdof_model_applies() for what each one rules out.
 bool stale_6dof_model_valid()
 {
     const AppliedEye ae = applied_eye();
     return dibrpolicy::sixdof_model_applies(
         warp_uses_6dof(),
-        on_static_screen(),
-        hooks::logic_camera_idle_ms() > kDibrIdleMs,
         ae.valid,
         ae.fresh,
         ae.how == kEyeAppliedAsCameraMove,
@@ -3633,9 +4051,10 @@ bool stale_6dof_model_valid()
 }
 
 // Defined below, next to the DIBR shift fill it was written for. Declared here
-// because the AER path reaches it first.
+// because the AER path reaches it first. `baseH`: the homography the caller drew
+// its rotation-only base with, for the mirror glass (reproject::Params::rotH).
 bool apply_stale_6dof(uint32_t stale, ID3D11UnorderedAccessView* dstUav,
-                      UINT dstW, UINT dstH);
+                      UINT dstW, UINT dstH, const Mat3* baseH = nullptr);
 
 bool warp_stale_eye(uint32_t stale)
 {
@@ -3707,7 +4126,7 @@ bool warp_stale_eye(uint32_t stale)
         g.ctx->OMSetRenderTargets(1, inullrtv, nullptr);
 
         composited = apply_stale_6dof(stale, g.staleWarpUav.Get(),
-                                      g.staleWarpW, g.staleWarpH);
+                                      g.staleWarpW, g.staleWarpH, &H);
         if (composited) {
             // The image is already in the destination view; the draw below must
             // not warp it a second time.
@@ -3806,6 +4225,15 @@ bool warp_stale_eye(uint32_t stale)
 // reasons are few and each is a different thing to go and fix.
 const char* g_stale6dofWhy = "(off)";
 
+// THE MOTION-VECTOR WARP (kWarpMotion), per stale eye it was asked for: moved
+// by the game's motion, or which check took it off them. For the periodic line
+// in apply_stale_6dof().
+enum MotionWarpOutcome { kMotionUsed = 0, kMotionNoField, kMotionOtherFrame,
+                         kMotionNotThisImage, kMotionSize, kMotionOutcomeCount };
+uint32_t g_motionWarp[kMotionOutcomeCount] = {};
+uint32_t g_motionMirrorMasked = 0;
+uint32_t g_motionNoMask = 0;
+
 // Composites the 6-DoF camera reprojection of eye `stale`'s retained frame into
 // `dstUav`, over whatever is already there.
 //
@@ -3814,7 +4242,7 @@ const char* g_stale6dofWhy = "(off)";
 // whole-eye stale warp (all of them, every other frame). The second is where the
 // correction is far more visible, for the obvious reason.
 bool apply_stale_6dof(uint32_t stale, ID3D11UnorderedAccessView* dstUav,
-                      UINT dstW, UINT dstH)
+                      UINT dstW, UINT dstH, const Mat3* baseH)
 {
     // Set on every path so the framedump line reports THIS frame, not a
     // leftover from whenever the state last changed.
@@ -3841,9 +4269,9 @@ bool apply_stale_6dof(uint32_t stale, ID3D11UnorderedAccessView* dstUav,
     }
 
     // See stale_6dof_model_valid(). Checked here as well as at the call sites,
-    // so a future caller cannot reach the reprojection on a screen where its
-    // premise does not hold.
-    g_stale6dofWhy = "map/garage/menu (projection-shift eye offset)";
+    // so a future caller cannot reach the reprojection when its premise does
+    // not hold.
+    g_stale6dofWhy = "no eye record for this frame";
     if (!stale_6dof_model_valid()) return false;
 
     g_stale6dofWhy = "no destination UAV";
@@ -3857,16 +4285,23 @@ bool apply_stale_6dof(uint32_t stale, ID3D11UnorderedAccessView* dstUav,
         !g.prevEyeSrvRaw[stale]) return false;
 
     // The depth and colour must describe the same pixels, or the reprojection
-    // moves each by the other's geometry.
+    // moves each by the other's geometry. Either on one grid, or -- when DLSS
+    // upscaled the colour after it was rendered -- the depth on the smaller
+    // render grid beneath it: the same picture at a lower resolution, so each
+    // colour pixel takes the depth of the render pixel it came from.
     g_stale6dofWhy = "retained depth/colour size mismatch";
-    if (g.prevEyeDepthW[stale] != g.prevEyeW[stale] ||
-        g.prevEyeDepthH[stale] != g.prevEyeH[stale]) {
+    const uint32_t depthW = g.prevEyeDepthW[stale], depthH = g.prevEyeDepthH[stale];
+    const uint32_t colourW = g.prevEyeW[stale], colourH = g.prevEyeH[stale];
+    const bool oneGrid = depthW == colourW && depthH == colourH;
+    const bool renderGrid =
+        upscaled_canvas() && depthW && depthH && depthW < colourW && depthH < colourH &&
+        std::fabs((float)depthW * (float)colourH - (float)colourW * (float)depthH) <
+            0.01f * (float)colourW * (float)depthH;
+    if (!oneGrid && !renderGrid) {
         static bool logged = false;
         if (!logged) { logged = true;
             VRLOG("DIBR shift 6-DoF: retained depth %ux%u does not match colour %ux%u "
-                  "-- reprojection skipped",
-                  g.prevEyeDepthW[stale], g.prevEyeDepthH[stale],
-                  g.prevEyeW[stale], g.prevEyeH[stale]); }
+                  "-- reprojection skipped", depthW, depthH, colourW, colourH); }
         return false;
     }
     // The reprojection maps source pixels onto destination pixels one for one,
@@ -3901,14 +4336,26 @@ bool apply_stale_6dof(uint32_t stale, ID3D11UnorderedAccessView* dstUav,
     //
     // Ask the rule instead of assuming. Direction still comes from the warp's
     // own eyeSign, so the two conventions cannot diverge.
-    const float eyeSign = dibrpolicy::eye_sign(ae.offset, kDibrRightIsScreenRight);
+    //
+    // THE EYE ON SCREEN, FROM ITS BUILD. ae is the latest build, which in
+    // gameplay is the image here. On the map, in the garage and on the menus the
+    // image is the build before, so ae is already the next frame's -- the other
+    // eye, which is the very eye being warped. Asked about that, the rule says
+    // "same eye, no separation", and the stale eye is pulled onto the rendered
+    // one: flat stereo on every warped frame.
+    const int   shownEye = (g_onScreenValid && g_onScreenRec.eye >= 0)
+                               ? (g_onScreenRec.eye & 1) : ae.eye;
+    const float shownOffset = dibrpolicy::shown_eye_offset(shownEye, ae.eye, ae.offset);
+    const float eyeSign = dibrpolicy::eye_sign(shownOffset, kDibrRightIsScreenRight);
     const float lateral = dibrpolicy::stale_eye_lateral(
-        (int)stale, ae.eye, sep);
+        (int)stale, shownEye, sep);
     float staleView[16], newViewProj[16];
     dibrpolicy::synth_eye_view(view, eyeSign, lateral, staleView);
     dibrpolicy::multiply_4x4(proj, staleView, newViewProj);
 
     reproject::Params rp{};
+    rp.depthWidth  = depthW;
+    rp.depthHeight = depthH;
     g_stale6dofWhy = "retained viewProj singular";
     if (!dibrpolicy::invert_4x4(g.prevEyeViewProj[stale], rp.invOldViewProj)) {
         static bool logged = false;
@@ -3928,6 +4375,83 @@ bool apply_stale_6dof(uint32_t stale, ID3D11UnorderedAccessView* dstUav,
     dibrpolicy::multiply_4x4(proj, rigidView, rigidViewProj);
     std::memcpy(rp.newViewProjRigid, rigidViewProj, sizeof(rigidViewProj));
 
+    // THE GAME'S OWN MOTION (kWarpMotion), when this frame's render measured it
+    // against exactly the image being moved: the render just before this one,
+    // which under AER is the stale eye's retained frame. Then every pixel moves
+    // by what the game says its surface did, and the rigid mask and orbit skip
+    // below are not consulted. Anything else -- the game's TAA off, a skipped
+    // frame, a field for another image -- runs the rigid path, which is the
+    // 6-DoF level unchanged, if the frame has the mask that path needs.
+    //
+    // WHICH IT ONLY DOES WHILE SOMETHING IS BEING DRIVEN. The truck is rigid with
+    // the camera because the camera is mounted on it. In the garage, on the map
+    // and on the menus the truck is parked and the camera moves around it, so it
+    // is static world like the ground it stands on, and takes the camera's travel
+    // with everything else. Masked, it would keep the head correction alone and
+    // slide against its own surroundings.
+    const bool truckRigid = !nothing_driven();
+    bool byMotion = false;
+    if (warp_uses_motion()) {
+        motionfield::Field mf;
+        int outcome = kMotionUsed;
+        if (!motionfield::latest(mf))                       outcome = kMotionNoField;
+        else if (!g.prevEyeBuild[stale] || mf.prevBuild != g.prevEyeBuild[stale])
+                                                            outcome = kMotionOtherFrame;
+        else if (!g_onScreenValid || mf.curBuild != g_onScreenRec.build)
+                                                            outcome = kMotionNotThisImage;
+        else if (mf.w != depthW || mf.h != depthH)          outcome = kMotionSize;
+        if (outcome == kMotionUsed) {
+            rp.motionSrv    = mf.onPrev;
+            rp.motionOwnSrv = mf.prevOwn;
+            byMotion = true;
+            // The debug overlay, painted by the resolve (render/motion_overlay.hpp).
+            if (motionoverlay::enabled()) {
+                rp.debugMotion = true;
+                head_move_between(mf.prevBuild, mf.curBuild, rp.headMove);
+            }
+            // Mirror glass moves with its housing and is filled from the
+            // rotation-only base: see Params::mirrorMaskSrv.
+            if (g.prevEyeMirrorValid[stale] && g.prevEyeMirrorSrv[stale] &&
+                g.prevEyeMirrorW[stale] == depthW && g.prevEyeMirrorH[stale] == depthH) {
+                rp.mirrorMaskSrv = g.prevEyeMirrorSrv[stale].Get();
+                ++g_motionMirrorMasked;
+                if (baseH) {
+                    std::memcpy(rp.rotH, baseH->m, sizeof(rp.rotH));
+                    rp.haveRotH = true;
+                }
+            }
+        }
+        ++g_motionWarp[outcome];
+        static ULONGLONG t0 = 0;
+        const ULONGLONG now = GetTickCount64();
+        if (!t0) t0 = now;
+        if (now - t0 >= 10000) {
+            t0 = now;
+            VRLOG("motion warp: %u stale eyes moved by the game's motion vectors (%u with "
+                  "the mirrors left to rotation, %u mirror draws marked); no vectors: no "
+                  "field this frame %u, field for another image %u, not this image's %u, "
+                  "size %u; of those, %u had no truck mask either and took the rotation warp",
+                  g_motionWarp[kMotionUsed], g_motionMirrorMasked,
+                  mirrormask::take_mark_count(), g_motionWarp[kMotionNoField],
+                  g_motionWarp[kMotionOtherFrame], g_motionWarp[kMotionNotThisImage],
+                  g_motionWarp[kMotionSize], g_motionNoMask);
+            for (uint32_t& c : g_motionWarp) c = 0;
+            g_motionMirrorMasked = 0;
+            g_motionNoMask = 0;
+        }
+        // A FRAME THAT LOST ITS FIELD WHILE THEY WERE ARRIVING has no truck mask
+        // either: nothing drew one (dibrpolicy::rigid_mask_marks()). Running the
+        // rigid path without it would move the cab by the camera's own travel,
+        // which is what the mask exists to stop, so this one goes to the caller's
+        // rotation warp instead -- the road is a frame behind in one eye, rather
+        // than the cab jumping. These are single frames around a hitch.
+        if (!byMotion && truckRigid && !g.prevEyeRigidValid[stale]) {
+            ++g_motionNoMask;
+            g_stale6dofWhy = "no motion vectors this frame, and no truck mask for it";
+            return false;
+        }
+    }
+
     // THE MASK IS THE WHOLE CLASSIFIER, and it is NOT gated on view mode.
     //
     // A depth band used to stand in for it, restricted to cockpit view because
@@ -3940,7 +4464,7 @@ bool apply_stale_6dof(uint32_t stale, ID3D11UnorderedAccessView* dstUav,
     //
     // The size check is the one precondition: the mask has to describe the same
     // pixels as the retained depth, or it would be classifying the wrong ones.
-    if (g.prevEyeRigidSrv[stale] &&
+    if (!byMotion && truckRigid && g.prevEyeRigidValid[stale] && g.prevEyeRigidSrv[stale] &&
         g.prevEyeRigidW[stale] == g.prevEyeDepthW[stale] &&
         g.prevEyeRigidH[stale] == g.prevEyeDepthH[stale])
         rp.rigidMaskSrv = g.prevEyeRigidSrv[stale].Get();
@@ -3957,7 +4481,7 @@ bool apply_stale_6dof(uint32_t stale, ID3D11UnorderedAccessView* dstUav,
     // is: it answers instantly and exactly, where a measured-translation test
     // only fires once enough motion has accumulated and so gets the start of
     // every swing wrong.
-    rp.rigidSkip = !cockpit_camera();
+    rp.rigidSkip = !byMotion && !cockpit_camera();
 
     // THE TERM THE RIGID BRANCH EXISTS TO REMOVE, measured rather than assumed.
     // If this reads ~0 while the truck is moving, the engine's view matrices
@@ -4083,7 +4607,7 @@ ID3D11ShaderResourceView* stale_eye_fill(uint32_t stale)
     // translation displaces near pixels further than far ones. It writes only
     // the destination pixels it can reach, so where it has no source the
     // rotation-warped pixel stands and the result is never worse than before.
-    apply_stale_6dof(stale, g.dibrFillUav.Get(), g.dibrFillW, g.dibrFillH);
+    apply_stale_6dof(stale, g.dibrFillUav.Get(), g.dibrFillW, g.dibrFillH, &H);
     return g.dibrFillSrv.Get();
 }
 
@@ -4293,6 +4817,591 @@ XrResult end_frame(XrSession session, const XrFrameEndInfo& in, uint32_t quadCou
 // alternatives to it: the warp decides what the un-rendered eye is built from,
 // and DIBR shift decides whether the rendered frame is depth-reprojected into
 // the other eye before that warp fills what the reprojection could not reach.
+bool is_srgb_format(DXGI_FORMAT f)
+{
+    switch (f) {
+        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB: return true;
+        default:                              return false;
+    }
+}
+
+// THE MOTION-VECTOR OVERLAY on the eye just rendered (render/motion_overlay.hpp):
+// its own motion, the motion the other eye's warp is taking as the next render's
+// this frame. Drawn over the finished image in the swapchain, after g.staging --
+// which is what gets retained -- was read, so the warp never moves a painted
+// image along with the real one.
+void paint_motion_overlay(uint32_t eye, ID3D11RenderTargetView* rtv,
+                          float x, float y, float w, float h)
+{
+    motionfield::Own own;
+    if (!motionfield::latest_own(own)) return;
+    hooks::SceneDepth sd{};
+    if (!hooks::scene_depth_for_eye((int)eye, sd) || !sd.srv) return;
+    float view[16], viewProj[16];
+    if (!hooks::main_camera_matrices(view, viewProj)) return;
+    motionoverlay::Params p;
+    if (!dibrpolicy::invert_4x4(viewProj, p.invViewProj)) return;
+    std::memcpy(p.viewProj, viewProj, sizeof(viewProj));
+    p.motionSrv = own.srv;
+    p.depthSrv  = sd.srv;
+    if (own.chained) head_move_between(own.prevBuild, own.curBuild, p.headMove);
+    p.colourW = g.stagingW;
+    p.colourH = g.stagingH;
+    D3D11_RENDER_TARGET_VIEW_DESC rd{};
+    rtv->GetDesc(&rd);
+    p.srgbTarget = is_srgb_format(rd.Format);
+    motionoverlay::draw(g.ctx.Get(), rtv, x, y, w, h, p);
+}
+
+// THE PER-EYE COMPOSITE: `src` letterboxed into the eye's image, with the
+// windscreen splatter on it (shifted by `dispK` for a synthesized eye -- see
+// kBlitHlsl), then the winch markers and, aiming at a winch point, the cursor.
+// Into that eye's swapchain image, acquired and released here; or, given
+// `target`, into that render target instead with nothing XR touched -- which
+// is how Synched Sequential holds an eye until its pair is complete.
+// `rectOut` receives the letterboxed sub-rect either way.
+//
+// `projValid/A/B` is the projection the splatter's shift is built from, and only
+// matters when `dispK` is not 0. `motionOverlay`: this is the eye rendered this
+// frame, which takes the debug overlay when it is on (paint_motion_overlay).
+bool blit_eye_image(uint32_t dstEye, ID3D11Texture2D* src, float dispK,
+                    bool projValid, float projA, float projB,
+                    ID3D11RenderTargetView* target = nullptr,
+                    XrRect2Di* rectOut = nullptr, bool motionOverlay = false)
+{
+    if (!src || !ensure_staging(src)) return false;
+    g.ctx->CopyResource(g.staging.Get(), src);
+
+    D3D11_TEXTURE2D_DESC sdesc{};
+    src->GetDesc(&sdesc);
+    float srcAspect = sdesc.Height > 0
+        ? (float)sdesc.Width / (float)sdesc.Height : 1.0f;
+    float dstAspect = g.height > 0 ? (float)g.width / (float)g.height : 1.0f;
+    float vw = (float)g.width, vh = (float)g.height;
+    if (srcAspect > dstAspect) vh = vw / srcAspect;
+    else                       vw = vh * srcAspect;
+    float vx = 0.5f * ((float)g.width - vw), vy = 0.5f * ((float)g.height - vh);
+
+    uint32_t idx = 0;
+    if (!target) {
+        XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+        XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+        wi.timeout = XR_INFINITE_DURATION;
+        if (XR_FAILED(xrAcquireSwapchainImage(g.swapchain[dstEye], &ai, &idx)) ||
+            XR_FAILED(xrWaitSwapchainImage(g.swapchain[dstEye], &wi)))
+            return false;
+    }
+
+    D3D11_VIEWPORT vp{vx, vy, vw, vh, 0, 1};
+    ID3D11RenderTargetView* rtv = target ? target : g.rtvs[dstEye][idx].Get();
+    float clear[4] = {0, 0, 0, 1};
+    g.ctx->ClearRenderTargetView(rtv, clear);
+    g.ctx->OMSetRenderTargets(1, &rtv, nullptr);
+    g.ctx->RSSetViewports(1, &vp);
+    g.ctx->IASetInputLayout(nullptr);
+    g.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g.ctx->VSSetShader(g.vs.Get(), nullptr, 0);
+    g.ctx->PSSetShader(g.ps.Get(), nullptr, 0);
+    ID3D11ShaderResourceView* smudgeSrv = smudgelayer::srv();
+    ID3D11ShaderResourceView* glassSrv  = smudgelayer::depth_srv();
+    ID3D11ShaderResourceView* winchSrv  = winchlayer::srv();
+    const bool smudgeOn = (smudgeSrv != nullptr) && g.blitCb;
+    const bool winchOn  = (winchSrv != nullptr) && g.blitCb;
+    if (g.blitCb) {
+        D3D11_MAPPED_SUBRESOURCE mc{};
+        if (SUCCEEDED(g.ctx->Map(g.blitCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mc))) {
+            float* p = static_cast<float*>(mc.pData);
+            p[0] = dispK;
+            p[1] = projValid ? projA : 0.0f;
+            p[2] = (g.width > 0) ? 1.0f / (float)g.width : 0.0f;
+            // Glass thickness as t/projB, the form smudge_shift()
+            // wants. projB is the only piece of the projection the
+            // folded disparity constant threw away, so it has to be
+            // divided back in here rather than in the shader.
+            p[3] = (projValid && projB != 0.0f)
+                       ? smudgelayer::depth_offset() / projB
+                       : 0.0f;
+            p[4] = smudgeOn ? 1.0f : 0.0f;
+            p[5] = glassSrv ? 1.0f : 0.0f;
+            p[6] = winchOn ? 1.0f : 0.0f;
+            p[7] = 0.0f;
+            g.ctx->Unmap(g.blitCb.Get(), 0);
+        }
+        ID3D11Buffer* cb[1] = { g.blitCb.Get() };
+        g.ctx->PSSetConstantBuffers(0, 1, cb);
+    }
+    ID3D11ShaderResourceView* srvs[4] = { g.stagingSrv.Get(), smudgeSrv,
+                                          glassSrv, winchSrv };
+    ID3D11SamplerState* smp = g.sampler.Get();
+    g.ctx->PSSetShaderResources(0, 4, srvs);
+    g.ctx->PSSetSamplers(0, 1, &smp);
+    g.ctx->Draw(3, 0);
+    // Release the layer bindings: both are render targets again on
+    // the very next frame, and D3D silently unbinds (and warns) if
+    // they are still bound as SRVs when that happens.
+    ID3D11ShaderResourceView* nullSrvs[4] = {};
+    g.ctx->PSSetShaderResources(0, 4, nullSrvs);
+
+    if (motionOverlay && motionoverlay::enabled())
+        paint_motion_overlay(dstEye, rtv, vx, vy, vw, vh);
+
+    if (!hooks::is_menu_open() && winch_cursor_active()) {
+        cursoroverlay::draw_in_rect(
+            g.device.Get(), g.ctx.Get(), rtv, g.outputWindow,
+            g.width, g.height, vx, vy, vw, vh, true);
+    }
+
+    // Dump what the HEADSET receives, not the source handed in.
+    //
+    // This used to capture `src`, i.e. the image BEFORE this shader
+    // ran -- so anything the blit itself composites was invisible in
+    // a frame dump. The windscreen splatter is composited here, which
+    // made it impossible to photograph the very artefact a dump was
+    // taken to show. Reading the swapchain texture back off its own
+    // RTV needs no extra bookkeeping, and catches every later stage
+    // by construction rather than one at a time.
+    //
+    // Taken before xrReleaseSwapchainImage, while the image is still
+    // ours to read.
+    {
+        ComPtr<ID3D11Resource> res;
+        rtv->GetResource(&res);
+        ComPtr<ID3D11Texture2D> shown;
+        if (res && SUCCEEDED(res.As(&shown)))
+            framedump::capture(g.ctx.Get(), shown.Get(), dstEye);
+    }
+
+    const XrRect2Di rect{{(int32_t)vx, (int32_t)vy}, {(int32_t)vw, (int32_t)vh}};
+    if (rectOut) *rectOut = rect;
+    if (target) return true;
+    XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    xrReleaseSwapchainImage(g.swapchain[dstEye], &ri);
+    g.eyeFresh[dstEye] = true;
+    g.eyeEverRendered[dstEye] = true;
+    g.blitRect[dstEye] = rect;
+    return true;
+}
+
+// SYNCHED SEQUENTIAL's holding images: one per eye, the size and format of that
+// eye's swapchain images, so a finished one copies straight in, and drawn
+// through the same view description the swapchain path uses.
+bool ensure_ss_pending(uint32_t eye)
+{
+    if (eye > 1 || g.rtvs[eye].empty() || !g.rtvs[eye][0] || !g.device) return false;
+    ComPtr<ID3D11Resource> res;
+    g.rtvs[eye][0]->GetResource(&res);
+    ComPtr<ID3D11Texture2D> image;
+    if (!res || FAILED(res.As(&image))) return false;
+    D3D11_TEXTURE2D_DESC want{};
+    image->GetDesc(&want);
+    if (g.ssPending[eye]) {
+        D3D11_TEXTURE2D_DESC have{};
+        g.ssPending[eye]->GetDesc(&have);
+        if (have.Width == want.Width && have.Height == want.Height &&
+            have.Format == want.Format && have.ArraySize == want.ArraySize &&
+            have.SampleDesc.Count == want.SampleDesc.Count)
+            return true;
+        g.ssPending[eye].Reset();
+        g.ssPendingRtv[eye].Reset();
+        g.ssPendingValid[eye] = false;
+    }
+    D3D11_TEXTURE2D_DESC d = want;
+    d.Usage = D3D11_USAGE_DEFAULT;
+    d.BindFlags = D3D11_BIND_RENDER_TARGET;
+    d.CPUAccessFlags = 0;
+    d.MiscFlags = 0;
+    D3D11_RENDER_TARGET_VIEW_DESC rd{};
+    g.rtvs[eye][0]->GetDesc(&rd);
+    if (FAILED(g.device->CreateTexture2D(&d, nullptr, &g.ssPending[eye])) ||
+        FAILED(g.device->CreateRenderTargetView(g.ssPending[eye].Get(), &rd,
+                                                &g.ssPendingRtv[eye]))) {
+        g.ssPending[eye].Reset();
+        g.ssPendingRtv[eye].Reset();
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true))
+            VRLOG("Synched Sequential: holding image for eye %u could not be created "
+                  "(%ux%u fmt %d)", eye, want.Width, want.Height, (int)want.Format);
+        return false;
+    }
+    return true;
+}
+
+// Both eyes of one moment into the swapchains, and the views they were rendered
+// from become what every Present declares until the next pair is complete.
+// `firstEye`: the eye that rendered the moment first (ss_first_eye()).
+bool ss_commit_pair(uint32_t firstEye)
+{
+    for (uint32_t e = 0; e < 2; ++e) {
+        XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+        XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+        wi.timeout = XR_INFINITE_DURATION;
+        uint32_t idx = 0;
+        if (XR_FAILED(xrAcquireSwapchainImage(g.swapchain[e], &ai, &idx)) ||
+            XR_FAILED(xrWaitSwapchainImage(g.swapchain[e], &wi)))
+            return false;
+        ComPtr<ID3D11Resource> dst;
+        g.rtvs[e][idx]->GetResource(&dst);
+        if (dst) g.ctx->CopyResource(dst.Get(), g.ssPending[e].Get());
+        XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+        xrReleaseSwapchainImage(g.swapchain[e], &ri);
+        g.eyeFresh[e] = true;
+        g.eyeEverRendered[e] = true;
+        g.blitRect[e] = g.ssPendingRect[e];
+    }
+    // Both renders were built from the same latched views; the first's
+    // snapshot stands for the pair.
+    g.ssCommittedView[0] = g.ssPendingView[firstEye & 1u][0];
+    g.ssCommittedView[1] = g.ssPendingView[firstEye & 1u][1];
+    g.ssCommitted = true;
+    return true;
+}
+
+// HOW MANY BUILDS BEHIND IS THE IMAGE AT THIS PRESENT: 0 in gameplay, 1 on the
+// map, garage and menus (see BuildRec). Voted from the camera: the GPU-side
+// view is the camera the image was actually drawn with, so whichever of the
+// last two builds' cameras it matches says the lag -- readable whenever the two
+// differ, i.e. whenever the head or the camera moves, which in a headset is
+// nearly always. Three agreeing votes to switch. With nothing to tell the two
+// apart for two seconds the screen decides, the way it was measured.
+int update_presented_lag()
+{
+    const uint32_t b = (uint32_t)g_advFlips.load();
+    BuildRec r0, r1;
+    AcquireSRWLockShared(&g_buildRecLock);
+    r0 = g_buildRec[b % kBuildRing];
+    r1 = g_buildRec[(b - 1) % kBuildRing];
+    ReleaseSRWLockShared(&g_buildRecLock);
+
+    const ULONGLONG now = GetTickCount64();
+    float view[16], viewProj[16];
+    if (r0.build == b && r1.build == b - 1 && r0.haveFwd && r1.haveFwd &&
+        hooks::main_camera_matrices(view, viewProj)) {
+        // Row 2 of the view is the camera's forward axis (either sign).
+        const float gpu[3] = {view[8], view[9], view[10]};
+        auto angle = [](const float* a, const float* c) {
+            const float x = a[1] * c[2] - a[2] * c[1], y = a[2] * c[0] - a[0] * c[2],
+                        z = a[0] * c[1] - a[1] * c[0];
+            const float d = a[0] * c[0] + a[1] * c[1] + a[2] * c[2];
+            return std::atan2(std::sqrt(x * x + y * y + z * z), std::fabs(d));
+        };
+        const float a0 = angle(gpu, r0.fwd), a1 = angle(gpu, r1.fwd);
+        const float sep = angle(r0.fwd, r1.fwd);
+        // A vote needs the two builds to differ (0.06 deg) and the GPU camera
+        // to sit clearly on one of them.
+        if (sep > 1.0e-3f && (std::min)(a0, a1) < 0.3f * sep) {
+            const int v = (a0 < a1) ? 0 : 1;
+            if (v == g_lagVote) ++g_lagRun;
+            else { g_lagVote = v; g_lagRun = 1; }
+            if (g_lagRun >= 3) {
+                g_lagVoteTick = now;
+                if (g_presLag.exchange(v) != v || !g_lagMeasured)
+                    VRLOG("frame timing: images show the camera built %d frame(s) "
+                          "before their Present (measured from the GPU camera)", v);
+                g_lagMeasured = true;
+            }
+        }
+    }
+    if (now - g_lagVoteTick > 2000) {
+        const int byScreen = r0.prevScreen ? 1 : 0;
+        g_lagMeasured = false;
+        if (g_presLag.exchange(byScreen) != byScreen)
+            VRLOG("frame timing: images now show the camera built %d frame(s) before their "
+                  "Present (by screen -- no camera motion to measure it from)", byScreen);
+    }
+    return g_presLag.load();
+}
+
+// THE BUILD ON SCREEN, worked out once at the top of every Present: the lag
+// (update_presented_lag), the record of the build the backbuffer's image was
+// drawn with, its eye for routing (present_route_eye) and its views for every
+// pose this Present declares or warps to (reference_view_pose). In gameplay
+// that is simply the latest build, exactly as before; on the map, garage and
+// menus it is the one before.
+// THE RENDER'S OWN CAMERA, when the frame uploaded one (cbuffer_hook.cpp): the
+// build it sits on, else the newest build when it was uploaded -- the one a
+// render takes. 0 = none this frame (nothing recognised as the main view since
+// the last Present), and the old measure decides.
+uint32_t render_camera_build(uint32_t newest, bool* matched = nullptr)
+{
+    hooks::CamSnapInfo si;
+    if (!hooks::main_camera_snap(si)) return 0;
+    if (g_snapSeqValid.load() && si.seq == g_snapSeqSeen.load()) return 0;   // not this frame's
+    const uint32_t b = si.build ? si.build : si.newestAt;
+    if (b == 0 || newest - b > 3u) return 0;
+    if (matched) *matched = si.build != 0;
+    return b;
+}
+
+void update_on_screen()
+{
+    // WHICH BUILD'S IMAGE THIS IS, from the render's own camera. It replaces
+    // the vote below wherever the frame uploaded a main camera, which is every
+    // frame with a 3D scene. The vote compares camera DIRECTIONS, which the two
+    // renders of a Synched Sequential pair share, so under SS it rarely got a
+    // vote in and the screen decided -- two seconds after the last vote, i.e.
+    // a second or more into the map with every other image routed to the wrong
+    // eye (the left/right jitter on opening the map, 2026-10-28).
+    const uint32_t newest = (uint32_t)g_advFlips.load();
+    bool matched = false;
+    const uint32_t fromRender = render_camera_build(newest, &matched);
+    {
+        hooks::CamSnapInfo si;
+        if (hooks::main_camera_snap(si)) {
+            g_snapSeqSeen.store(si.seq);
+            g_snapSeqValid.store(true);
+        }
+    }
+    int lag;
+    if (fromRender) {
+        lag = (int)(newest - fromRender);
+        ++g_onScreenBy[matched ? 0 : 1];
+        // Keeps the vote's own timer quiet while this decides, so a frame
+        // without a camera does not swing it to "by screen" at once.
+        g_lagVoteTick = GetTickCount64();
+        static ULONGLONG s_lastLog = 0;
+        static int s_quiet = 0;
+        if (g_presLag.exchange(lag) != lag) {
+            const ULONGLONG now = GetTickCount64();
+            if (now - s_lastLog >= 2000) {
+                VRLOG("frame timing: images now show the camera built %d frame(s) before "
+                      "their Present (the render's own camera%s)", lag,
+                      s_quiet ? ", after more changes in between" : "");
+                s_lastLog = now;
+                s_quiet = 0;
+            } else {
+                ++s_quiet;
+            }
+        }
+        g_lagMeasured = true;
+    } else {
+        lag = update_presented_lag();
+        ++g_onScreenBy[2];
+    }
+    // Where the Presents' builds came from, every 10 s.
+    {
+        static ULONGLONG t0 = 0;
+        static uint32_t lagCount[3] = {0, 0, 0};
+        ++lagCount[lag <= 0 ? 0 : (lag == 1 ? 1 : 2)];
+        const ULONGLONG now = GetTickCount64();
+        if (!t0) t0 = now;
+        if (now - t0 >= 10000) {
+            VRLOG("frame timing: Presents in 10 s by the render's camera on a build %u, by "
+                  "its upload time %u, by the old vote/screen %u | images 0/1/2+ builds "
+                  "behind %u/%u/%u", g_onScreenBy[0], g_onScreenBy[1], g_onScreenBy[2],
+                  lagCount[0], lagCount[1], lagCount[2]);
+            g_onScreenBy[0] = g_onScreenBy[1] = g_onScreenBy[2] = 0;
+            lagCount[0] = lagCount[1] = lagCount[2] = 0;
+            t0 = now;
+        }
+    }
+    const uint32_t onScreen = newest - (uint32_t)lag;
+    AcquireSRWLockShared(&g_buildRecLock);
+    g_onScreenRec = g_buildRec[onScreen % kBuildRing];
+    ReleaseSRWLockShared(&g_buildRecLock);
+    g_onScreenValid = (g_onScreenRec.build == onScreen && onScreen != 0);
+    g_onScreenEye.store(g_onScreenValid ? g_onScreenRec.eye : -1);
+    {
+        const int builder = g_onScreenValid ? g_onScreenRec.builder : kBuilderUnknown;
+        const int was = g_onScreenBuilder.exchange(builder);
+        if (builder != was && builder != kBuilderUnknown)
+            VRLOG("SCREEN CAMERA -> %s camera on screen (map markers %s, drive camera %s)",
+                  builder == kBuilderMenu ? "MENU" : "IN-GAME",
+                  hooks::in_map_view() ? "say map" : "say not map",
+                  hooks::logic_camera_idle_ms() > kDibrIdleMs ? "idle" : "ticking");
+    }
+    AcquireSRWLockExclusive(&g_renderViewLock);
+    g_onScreenViewsValid = g_onScreenValid && g_onScreenRec.haveViews;
+    if (g_onScreenViewsValid) {
+        g_onScreenViews[0] = g_onScreenRec.views[0];
+        g_onScreenViews[1] = g_onScreenRec.views[1];
+    }
+    ReleaseSRWLockExclusive(&g_renderViewLock);
+}
+
+// THE IMAGE AN EYE IS BUILT FROM: the game's frame, or DLSS's image of it
+// (render/dlss.hpp) -- upscaled to the eye images' size, and sharpened. Once
+// per Present that shows a new render, before anything copies the frame into
+// an eye; a Present that is skipped (stalled, not rendering) never asks, and
+// its frame stays out of DLSS's history. Everything after this -- both eyes'
+// blits, the retained copy the stale-eye warp works from, DIBR shift -- sees
+// the same image.
+ID3D11Texture2D* eye_source(ID3D11Texture2D* backbuffer, int eye)
+{
+    if (ID3D11Texture2D* img = dlss::image_for_present(g.ctx.Get(), backbuffer, eye))
+        return img;
+    return backbuffer;
+}
+
+// One Present's render under Synched Sequential: composited into its eye's
+// holding image exactly as AER would put it in the swapchain (the windscreen
+// splatter is this render's own, so unshifted), and -- when it is the second
+// render of a moment whose first is waiting -- the pair is committed.
+//
+// `r` is the record of the build this image was DRAWN with, which on the map,
+// garage and menus is the build before the latest (update_presented_lag): its
+// eye, its moment and the views its camera was built from all come from there,
+// so each eye is paired and declared with what it actually shows.
+void ss_present_eye(ID3D11Texture2D* src, const BuildRec& r)
+{
+    const uint64_t rec = r.ss;
+    if (!(rec >> 63)) return;
+    const bool     first  = ((rec >> 62) & 1u) != 0;
+    const uint32_t moment = (uint32_t)rec;
+    const uint32_t eye    = (uint32_t)(r.eye & 1);   // which eye goes first alternates
+    if (!ensure_ss_pending(eye)) return;
+
+    XrRect2Di rect{};
+    if (!blit_eye_image(eye, src, 0.0f, false, 0.0f, 0.0f,
+                        g.ssPendingRtv[eye].Get(), &rect))
+        return;
+    g.ssPendingRect[eye]  = rect;
+    g.ssPendingPair[eye]  = moment;
+    g.ssPendingValid[eye] = true;
+    // The views THIS render was built from: its build's own snapshot, not
+    // g_ssViews, which may already hold the next moment's by now.
+    for (int v = 0; v < 2; ++v)
+        g.ssPendingView[eye][v] = r.haveViews ? r.views[v] : g.lastView[v];
+
+    if (!first) {
+        const uint32_t other = eye ^ 1u;   // rendered this moment first
+        if (g.ssPendingValid[other] && g.ssPendingPair[other] == moment) {
+            if (ss_commit_pair(other)) g_ssPairs.fetch_add(1);
+            g.ssPendingValid[0] = g.ssPendingValid[1] = false;
+        } else {
+            g_ssOrphans.fetch_add(1);
+        }
+    }
+
+    // How it is going, every 10 s: pairs completed per second, the learned
+    // lag, where the game's camera input changed (in-game: at frozen updates
+    // when what it follows moves, at real ones when the camera itself swings),
+    // second renders that found no first, and the camera hold -- how many
+    // second renders came in with a different camera input and were built from
+    // their first's instead (viewbuild_hook.cpp, ss_hold_camera).
+    // The rate first: pairs per second, the game's renders per second (two per
+    // pair at best) and the headset's frames, with how long each waited for
+    // its refresh -- near 0 means the PC is what limits the pair rate.
+    static ULONGLONG t0 = 0;
+    static uint32_t pairs0 = 0;
+    static int presents0 = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (t0 == 0) { t0 = now; pairs0 = g_ssPairs.load(); presents0 = g_presents.load(); }
+    if (now - t0 >= 10000) {
+        const uint32_t pairs = g_ssPairs.load();
+        const int presents = g_presents.load();
+        const double secs = (double)(now - t0) / 1000.0;
+        const uint32_t xrFrames = g_ssXrFrames.exchange(0);
+        const uint32_t waitUs = g_ssWaitUs.exchange(0);
+        hooks::SsHoldStats hold;
+        hooks::take_ss_hold_stats(hold);
+        VRLOG("Synched Sequential: %.1f pairs/s from %.0f renders/s, %.0f headset "
+              "frames/s (%.1f ms waiting for each), renders %d update(s) behind, images %d "
+              "build(s) behind, camera input changed at real/frozen updates %u/%u, "
+              "unpaired %u, camera builds at real/frozen updates %u/%u, frames without "
+              "one %u | camera held for %u of %u second renders (moved up to %.2f deg, "
+              "%.1f cm, truck frame %.2f deg), no first to hold to %u",
+              (pairs - pairs0) / secs, (presents - presents0) / secs, xrFrames / secs,
+              xrFrames ? waitUs / 1000.0 / xrFrames : 0.0, g_ssLag.load(),
+              g_presLag.load(),
+              g_ssNewMoment[0].exchange(0), g_ssNewMoment[1].exchange(0),
+              g_ssOrphans.exchange(0), g_ssBuilds[0].exchange(0), g_ssBuilds[1].exchange(0),
+              g_ssStalled.exchange(0), hold.moved, hold.seconds, hold.maxDeg, hold.maxCm,
+              hold.maxTruckDeg, hold.unmatched);
+        t0 = now;
+        pairs0 = pairs;
+        presents0 = presents;
+    }
+}
+
+// The eye views at display time `t`: the runtime's latest (g.lastView), the IPD
+// and the cant -- and, with `latchSs`, the views both renders of the next
+// moment are built from under Synched Sequential.
+void locate_eye_views(XrTime t, bool latchSs)
+{
+    XrViewState vst{XR_TYPE_VIEW_STATE};
+    XrViewLocateInfo vli{XR_TYPE_VIEW_LOCATE_INFO};
+    vli.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+    vli.displayTime = t;
+    vli.space = g.space;
+    uint32_t vc = 0;
+    XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+    if (XR_SUCCEEDED(xrLocateViews(g.session, &vli, &vst, 2, &vc, views)) && vc == 2) {
+        note_view_validity(vst);
+        g.lastView[0] = views[0];
+        g.lastView[1] = views[1];
+        // ...and the views that go with it, for both renders of the moment.
+        if (latchSs) {
+            AcquireSRWLockExclusive(&g_renderViewLock);
+            g_ssViews[0] = views[0];
+            g_ssViews[1] = views[1];
+            g_ssViewsValid = true;
+            ReleaseSRWLockExclusive(&g_renderViewLock);
+        }
+        float dx = views[1].pose.position.x - views[0].pose.position.x;
+        float dy = views[1].pose.position.y - views[0].pose.position.y;
+        float dz = views[1].pose.position.z - views[0].pose.position.z;
+        float d = std::sqrt(dx*dx + dy*dy + dz*dz);
+        if (d > 0.03f && d < 0.12f) { g.ipd = d; g_ipd.store(d); }
+        if (vst.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)
+            latch_eye_cant(views);   // see render_frame() for why it is gated
+    }
+}
+
+// SYNCHED SEQUENTIAL: ONE HEAD POSE PER MOMENT. The next render is either the
+// first of a new moment -- then it gets a fresh pose, as in AER -- or the
+// frozen repeat of the one just rendered, which must be built from the SAME
+// pose or the pair would disagree by however far the head moved in a frame.
+// Which one is known in advance: the next update's kind is ours to decide, and
+// the lag says which update the next render shows.
+bool ss_next_render_starts_moment()
+{
+    const uint32_t cur = hooks::frame_update_index();
+    const uint32_t nextShown = cur + 1 - (uint32_t)g_ssLag.load();
+    const bool nextFrozen = (nextShown == cur + 1) ? hooks::frame_next_update_frozen()
+                                                   : hooks::frame_update_frozen(nextShown);
+    return !nextFrozen;
+}
+
+// SYNCHED SEQUENTIAL AT THE FULL PAIR RATE: a Present whose image is the FIRST
+// render of a moment. It runs no XR frame. The image is set aside for its pair
+// and the game goes straight on to the second render; the XR frame runs at the
+// Present that completes the pair. So the headset paces PAIRS -- one per
+// refresh -- instead of renders, and the game renders twice per refresh when
+// the PC can. Every Present used to run a full XR frame, as AER does, which
+// held the game to one render per refresh: 80 FPS was 40 pairs a second.
+//
+// Not the render/submit decoupling that was removed from AER (see the note
+// near the top of this file): that guessed from timing when a display was due,
+// and the guess collapsed back to one render per refresh. Nothing here is
+// guessed -- the pair says when there is something to submit.
+void ss_first_eye_present(IDXGISwapChain* swapchain)
+{
+    ComPtr<ID3D11Texture2D> backbuffer;
+    if (SUCCEEDED(swapchain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&backbuffer))) {
+        ss_present_eye(eye_source(backbuffer.Get(), (int)(g_onScreenRec.eye & 1)),
+                       g_onScreenRec);
+        framedump::end_frame();
+        if (g.desktopSave) {
+            if (g_desktopEye.load() == (g_onScreenRec.eye & 1))
+                g.ctx->CopyResource(g.desktopSave.Get(), backbuffer.Get());
+            else                          g.ctx->CopyResource(backbuffer.Get(), g.desktopSave.Get());
+        }
+    }
+    // The next render can begin a moment here: on the map, garage and menus the
+    // image is a build late, so the first render of one is on screen while the
+    // first of the next is about to be built. Its pose is latched now, for the
+    // display time the coming XR frame should get.
+    if (ss_next_render_starts_moment()) {
+        const XrTime t = g_lastDisplayTime + g_lastDisplayPeriod;
+        update_head_pose(t);
+        locate_eye_views(t, true);
+    }
+    g.eyeFresh[0] = g.eyeFresh[1] = false;
+    g_newFrame.store(true);
+}
+
 void render_frame(IDXGISwapChain* swapchain)
 {
     g_presents.fetch_add(1);
@@ -4426,13 +5535,45 @@ void render_frame(IDXGISwapChain* swapchain)
     }
     static uint32_t stalls = 0, framesSeen = 0;
     ++framesSeen;
+    const bool ss = synched_active();
+    if (stalled && ss) g_ssStalled.fetch_add(1);
     if (stalled && ++stalls % 32 == 0)
         VRLOG("AER: %u/%u Presents had no camera build (frame skipped)", stalls, framesSeen);
+    if (ss && g_ssReset.exchange(false)) {
+        g.ssPendingValid[0] = g.ssPendingValid[1] = false;
+        g.ssCommitted = false;
+        g_lastDisplayTime = 0;
+    }
+
+    // SYNCHED SEQUENTIAL AT THE FULL PAIR RATE. The image on screen is the
+    // first render of a moment: nothing new can be shown until its pair is
+    // complete, so this Present runs no XR frame -- see ss_first_eye_present().
+    // Never two in a row, so a pairing gone wrong can only halve the headset's
+    // frames, never stop them; and not before an XR frame has given a display
+    // time to predict from.
+    static bool s_heldLast = false;
+    if (ss && !stalled && !s_heldLast && g_lastDisplayTime != 0 && g_onScreenValid &&
+        (g_onScreenRec.ss >> 63) && ((g_onScreenRec.ss >> 62) & 1u)) {
+        s_heldLast = true;
+        ss_first_eye_present(swapchain);
+        return;
+    }
+    s_heldLast = false;
 
     XrFrameWaitInfo fwi{XR_TYPE_FRAME_WAIT_INFO};
     XrFrameState fs{XR_TYPE_FRAME_STATE};
+    LARGE_INTEGER waitStart{}, waitEnd{};
+    QueryPerformanceCounter(&waitStart);
     if (XR_FAILED(xrWaitFrame(g.session, &fwi, &fs)))
         return;
+    QueryPerformanceCounter(&waitEnd);
+    if (ss) {
+        static LARGE_INTEGER freq{};
+        if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+        g_ssXrFrames.fetch_add(1);
+        g_ssWaitUs.fetch_add((uint32_t)((waitEnd.QuadPart - waitStart.QuadPart) * 1000000 /
+                                        freq.QuadPart));
+    }
 
     XrFrameBeginInfo fbi{XR_TYPE_FRAME_BEGIN_INFO};
     XrResult beginRes = xrBeginFrame(g.session, &fbi);
@@ -4445,35 +5586,29 @@ void render_frame(IDXGISwapChain* swapchain)
 
     const bool validTime = !is_bogus_display_time(fs.predictedDisplayTime);
     if (validTime) {
+        g_lastDisplayTime   = fs.predictedDisplayTime;
+        g_lastDisplayPeriod = fs.predictedDisplayPeriod;
+    }
+
+    // SYNCHED SEQUENTIAL: ONE HEAD POSE PER MOMENT -- see
+    // ss_next_render_starts_moment(). In AER every render takes a fresh one.
+    const bool latchPose = !ss || ss_next_render_starts_moment();
+
+    if (validTime && latchPose) {
         update_head_pose(fs.predictedDisplayTime);
-    } else {
+    } else if (!validTime) {
         static bool loggedSentinel = false;
         if (!loggedSentinel) { loggedSentinel = true;
             VRLOG("xr: ignoring VDXR sentinel predictedDisplayTime"); }
     }
 
-    // Locate eye views and update IPD each frame (same data, just sampled more
-    // often than in 2x mode -- no correctness downside).
-    {
-        XrViewState vst{XR_TYPE_VIEW_STATE};
-        XrViewLocateInfo vli{XR_TYPE_VIEW_LOCATE_INFO};
-        vli.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
-        vli.displayTime = fs.predictedDisplayTime;
-        vli.space = g.space;
-        uint32_t vc = 0;
-        XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
-        if (XR_SUCCEEDED(xrLocateViews(g.session, &vli, &vst, 2, &vc, views)) && vc == 2) {
-            note_view_validity(vst);
-            g.lastView[0] = views[0];
-            g.lastView[1] = views[1];
-            float dx = views[1].pose.position.x - views[0].pose.position.x;
-            float dy = views[1].pose.position.y - views[0].pose.position.y;
-            float dz = views[1].pose.position.z - views[0].pose.position.z;
-            float d = std::sqrt(dx*dx + dy*dy + dz*dz);
-            if (d > 0.03f && d < 0.12f) { g.ipd = d; g_ipd.store(d); }
-            if (vst.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)
-                latch_eye_cant(views);   // see render_frame() for why it is gated
-        }
+    // Locate eye views and update IPD each frame.
+    locate_eye_views(fs.predictedDisplayTime, ss && latchPose);
+
+    if (!ss && g_ssViewsValid) {
+        AcquireSRWLockExclusive(&g_renderViewLock);
+        g_ssViewsValid = false;
+        ReleaseSRWLockExclusive(&g_renderViewLock);
     }
 
     hold_winch_pointer_against_head(winch_cursor_active());
@@ -4486,13 +5621,41 @@ void render_frame(IDXGISwapChain* swapchain)
     uint32_t dibrRealEye = 0;
     float    dibrSeparationM = 0.0f;
 
-    if (fs.shouldRender && !stalled) {
+    if (fs.shouldRender && !stalled && ss) {
+        // SYNCHED SEQUENTIAL: this frame's render is one eye of a moment --
+        // held until the other render of the same moment has arrived, then
+        // both go into the swapchains together. No warp and no DIBR: there is
+        // no stale eye to supply. Until a pair completes, the last one keeps
+        // being submitted, so the eyes never show two different moments.
+        ComPtr<ID3D11Texture2D> backbuffer;
+        if (SUCCEEDED(swapchain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&backbuffer))) {
+            uint32_t eye = (uint32_t)present_route_eye();
+            if (g_onScreenValid) {
+                ss_present_eye(eye_source(backbuffer.Get(), (int)(g_onScreenRec.eye & 1)),
+                               g_onScreenRec);
+                if (g_onScreenRec.ss >> 63) eye = (uint32_t)(g_onScreenRec.eye & 1);
+            } else {
+                g_ssOrphans.fetch_add(1);
+            }
+            framedump::end_frame();
+            if (g.desktopSave) {
+                if ((int)eye == g_desktopEye.load()) g.ctx->CopyResource(g.desktopSave.Get(), backbuffer.Get());
+                else                                 g.ctx->CopyResource(backbuffer.Get(), g.desktopSave.Get());
+            }
+        }
+    } else if (fs.shouldRender && !stalled) {
         ComPtr<ID3D11Texture2D> backbuffer;
         if (SUCCEEDED(swapchain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&backbuffer))) {
             ID3D11Texture2D* blitSrc = backbuffer.Get();
 
             // Must be called exactly once per Present (it advances the ring).
             uint32_t eye = (uint32_t)present_route_eye();
+
+            // The eye's image: DLSS's when it made one -- see eye_source().
+            // DIBR shift does not run while it upscales (dibr_shift_runs()),
+            // so `eye` is final for the upscale here.
+            const bool dibrRuns = dibr_shift_runs();
+            blitSrc = eye_source(backbuffer.Get(), (int)eye);
 
             // DIBR shift: synthesize the OTHER eye from this one.
             //
@@ -4622,7 +5785,7 @@ void render_frame(IDXGISwapChain* swapchain)
             float frameProjB = g_dibrProj.b;
             bool  frameProjValid = g_dibrProj.valid;
 
-            if (g_dibrShift.load()) {
+            if (dibrRuns) {
                 const xr::AppliedEye ae = xr::applied_eye();
                 // ASK FOR THE EYE IN THE BACKBUFFER, rather than taking whatever
                 // capture was newest and then checking whether it happened to
@@ -4678,8 +5841,7 @@ void render_frame(IDXGISwapChain* swapchain)
                 // PAUSE MENU, which no screen classifier can: the world is still
                 // loaded there so the camera has not relocated.
                 const bool offWorldScreen = on_static_screen();
-                const bool driveIdle = hooks::logic_camera_idle_ms() > kDibrIdleMs ||
-                                       offWorldScreen;
+                const bool driveIdle = nothing_driven();
                 {
                     static bool wasIdle = false;
                     if (driveIdle != wasIdle) {
@@ -4800,8 +5962,16 @@ void render_frame(IDXGISwapChain* swapchain)
                     // Null on any frame the capture could not be trusted, and the
                     // finished backbuffer is used instead: a dragged HUD for one
                     // frame, rather than an eye built from the wrong image.
+                    //
+                    // Not when DLSS's sharpened frame stands in for the
+                    // backbuffer (eye_source()): the copy predates the
+                    // sharpening, and the eye built from it would be the one
+                    // left soft. All that costs is a dragged HUD, and only while
+                    // the HUD is in the frame at all -- not while the UI has a
+                    // layer of its own.
                     const bool hudIsOverlay = hooks::in_gameplay() &&
-                                              hooks::logic_camera_idle_ms() < 400;
+                                              hooks::logic_camera_idle_ms() < 400 &&
+                                              blitSrc == backbuffer.Get();
                     ID3D11Texture2D* dibrSrc =
                         hudIsOverlay ? hooks::pre_hud_texture() : nullptr;
                     // Recorded before the fallback below overwrites it, so
@@ -4847,110 +6017,9 @@ void render_frame(IDXGISwapChain* swapchain)
             // `dispK` is the per-pixel disparity constant for the splatter
             // composite: 0 for the eye actually rendered, which needs no shift.
             auto blit_into_eye = [&](uint32_t dstEye, ID3D11Texture2D* src,
-                                     float dispK = 0.0f) -> bool {
-                if (!src || !ensure_staging(src)) return false;
-                g.ctx->CopyResource(g.staging.Get(), src);
-
-                D3D11_TEXTURE2D_DESC sdesc{};
-                src->GetDesc(&sdesc);
-                float srcAspect = sdesc.Height > 0
-                    ? (float)sdesc.Width / (float)sdesc.Height : 1.0f;
-                float dstAspect = g.height > 0 ? (float)g.width / (float)g.height : 1.0f;
-                float vw = (float)g.width, vh = (float)g.height;
-                if (srcAspect > dstAspect) vh = vw / srcAspect;
-                else                       vw = vh * srcAspect;
-                float vx = 0.5f * ((float)g.width - vw), vy = 0.5f * ((float)g.height - vh);
-
-                XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-                XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-                wi.timeout = XR_INFINITE_DURATION;
-                uint32_t idx = 0;
-                if (XR_FAILED(xrAcquireSwapchainImage(g.swapchain[dstEye], &ai, &idx)) ||
-                    XR_FAILED(xrWaitSwapchainImage(g.swapchain[dstEye], &wi)))
-                    return false;
-
-                D3D11_VIEWPORT vp{vx, vy, vw, vh, 0, 1};
-                ID3D11RenderTargetView* rtv = g.rtvs[dstEye][idx].Get();
-                float clear[4] = {0, 0, 0, 1};
-                g.ctx->ClearRenderTargetView(rtv, clear);
-                g.ctx->OMSetRenderTargets(1, &rtv, nullptr);
-                g.ctx->RSSetViewports(1, &vp);
-                g.ctx->IASetInputLayout(nullptr);
-                g.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-                g.ctx->VSSetShader(g.vs.Get(), nullptr, 0);
-                g.ctx->PSSetShader(g.ps.Get(), nullptr, 0);
-                ID3D11ShaderResourceView* smudgeSrv = smudgelayer::srv();
-                ID3D11ShaderResourceView* glassSrv  = smudgelayer::depth_srv();
-                ID3D11ShaderResourceView* winchSrv  = winchlayer::srv();
-                const bool smudgeOn = (smudgeSrv != nullptr) && g.blitCb;
-                const bool winchOn  = (winchSrv != nullptr) && g.blitCb;
-                if (g.blitCb) {
-                    D3D11_MAPPED_SUBRESOURCE mc{};
-                    if (SUCCEEDED(g.ctx->Map(g.blitCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mc))) {
-                        float* p = static_cast<float*>(mc.pData);
-                        p[0] = dispK;
-                        p[1] = frameProjValid ? frameProjA : 0.0f;
-                        p[2] = (g.width > 0) ? 1.0f / (float)g.width : 0.0f;
-                        // Glass thickness as t/projB, the form smudge_shift()
-                        // wants. projB is the only piece of the projection the
-                        // folded disparity constant threw away, so it has to be
-                        // divided back in here rather than in the shader.
-                        p[3] = (frameProjValid && frameProjB != 0.0f)
-                                   ? smudgelayer::depth_offset() / frameProjB
-                                   : 0.0f;
-                        p[4] = smudgeOn ? 1.0f : 0.0f;
-                        p[5] = glassSrv ? 1.0f : 0.0f;
-                        p[6] = winchOn ? 1.0f : 0.0f;
-                        p[7] = 0.0f;
-                        g.ctx->Unmap(g.blitCb.Get(), 0);
-                    }
-                    ID3D11Buffer* cb[1] = { g.blitCb.Get() };
-                    g.ctx->PSSetConstantBuffers(0, 1, cb);
-                }
-                ID3D11ShaderResourceView* srvs[4] = { g.stagingSrv.Get(), smudgeSrv,
-                                                      glassSrv, winchSrv };
-                ID3D11SamplerState* smp = g.sampler.Get();
-                g.ctx->PSSetShaderResources(0, 4, srvs);
-                g.ctx->PSSetSamplers(0, 1, &smp);
-                g.ctx->Draw(3, 0);
-                // Release the layer bindings: both are render targets again on
-                // the very next frame, and D3D silently unbinds (and warns) if
-                // they are still bound as SRVs when that happens.
-                ID3D11ShaderResourceView* nullSrvs[4] = {};
-                g.ctx->PSSetShaderResources(0, 4, nullSrvs);
-
-                if (!hooks::is_menu_open() && winch_cursor_active()) {
-                    cursoroverlay::draw_in_rect(
-                        g.device.Get(), g.ctx.Get(), rtv, g.outputWindow,
-                        g.width, g.height, vx, vy, vw, vh, true);
-                }
-
-                // Dump what the HEADSET receives, not the source handed in.
-                //
-                // This used to capture `src`, i.e. the image BEFORE this shader
-                // ran -- so anything the blit itself composites was invisible in
-                // a frame dump. The windscreen splatter is composited here, which
-                // made it impossible to photograph the very artefact a dump was
-                // taken to show. Reading the swapchain texture back off its own
-                // RTV needs no extra bookkeeping, and catches every later stage
-                // by construction rather than one at a time.
-                //
-                // Taken before xrReleaseSwapchainImage, while the image is still
-                // ours to read.
-                {
-                    ComPtr<ID3D11Resource> res;
-                    rtv->GetResource(&res);
-                    ComPtr<ID3D11Texture2D> shown;
-                    if (res && SUCCEEDED(res.As(&shown)))
-                        framedump::capture(g.ctx.Get(), shown.Get(), dstEye);
-                }
-
-                XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-                xrReleaseSwapchainImage(g.swapchain[dstEye], &ri);
-                g.eyeFresh[dstEye] = true;
-                g.eyeEverRendered[dstEye] = true;
-                g.blitRect[dstEye] = {{(int32_t)vx, (int32_t)vy}, {(int32_t)vw, (int32_t)vh}};
-                return true;
+                                     float dispK = 0.0f, bool rendered = false) -> bool {
+                return blit_eye_image(dstEye, src, dispK, frameProjValid, frameProjA,
+                                      frameProjB, nullptr, nullptr, rendered);
             };
 
             // Disparity debug view (fill mode 3) outputs an UNWARPED map derived
@@ -4972,7 +6041,7 @@ void render_frame(IDXGISwapChain* swapchain)
             } else {
                 // The eye actually rendered. From the pre-HUD copy when one
                 // exists, so the smudge lands under the HUD rather than over it.
-                blit_into_eye(eye, preUiSrc ? preUiSrc : blitSrc);
+                blit_into_eye(eye, preUiSrc ? preUiSrc : blitSrc, 0.0f, true);
                 // Same frame to the partner eye on a static screen -- see
                 // monoScreen above. Done here rather than by warping, because
                 // the warp's source is a pre-menu image.
@@ -4992,7 +6061,7 @@ void render_frame(IDXGISwapChain* swapchain)
                 // rendered eye may now come from the pre-HUD copy, and
                 // retain_eye_for_warp() reads g.staging by default. Passing the
                 // finished frame keeps the stale-eye fill exactly what it was.
-                if (g_dibrShift.load())
+                if (dibrRuns)
                     retain_eye_for_warp(eye, blitSrc);
 
                 // The synthesized eye's splatter is shifted by the disparity of
@@ -5049,7 +6118,7 @@ void render_frame(IDXGISwapChain* swapchain)
             // rotation-warps INTO the swapchain: the DIBR result is strictly
             // more information than a rotation-only warp of an older frame, and
             // the retained copy is used as its disocclusion fill instead.
-            const bool shift = g_dibrShift.load();
+            const bool shift = dibrRuns;
             if (!shift) {
                 retain_eye_for_warp(eye);
                 warp_stale_eye(eye ^ 1u);
@@ -5176,12 +6245,15 @@ void render_frame(IDXGISwapChain* swapchain)
             // while the other kept the current locate is what split the eyes
             // apart on 2026-08-20; see g_renderView.
             pv[e].pose = reference_view_pose((uint32_t)e);
+            // Synched Sequential: the views the pair in the swapchains was
+            // rendered from -- one head pose for both eyes.
+            if (ss && g.ssCommitted) pv[e].pose = g.ssCommittedView[e].pose;
             if (dibrPairThisFrame) {
                 AcquireSRWLockShared(&g_renderViewLock);
-                const bool    haveRv   = g_renderViewValid;
-                const XrPosef rendered = g_renderView[dibrRealEye].pose;
-                const XrPosef other    = g_renderView[dibrRealEye ^ 1u].pose;
+                const bool haveRv = g_renderViewValid || g_onScreenViewsValid;
                 ReleaseSRWLockShared(&g_renderViewLock);
+                const XrPosef rendered = reference_view_pose(dibrRealEye);
+                const XrPosef other    = reference_view_pose(dibrRealEye ^ 1u);
                 if (haveRv && (uint32_t)e == dibrRealEye) {
                     pv[e].pose = rendered;
                 } else if (haveRv) {
@@ -5190,6 +6262,13 @@ void render_frame(IDXGISwapChain* swapchain)
                     // runtime's own eye position instead would describe a
                     // baseline the image was never built with, whenever the
                     // camera hook scaled the offset.
+                    //
+                    // Less the WORLD SCALE, which is not such a scaling: it is a
+                    // world drawn bigger or smaller around the real eyes, and AER
+                    // declares both of its eyes at their real poses whatever it
+                    // is set to. Rebasing at the separation it rendered would put
+                    // this eye a scaled IPD from the other and have the
+                    // compositor correct the scale away in this eye alone.
                     const auto to_policy = [](const XrPosef& p) {
                         dibrpolicy::EyePose o;
                         o.orientation[0] = p.orientation.x;
@@ -5204,7 +6283,8 @@ void render_frame(IDXGISwapChain* swapchain)
                     dibrpolicy::EyePose synth;
                     if (dibrpolicy::rebase_synth_eye(to_policy(rendered),
                                                     to_policy(other),
-                                                    dibrSeparationM, synth)) {
+                                                    dibrSeparationM * g_worldScale.load(),
+                                                    synth)) {
                         pv[e].pose.orientation = {synth.orientation[0],
                                                   synth.orientation[1],
                                                   synth.orientation[2],
@@ -5218,19 +6298,15 @@ void render_frame(IDXGISwapChain* swapchain)
                 }
             }
             {
-                float voff = submitted_vertical_pitch();
-                float half = voff * 0.5f;
-                Quat q = {pv[e].pose.orientation.x, pv[e].pose.orientation.y,
-                          pv[e].pose.orientation.z, pv[e].pose.orientation.w};
-                Quat pitch = {std::sin(half), 0.0f, 0.0f, std::cos(half)};
-                Quat nq = mul(q, pitch);
-                // SYNTHETIC cant only. A real hardware cant is already baked
-                // into g.lastView[e].pose above -- adding it here too would
-                // double it. The debug cant has no such source, so it has to
-                // be declared here as well as rendered, otherwise the slider
-                // would just tilt each eye's render with nothing to undo it
-                // (a broken-stereo test, not a simulation of a canted headset).
-                nq = mul(nq, debug_cant(e));
+                // WHAT THE CAMERA WAS AIMED AT: the vertical tilt and the
+                // SYNTHETIC cant, the same two rotations head_look() gave it
+                // (rendered_orientation()). A real hardware cant is already
+                // baked into g.lastView[e].pose above -- adding it here too
+                // would double it. The debug cant has no such source, so it has
+                // to be declared here as well as rendered, otherwise the slider
+                // would just tilt each eye's render with nothing to undo it (a
+                // broken-stereo test, not a simulation of a canted headset).
+                const Quat nq = rendered_orientation(pv[e].pose.orientation, e);
                 pv[e].pose.orientation.x = nq.x; pv[e].pose.orientation.y = nq.y;
                 pv[e].pose.orientation.z = nq.z; pv[e].pose.orientation.w = nq.w;
             }
@@ -5314,6 +6390,20 @@ void render_frame(IDXGISwapChain* swapchain)
         // panel's height limit (build_menu_quad_layer).
         g_submittedHalfV.store((std::min)((std::min)(pv[0].fov.angleUp, -pv[0].fov.angleDown),
                                           (std::min)(pv[1].fov.angleUp, -pv[1].fov.angleDown)));
+        // And the horizontal, for its width limit: the narrower side of each
+        // eye, rendered AND on the panel -- a head-locked quad is drawn by the
+        // compositor, so the panel's own edge (the nose side) bounds it even
+        // where the render reaches further.
+        {
+            float halfH = 10.0f;
+            for (int e = 0; e < 2; ++e) {
+                halfH = (std::min)(halfH, (std::min)(pv[e].fov.angleRight, -pv[e].fov.angleLeft));
+                const XrFovf& raw = g.lastView[e].fov;
+                if (raw.angleRight - raw.angleLeft > 0.01f)
+                    halfH = (std::min)(halfH, (std::min)(raw.angleRight, -raw.angleLeft));
+            }
+            g_submittedHalfH.store(halfH < 10.0f ? halfH : 0.0f);
+        }
     }
 
     // Only submit the eye projection layer when the runtime is actually
@@ -5414,6 +6504,14 @@ HeadLook head_look()
     Quat rel{g_relQuat[0], g_relQuat[1], g_relQuat[2], g_relQuat[3]};
     ReleaseSRWLockShared(&g_poseLock);
 
+    // THE WORLD SCALE divides the head's travel here, as advance_aer_parity()
+    // divides the eye separation by it -- both are how you judge the world's
+    // size. Drawn twice the size, a 10 cm lean has to move the camera 5 cm, or
+    // moving your head says life size while the stereo says double. Turning
+    // stays one to one: an angle is the same at any size.
+    const float scale = g_worldScale.load();
+    h.ox /= scale; h.oy /= scale; h.oz /= scale;
+
     // Per-eye display canting. This is the single choke point every camera
     // consumer already shares (camera_hook's cockpit path, viewbuild_hook's
     // view post-rotation and detour_fna), so folding the cant in here gets it
@@ -5428,10 +6526,19 @@ HeadLook head_look()
     // Bit-identical no-op on a parallel-panel headset with the debug slider at
     // zero, which is the overwhelmingly common case -- the early-out below is
     // what guarantees that, not just "the numbers work out the same".
+    //
+    // THE VERTICAL TILT goes on after the cant, through the same choke point
+    // and for the same reason: the submission declares every eye tilted by
+    // submitted_vertical_pitch() (rendered_orientation()), so the camera has to
+    // be tilted by it too, or the world is displayed rotated by it. It is not
+    // a cant (one value for both eyes) but composes the same way, about the
+    // eye's own right axis. Zero only on a headset whose display is centred on
+    // its optical axis -- on most, the early-out no longer applies.
     if (!h.valid) return h;
     const Quat cant = total_cant(g_frameEye.load() & 1);
-    if (cant_is_identity(cant)) return h;
-    euler_from_rel(mul(rel, cant), h.yaw, h.pitch, h.roll);
+    const Quat tilt = vertical_tilt();
+    if (cant_is_identity(cant) && cant_is_identity(tilt)) return h;
+    euler_from_rel(mul(mul(rel, cant), tilt), h.yaw, h.pitch, h.roll);
     return h;
 }
 
@@ -5484,10 +6591,18 @@ bool native_eye_size(uint32_t& w, uint32_t& h)
 
 bool render_canvas_wh(uint32_t& w, uint32_t& h)
 {
-    // The game's ACTUAL backbuffer size (see g.width/g.height, mirrored 1:1
-    // from the swapchain desc), whatever chose it.
-    w = g.width; h = g.height;
+    // The game's ACTUAL backbuffer size (from the swapchain desc at init),
+    // whatever chose it. g.width/g.height are the eye images, which differ
+    // from it while DLSS upscales.
+    w = g.bbWidth; h = g.bbHeight;
     return w > 0 && h > 0;
+}
+
+bool upscale_canvas(uint32_t& w, uint32_t& h)
+{
+    if (!g.bbWidth || (g.width == g.bbWidth && g.height == g.bbHeight)) return false;
+    w = g.width; h = g.height;
+    return true;
 }
 
 // ZERO IN 2D, and this is not optional. A flat panel is one image shown to both
@@ -5495,6 +6610,17 @@ bool render_canvas_wh(uint32_t& w, uint32_t& h)
 // panel would shake left and right at half the frame rate. There is no stereo
 // to keep on a mono quad, so the offset simply stops being applied.
 float eye_side_offset() { return flat_screen_active() ? 0.0f : g_eyeSide.load(); }
+
+float world_scale() { return g_worldScale.load(); }
+
+// Takes effect at the next frame's eye choice (advance_aer_parity), the moment
+// a new eye offset is set anyway.
+void set_world_scale(float scale)
+{
+    float s = std::isfinite(scale) ? scale : 1.0f;
+    s = (std::max)(0.5f, (std::min)(2.0f, s));
+    g_worldScale.store(s);
+}
 
 
 std::atomic<uint64_t> g_appliedEye{0};
@@ -5530,10 +6656,23 @@ void record_applied_eye_offset(float off, int how)
     // latency.
     //
     // Cheap: two poses under an exclusive lock, a handful of times per frame.
+    //
+    // Under Synched Sequential, the views latched for the moment being
+    // rendered: both renders of it are built from those, and g.lastView may
+    // already be a later locate by the second.
+    XrView snap[2];
     AcquireSRWLockExclusive(&g_renderViewLock);
-    for (int e = 0; e < 2; ++e) g_renderView[e] = g.lastView[e];
+    for (int e = 0; e < 2; ++e)
+        snap[e] = g_renderView[e] = g_ssViewsValid ? g_ssViews[e] : g.lastView[e];
     g_renderViewValid = true;
     ReleaseSRWLockExclusive(&g_renderViewLock);
+    {
+        const uint32_t b = (uint32_t)g_advFlips.load();
+        AcquireSRWLockExclusive(&g_buildRecLock);
+        BuildRec& r = g_buildRec[b % kBuildRing];
+        if (r.build == b) { r.views[0] = snap[0]; r.views[1] = snap[1]; r.haveViews = true; }
+        ReleaseSRWLockExclusive(&g_buildRecLock);
+    }
 }
 
 AppliedEye applied_eye()
@@ -5551,6 +6690,238 @@ AppliedEye applied_eye()
     return out;
 }
 
+bool synched_sequential_active() { return synched_active(); }
+
+bool xr_session_running() { return !g_failed && g.running; }
+
+bool render_in_progress(RenderInfo& out)
+{
+    // The render's own camera, as its Present will read it (update_on_screen),
+    // else the newest build: in the middle of the frame that IS the render's.
+    // NOT the newest build minus the Present's lag -- on the map, garage and
+    // menus the next camera is built AFTER the scene, so from here the image
+    // is not a build behind yet, and subtracting the lag named the build
+    // before. Measured 2026-10-28 with DLSS: under Synched Sequential half the
+    // renders' eyes disagreed with their Present's on exactly those screens,
+    // and each eye's DLSS history took in the other eye's frames.
+    const uint32_t newest = (uint32_t)g_advFlips.load();
+    const uint32_t fromRender = render_camera_build(newest);
+    const uint32_t b = fromRender ? fromRender : newest;
+    BuildRec r;
+    AcquireSRWLockShared(&g_buildRecLock);
+    r = g_buildRec[b % kBuildRing];
+    ReleaseSRWLockShared(&g_buildRecLock);
+    if (r.build != b || b == 0 || r.eye < 0) return false;
+    out.build   = b;
+    out.eye     = r.eye & 1;
+    out.synched = (r.ss >> 63) != 0 && synched_active();
+    out.moment  = out.synched ? (uint32_t)r.ss : r.build;
+    return true;
+}
+
+bool ss_build_info(SsBuildInfo& out)
+{
+    if (!synched_active()) return false;
+    const uint64_t f = g_ssFrame.load();
+    if (!(f >> 63)) return false;
+    out.build  = (uint32_t)g_advFlips.load();
+    out.moment = (uint32_t)f;
+    out.first  = ((f >> 62) & 1u) != 0;
+    return true;
+}
+
+void note_built_camera(const float fwd[3], bool previousBuildScreen, const float eye[3],
+                       int builder, const float eyeOffset[3])
+{
+    const uint32_t b = (uint32_t)g_advFlips.load();
+    AcquireSRWLockExclusive(&g_buildRecLock);
+    BuildRec& r = g_buildRec[b % kBuildRing];
+    if (r.build == b) {
+        r.fwd[0] = fwd[0]; r.fwd[1] = fwd[1]; r.fwd[2] = fwd[2];
+        r.haveFwd = true;
+        r.prevScreen = previousBuildScreen;
+        if (eye) {
+            r.eyePos[0] = eye[0]; r.eyePos[1] = eye[1]; r.eyePos[2] = eye[2];
+            r.haveEyePos = true;
+        }
+        if (eyeOffset) {
+            r.eyeOff[0] = eyeOffset[0]; r.eyeOff[1] = eyeOffset[1]; r.eyeOff[2] = eyeOffset[2];
+            r.haveEyeOff = true;
+        }
+        r.builder = builder;
+    }
+    ReleaseSRWLockExclusive(&g_buildRecLock);
+}
+
+bool match_built_camera(const float eye[3], const float fwd[3], float tolM,
+                        uint32_t& build, float& distM)
+{
+    const float fl = std::sqrt(fwd[0]*fwd[0] + fwd[1]*fwd[1] + fwd[2]*fwd[2]);
+    if (!(fl > 1.0e-6f)) return false;
+    constexpr float kCos2Deg = 0.99939f;
+    const uint32_t newest = (uint32_t)g_advFlips.load();
+    bool found = false;
+    AcquireSRWLockShared(&g_buildRecLock);
+    // Newest first, replaced only by a STRICTLY nearer one: among equals --
+    // a still head on a still screen builds the same camera twice -- the
+    // newest that existed at upload wins, which is the one the render took.
+    for (uint32_t k = 0; k < kBuildRing && k < newest; ++k) {
+        const uint32_t b = newest - k;
+        const BuildRec& r = g_buildRec[b % kBuildRing];
+        if (r.build != b || !r.haveEyePos || !r.haveFwd) continue;
+        const float dx = eye[0] - r.eyePos[0], dy = eye[1] - r.eyePos[1],
+                    dz = eye[2] - r.eyePos[2];
+        const float d = std::sqrt(dx*dx + dy*dy + dz*dz);
+        if (!(d <= tolM)) continue;
+        // Either sign: the view's forward row and the direction handed over
+        // need not share a convention.
+        const float c = std::fabs(fwd[0]*r.fwd[0] + fwd[1]*r.fwd[1] + fwd[2]*r.fwd[2]) / fl;
+        if (c < kCos2Deg) continue;
+        if (!found || d < distM - 1.0e-4f) { found = true; build = b; distM = d; }
+    }
+    ReleaseSRWLockShared(&g_buildRecLock);
+    return found;
+}
+
+// How far a camera may sit from every recorded build and still be taken for the
+// nearest. The same allowance cbuffer_hook.cpp gives a camera that is only
+// NEAR a build: a camera that is a build's own sits on it to the millimetre, and
+// the nearest of two builds is still the right eye at any tolerance, because
+// the eye offset alone puts the two renders of a pair 6 cm apart.
+constexpr float kUiCameraMatchTolM = 1.0f;
+
+// THE PLANE, IN THE FRAME OF THE CAMERA A MARKER IS PROJECTED WITH.
+//
+// The camera is matched to the build it came from by its own position and
+// direction, as the GPU's camera is in cbuffer_hook.cpp. That build's record
+// holds the eye it was rendered for, both eye poses at that instant and the eye
+// offset it applied, which is everything the plane's placement depends on. The
+// plane is placed the way place_ui_plane_quad() last placed it -- pinned in the
+// runtime's space, or hung on the capture eye and tilted with the render -- and
+// only then expressed in the camera's frame. Turning OpenXR's axes (-Z forward)
+// into the game's (+Z forward) is the last step, so everything before it is the
+// placement's own arithmetic.
+//
+// FROM BETWEEN THE EYES, not from the eye the build was rendered for: the plane
+// is measured from the middle of the two eye poses, and `origin` is that point
+// in the game -- the build's own eye offset taken back off. Both eyes' builds
+// then put every marker in the same place, so the UI of either eye's frame is
+// the UI of both (marker_camera_placing()).
+bool ui_plane_in_camera(const float eye[3], const float fwd[3], UiPlaneInCamera& out)
+{
+    if (g_failed || !g.running || flat_screen_active()) return false;
+    const float w = g_uiQuadWidthM.load(), h = g_uiQuadHeightM.load();
+    if (!(w > 1.0e-3f) || !(h > 1.0e-3f)) return false;
+
+    uint32_t b = 0;
+    float matchM = 0.0f;
+    if (!match_built_camera(eye, fwd, kUiCameraMatchTolM, b, matchM)) return false;
+    BuildRec r;
+    AcquireSRWLockShared(&g_buildRecLock);
+    r = g_buildRec[b % kBuildRing];
+    ReleaseSRWLockShared(&g_buildRecLock);
+    if (r.build != b || !r.haveViews || !r.haveEyeOff || r.eye < 0) return false;
+    const int e = r.eye & 1;
+
+    // The camera's axes: the orientation this build was rendered and declared
+    // at. Its position: the middle of the two eyes.
+    const XrView& cv = r.views[e];
+    const Quat qc = rendered_orientation(cv.pose.orientation, e);
+    const Vec3 pc{(r.views[0].pose.position.x + r.views[1].pose.position.x) * 0.5f,
+                  (r.views[0].pose.position.y + r.views[1].pose.position.y) * 0.5f,
+                  (r.views[0].pose.position.z + r.views[1].pose.position.z) * 0.5f};
+
+    // The quad's centre and orientation, in the same space.
+    Quat qq{0.0f, 0.0f, 0.0f, 1.0f};
+    Vec3 pq{0.0f, 0.0f, 0.0f};
+    bool pinned = false;
+    if (g_uiQuadPinned.load()) {
+        AcquireSRWLockShared(&g_uiPinLock);
+        if (g_uiPinValid) {
+            qq = {g_uiPinPose.orientation.x, g_uiPinPose.orientation.y,
+                  g_uiPinPose.orientation.z, g_uiPinPose.orientation.w};
+            pq = {g_uiPinPose.position.x, g_uiPinPose.position.y, g_uiPinPose.position.z};
+            pinned = true;
+        }
+        ReleaseSRWLockShared(&g_uiPinLock);
+    }
+    if (!pinned) {
+        const XrView& ce = r.views[kUiCaptureEye];
+        qq = mul(Quat{ce.pose.orientation.x, ce.pose.orientation.y,
+                      ce.pose.orientation.z, ce.pose.orientation.w}, vertical_tilt());
+        pq = {ce.pose.position.x, ce.pose.position.y, ce.pose.position.z};
+    }
+    const Vec3 off = rotate(qq, {0.0f, 0.0f, -g_uiPlaneDistM.load()});
+    pq = {pq.x + off.x, pq.y + off.y, pq.z + off.z};
+
+    const Quat ic  = conj(qc);
+    const Quat rel = mul(ic, qq);
+    const Vec3 c  = rotate(ic, {pq.x - pc.x, pq.y - pc.y, pq.z - pc.z});
+    const Vec3 ax = rotate(rel, {1.0f, 0.0f, 0.0f});
+    const Vec3 ay = rotate(rel, {0.0f, 1.0f, 0.0f});
+    const Vec3 az = rotate(rel, {0.0f, 0.0f, -1.0f});   // into the quad, away from the eye
+    out.center[0] = c.x;  out.center[1] = c.y;  out.center[2] = -c.z;
+    out.right[0]  = ax.x; out.right[1]  = ax.y; out.right[2]  = -ax.z;
+    out.up[0]     = ay.x; out.up[1]     = ay.y; out.up[2]     = -ay.z;
+    out.normal[0] = az.x; out.normal[1] = az.y; out.normal[2] = -az.z;
+    out.origin[0] = -r.eyeOff[0]; out.origin[1] = -r.eyeOff[1]; out.origin[2] = -r.eyeOff[2];
+    out.width  = w;
+    out.height = h;
+    out.build  = b;
+    out.eye    = e;
+    out.matchM = matchM;
+    out.pinned = pinned;
+    return true;
+}
+
+uint32_t current_build() { return (uint32_t)g_advFlips.load(); }
+
+int onscreen_camera_builder() { return g_onScreenBuilder.load(); }
+
+bool have_built_camera()
+{
+    const uint32_t newest = (uint32_t)g_advFlips.load();
+    bool any = false;
+    AcquireSRWLockShared(&g_buildRecLock);
+    for (uint32_t k = 0; k < kBuildRing && k < newest && !any; ++k) {
+        const BuildRec& r = g_buildRec[(newest - k) % kBuildRing];
+        any = r.build == newest - k && r.haveEyePos;
+    }
+    ReleaseSRWLockShared(&g_buildRecLock);
+    return any;
+}
+
+int  render_method() { return g_renderMethod.load(); }
+
+void set_render_method(int method)
+{
+    const int m = (method == kRenderSynchedSequential) ? kRenderSynchedSequential : kRenderAER;
+    if (g_renderMethod.exchange(m) == m) return;
+    g_ssReset.store(true);
+    VRLOG("render method -> %s%s", m == kRenderSynchedSequential ? "Synched Sequential"
+                                                                 : "Alternate Eye Rendering",
+          (m == kRenderSynchedSequential && !hooks::frame_sync_ready())
+              ? " (waiting for the frame callbacks)" : "");
+}
+
+bool synched_sequential_available() { return hooks::frame_sync_ready(); }
+
+const char* render_method_key(int method)
+{
+    return method == kRenderSynchedSequential ? "SynchedSequential" : "AlternateEye";
+}
+
+bool render_method_from_key(const char* key, int& method)
+{
+    if (!key) return false;
+    if (_stricmp(key, "SynchedSequential") == 0) { method = kRenderSynchedSequential; return true; }
+    if (_stricmp(key, "AlternateEye") == 0)      { method = kRenderAER; return true; }
+    return false;
+}
+
+bool dibr_shift_active() { return dibr_shift_runs() && !synched_active(); }
+bool warp_active()       { return g_warpEnabled.load() && !synched_active(); }
+
 bool warp_enabled() { return g_warpEnabled.load(); }
 void set_warp_enabled(bool on)
 {
@@ -5561,15 +6932,18 @@ void set_warp_enabled(bool on)
 const char* kWarpTypeName[kWarpTypeCount] = {
     "headset rotation only",
     "headset + game camera rotation",
-    "headset + game camera 6-DoF"
+    "headset + game camera 6-DoF",
+    "headset + game camera 6-DoF + the game's motion vectors"
 };
 // Stable config-file tokens, deliberately separate from the names above so the
 // log wording can change without invalidating a saved config.
-const char* kWarpTypeKey[kWarpTypeCount] = { "Headset", "GameRotation", "Game6Dof" };
+const char* kWarpTypeKey[kWarpTypeCount] = { "Headset", "GameRotation", "Game6Dof",
+                                             "MotionVectors" };
 
 int warp_type() { return g_warpType.load(); }
 bool warp_uses_game_rot() { return g_warpType.load() >= kWarpGameRot; }
 bool warp_uses_6dof()     { return g_warpType.load() >= kWarp6Dof; }
+bool warp_uses_motion()   { return g_warpType.load() >= kWarpMotion; }
 
 void set_warp_type(int type)
 {
@@ -5603,6 +6977,7 @@ void set_warp_type(int type)
                 g.prevEyeRigidSrv[e].Reset();
                 g.prevEyeRigid[e].Reset();
                 g.prevEyeRigidW[e] = g.prevEyeRigidH[e] = 0;
+                g.prevEyeRigidValid[e] = false;
             }
             reproject::release();
         }
@@ -5654,11 +7029,11 @@ void set_render_fov_scale(float s)
           headset_hfov_deg() * s, headset_hfov_deg());
 }
 
-float map_window_shrink() { return g_mapWindowShrink.load(); }
+float map_ui_scale() { return g_mapUiScale.load(); }
 
-void set_map_window_shrink(float v)
+void set_map_ui_scale(float v)
 {
-    g_mapWindowShrink.store((std::max)(0.05f, (std::min)(1.0f, v)));
+    g_mapUiScale.store((std::max)(0.2f, (std::min)(1.0f, v)));
 }
 
 float vertical_recenter() { return g_vertOffset.load(); }
@@ -5737,7 +7112,7 @@ void note_camera_active()
 // call after a Present flips the eye and sets its ±IPD/2 offset; later calls in
 // the same frame are no-ops. The offset and the Present routing both read
 // g_frameEye, so they stay in lockstep.
-void advance_aer_parity()
+void advance_aer_parity(uint64_t cameraFingerprint, bool gameplayCamera)
 {
     g_advCalls.fetch_add(1);
     bool expected = true;
@@ -5746,9 +7121,23 @@ void advance_aer_parity()
         // The frame turns over here, so anything recorded before this instant
         // belongs to the PREVIOUS frame. See AppliedEye::fresh.
         g_eyeSerialAtFlip.store(g_eyeRecordSerial.load());
-        int e = g_frameEye.load() ^ 1;
+        // AER flips; Synched Sequential chooses, by the moment being rendered.
+        int e = synched_active() ? ss_choose_eye(cameraFingerprint, gameplayCamera)
+                                 : (g_frameEye.load() ^ 1);
         g_frameEye.store(e);
-        float ipd = g_ipd.load();
+        {
+            const uint32_t b = (uint32_t)g_advFlips.load();
+            AcquireSRWLockExclusive(&g_buildRecLock);
+            BuildRec& r = g_buildRec[b % kBuildRing];
+            r = BuildRec{};
+            r.build = b;
+            r.eye = e;
+            r.ss = g_ssFrame.load();
+            ReleaseSRWLockExclusive(&g_buildRecLock);
+        }
+        // The world scale is applied here and only here: every 3D view takes its
+        // eye offset from g_eyeSide, and DIBR shift reads back what was baked.
+        float ipd = g_ipd.load() / g_worldScale.load();
         // eye 0 -> swapchain[0] = left XrView; the left eye sits at +IPD/2 along
         // the game's right axis under our sign convention (verified: -IPD/2 gave
         // inverted depth in both cockpit AND orbit). Global flip fixes both.
@@ -6067,8 +7456,8 @@ float render_hfov_deg()
     // The "Final FOV" angle trim that used to sit here was REMOVED 2026-08-18:
     // with the automatic sizing correct it was only ever left at 1.0, and a
     // knob that is always 1.0 is one more thing that can silently be wrong.
-    // render_fov_scale() (the render-size slider) and the map shrink both
-    // remain -- they work in TANGENT space, see below.
+    // render_fov_scale() (the render-size slider) remains -- it works in
+    // TANGENT space, see below.
     const float trimmed = hfov;
 
     // composited_fov_scale() must be applied in TANGENT space, because that is
@@ -6076,12 +7465,13 @@ float render_hfov_deg()
     // the window we submit to the compositor:
     //     vh = atan(tan(base) * composited_fov_scale())
     // This used to scale the ANGLE here instead, which silently disagreed with
-    // the submission for any scale != 1. At MapWindowShrink=0.5 on a ~100.7 deg
-    // headset that meant declaring a 62.1 deg window over a 50.3 deg render --
-    // the compositor stretched the difference and the map view read as ~1.23x
-    // too zoomed. (Measured: the Final-FOV value that cancelled it by hand was
-    // ~1.23, matching 62.1/100.67/0.5 to two decimals.) The two are now the
-    // same computation, so the map view needs no FOV compensation at all.
+    // the submission for any scale != 1. With the map window (since removed)
+    // at 0.5 on a ~100.7 deg headset that meant declaring a 62.1 deg window
+    // over a 50.3 deg render -- the compositor stretched the difference and the
+    // map view read as ~1.23x too zoomed. (Measured: the Final-FOV value that
+    // cancelled it by hand was ~1.23, matching 62.1/100.67/0.5 to two
+    // decimals.) The two are now the same computation, so no view needs FOV
+    // compensation at all.
     const float s = composited_fov_scale();
     if (s == 1.0f) return trimmed;   // gameplay path: bit-identical to before
 
@@ -6122,23 +7512,87 @@ void aer_only_present(IDXGISwapChain* swapchain)
     ComPtr<ID3D11Texture2D> bb;
     if (FAILED(swapchain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&bb))) return;
     ensure_desktop_save(bb.Get());
-    if (g.desktopSave) {
+    // One eye on the monitor -- except under DLSS, which renders the flat
+    // screen mono (below) and is judged on it: holding every other frame would
+    // halve the rate it is being judged at.
+    if (g.desktopSave && dlss::mode() == dlss::kOff) {
         if (present_route_eye() == g_desktopEye.load()) g.ctx->CopyResource(g.desktopSave.Get(), bb.Get());
         else                                            g.ctx->CopyResource(bb.Get(), g.desktopSave.Get());
     }
-    g_ipd.store(0.062f);       // no headset -> assume default IPD
+    // No headset -> assume the default IPD, so the stereo pipeline keeps running
+    // for development. Except under DLSS, which is tested exactly here: a camera
+    // jumping 62 mm sideways every frame is not something any temporal AA can
+    // accumulate, so the flat screen gets one eye at the head's centre.
+    g_ipd.store(dlss::mode() != dlss::kOff ? 0.0f : 0.062f);
     g_newFrame.store(true);    // first camera build next frame advances the parity
 }
 
 
+// A LIVE RESIZE REACHES THE HEADSET HERE, at the top of the Present after the
+// engine's resize, where no frame is open, no image is acquired and the previous
+// xrEndFrame has finished. Nothing happens if only the render size moved: a DLSS
+// mode change keeps the eye images.
+//
+// The new images are made before the old ones go, so a size the runtime refuses
+// costs nothing: the blit scales whatever it is given into the images there are.
+//
+// They start empty, so they count as never rendered, and no layer is submitted
+// until both have something in them. That is normally this very frame: the eye
+// not rendered now is warped from its retained frame, which knows nothing of the
+// swapchain, into the rect its last blit left -- scaled here, because the warp
+// reuses that rect as it stands, and an empty one would draw nothing at all.
+static void follow_game_frame()
+{
+    if (!g_frameResized.exchange(false) || g.session == XR_NULL_HANDLE || !g.device) return;
+
+    uint32_t w = 0, h = 0;
+    eye_size_for_frame(g.bbWidth, g.bbHeight, w, h);
+    if (w == g.width && h == g.height) return;
+
+    XrSwapchain sc[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
+    std::vector<ComPtr<ID3D11RenderTargetView>> rtvs[2];
+    if (!create_eye_images(g.device.Get(), w, h, sc, rtvs)) {
+        destroy_eye_images(sc, rtvs);
+        VRLOG("XR canvas: could not make %ux%u eye images -- staying at %ux%u", w, h, g.width,
+              g.height);
+        return;
+    }
+    destroy_eye_images(g.swapchain, g.rtvs);
+
+    const float sx = (float)w / (float)g.width, sy = (float)h / (float)g.height;
+    for (int e = 0; e < 2; ++e) {
+        g.swapchain[e] = sc[e];
+        g.rtvs[e] = std::move(rtvs[e]);
+        g.eyeFresh[e] = false;
+        g.eyeEverRendered[e] = false;
+        XrRect2Di& r = g.blitRect[e];
+        r.offset.x = (int32_t)((float)r.offset.x * sx);
+        r.offset.y = (int32_t)((float)r.offset.y * sy);
+        r.extent.width  = (int32_t)((float)r.extent.width * sx);
+        r.extent.height = (int32_t)((float)r.extent.height * sy);
+        g.ssPendingValid[e] = false;
+    }
+    g.ssCommitted = false;
+    g_ssReset.store(true);
+
+    VRLOG("XR canvas: eye images %ux%u -> %ux%u, %u+%u images", g.width, g.height, w, h,
+          (uint32_t)g.rtvs[0].size(), (uint32_t)g.rtvs[1].size());
+    g.width = w;
+    g.height = h;
+}
+
 void mirror_on_present(IDXGISwapChain* swapchain)
 {
+    // Which camera build the image in the backbuffer was drawn with, before
+    // anything below routes it to an eye or declares a pose for it.
+    update_on_screen();
 
-    if (g_failed) { aer_only_present(swapchain); return; }
+    if (g_failed) { hooks::set_frame_freeze(false); aer_only_present(swapchain); return; }
     if (!g_inited) {
         g_inited = true;
         if (!init(swapchain)) {
             g_failed = true;
+            hooks::set_frame_freeze(false);
             VRLOG("no OpenXR -> AER-only fallback (default 62mm IPD)");
             aer_only_present(swapchain);
             return;
@@ -6197,10 +7651,22 @@ void mirror_on_present(IDXGISwapChain* swapchain)
     // Waited for HERE, ahead of poll_events() as well as render_frame(), so no
     // call on the session -- an xrEndSession included -- ever overlaps it.
     end_frame_wait();
+    follow_game_frame();
     poll_events();
     // Every Present, running or not: an unfocused session publishes a neutral
     // pad, so a button held when the headset came off is not held forever.
     xrinput::poll(g.session, g.running && g.state == XR_SESSION_STATE_FOCUSED);
+
+    // Synched Sequential's freeze runs only while there is a session to show it:
+    // on the desktop alone, frames in pairs are just half the frame rate. Any
+    // change of state drops a half-built pair.
+    {
+        const bool want = g_renderMethod.load() == kRenderSynchedSequential && g.running;
+        static bool s_was = false;
+        hooks::set_frame_freeze(want);
+        const bool on = hooks::frame_freeze_on();
+        if (on != s_was) { s_was = on; g_ssReset.store(true); }
+    }
     if (g.running) render_frame(swapchain);
 }
 
@@ -6252,9 +7718,19 @@ void shutdown_xr()
 void mirror_on_resize()
 {
     // Backbuffer size changes: drop staging (rebuilt lazily). The XR swapchain
-    // keeps its size; the blit samples with clamp so aspect is preserved.
+    // keeps its size unless the mod asked for this one (on_game_resized); the
+    // blit samples with clamp so aspect is preserved.
     g.staging.Reset();
     g.stagingSrv.Reset();
+}
+
+void before_game_resize() { end_frame_wait(); }
+
+void on_game_resized(uint32_t w, uint32_t h)
+{
+    g.bbWidth  = w;
+    g.bbHeight = h;
+    g_frameResized.store(true);
 }
 
 } // namespace xr

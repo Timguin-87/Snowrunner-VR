@@ -5,9 +5,11 @@
 #include "hooks/camera_fov.h"
 #include "hooks/menu_hook.h"
 #include "hooks/cbuffer_hook.h"
+#include "hooks/depth_probe.h"
 #include "hooks/ui_hook.h"
 #include "hooks/shader_cull.h"
 #include "hooks/resolution_hook.h"
+#include "render/dlss.hpp"
 #include "hooks/pattern_scan.h"
 #include "render/smudge_layer.hpp"
 #include "xr/xr_mirror.h"
@@ -293,13 +295,19 @@ constexpr float kDefaultUiPlaneSize     = 8.00f;
 constexpr int   kDefaultUiPlaneMode     = xr::kUiPlaneForward;
 constexpr float kDefaultUiPlaneDistance = 7.00f;
 constexpr float kDefaultRenderFovScale  = 1.0f;
-// Defaults to disabled, because it is an experimental feauture right now.
-constexpr bool  kDefaultWorldMarkerFix  = false;
-// The map/garage window, as a fraction of the render size. Small enough to sit
-// inside the sweet spot of the lenses rather than needing eye movement to read
-// its corners -- it is a flat screen being looked AT, not a view being looked
-// THROUGH.
-constexpr float kDefaultMapWindowShrink = 0.4f;
+// (WorldMarkerFix -- Off, ShaderDraw or CameraPointer -- was removed
+// 2026-11-02: the camera pointer is simply how the world markers are placed
+// now, hooks/marker_camera.h. A config that still has the key reads as before,
+// the line is ignored, and the next save drops it.)
+// (MapWindowShrink -- the map's render and window shrunk together -- was removed
+// 2026-11-03: the map renders at the render size like everything else, and
+// MapUIScale below sizes its UI. An old line is ignored and the next save drops
+// it.)
+// The map's UI, as a share of the rendered view. Small enough to sit inside the
+// sweet spot of the lenses rather than needing eye movement to read its corners
+// -- the UI is a flat screen being looked AT, not a view being looked THROUGH.
+// 40% is what the removed window shrink defaulted to, so the UI keeps its size.
+constexpr float kDefaultMapUiScale = 0.4f;
 constexpr bool     kDefaultHideHud = false;
 // Matches xr_mirror.cpp's g_vertOffset initializer (the pre-existing
 // hand-tuned, headset-confirmed constant).
@@ -311,9 +319,17 @@ constexpr float kDefaultVerticalRecenter = 0.0f;
 // exactly as it was, one frame stale, which is the thing this mod exists to
 // avoid -- so off is a measurement ("is the warp what is wrong, or is what it
 // is warping wrong?"), not a way anyone should be playing. It persists anyway:
+constexpr int   kDefaultRenderMethod = 0;  // xr::kRenderAER
+constexpr int   kDefaultDlssMode     = 0;  // dlss::kOff
+constexpr int   kDefaultDlssPreset   = 0;  // dlss::kPresetDefault
+// Takes the softness off DLSS's image, short of making it crisp: at 30% the
+// detail is lifted by about the CAS filter's own lowest setting.
+constexpr float kDefaultDlssSharpness = 0.30f;
 constexpr bool  kDefaultWarpEnabled = true;
-// Stale-eye warp source: headset + game rotation (level 1 of the ladder).
-constexpr int   kDefaultWarpType = 1;   // xr::kWarpGameRot (headset + game rotation)
+// Stale-eye warp source: the top of the ladder, the game's own motion vectors.
+// A frame without any (TAA off) runs the 6-DoF warp, so this is safe on every
+// anti-aliasing setting.
+constexpr int   kDefaultWarpType = 3;   // xr::kWarpMotion
 // The cab band for that reprojection, in view metres. Sized from a cockpit:
 // dashboard ~0.8, windscreen ~1.2, and the nearest world geometry a bumper
 // reaches is a few metres out.
@@ -328,6 +344,12 @@ constexpr float kDefaultDebugEyeCantDeg = 0.0f;
 // travel does not reach it.
 constexpr bool kDefaultTruckLevelLock = true;
 constexpr bool kDefaultTruckYawLock   = false;
+// The head where the game puts it, at the eye separation the headset reports.
+constexpr float kDefaultFirstPersonOffsetCm = 0.0f;
+constexpr float kDefaultWorldScalePct       = 100.0f;
+// Tim's setting after trying it, 2026-11-02: enough to take the edge off the
+// 60 Hz physics and the jolts without the cab visibly swimming around the head.
+constexpr float kDefaultHeadSmoothingMs     = 50.0f;
 // Mode 4 only. Off = the original behaviour, so an existing config that predates
 // this key reads exactly as it did.
 // Off by default: the game keeps its own resolution, exactly as it would
@@ -360,6 +382,7 @@ constexpr bool kDefaultCullShaders = false;
 // no depth, so it is wrong under any reprojection and awkward in stereo even
 // without one -- a refracting surface a few centimetres from the eyes.
 constexpr bool kDefaultDisableWindows = true;
+constexpr bool kDefaultDepthAtTaaResolve = true;
 
 struct Settings {
     bool     dibrShift          = kDefaultDibrShift;
@@ -371,8 +394,7 @@ struct Settings {
     int      uiPlaneMode        = kDefaultUiPlaneMode;
     float    uiPlaneDistance    = kDefaultUiPlaneDistance;
     float    renderFovScale     = kDefaultRenderFovScale;
-    bool     worldMarkerFix     = kDefaultWorldMarkerFix;
-    float    mapWindowShrink    = kDefaultMapWindowShrink;
+    float    mapUiScale         = kDefaultMapUiScale;
     bool     hideHud            = kDefaultHideHud;
     float    verticalRecenter   = kDefaultVerticalRecenter;
     int      mapRender          = kDefaultMapRender;
@@ -380,11 +402,19 @@ struct Settings {
     bool     offcenterProjection = kDefaultOffcenterProjection;
     bool     alignFovAsymmetry  = kDefaultAlignFovAsymmetry;
     bool     matchHeadsetVfov   = kDefaultMatchHeadsetVfov;
+    int      renderMethod       = kDefaultRenderMethod;
+    int      dlssMode           = kDefaultDlssMode;
+    int      dlssPreset         = kDefaultDlssPreset;
+    float    dlssSharpness      = kDefaultDlssSharpness;
     bool     warpEnabled        = kDefaultWarpEnabled;
     int      warpType           = kDefaultWarpType;
     float    debugEyeCantDeg    = kDefaultDebugEyeCantDeg;
     bool     truckLevelLock     = kDefaultTruckLevelLock;
     bool     truckYawLock       = kDefaultTruckYawLock;
+    float    firstPersonOffsetCm[3] = {kDefaultFirstPersonOffsetCm, kDefaultFirstPersonOffsetCm,
+                                       kDefaultFirstPersonOffsetCm};   // right, up, forward
+    float    worldScalePct      = kDefaultWorldScalePct;
+    float    headSmoothingMs    = kDefaultHeadSmoothingMs;
     int      forceResW          = kDefaultForceResW;
     int      forceResH          = kDefaultForceResH;
     // No resolution has ever been chosen -- see vrcfg::resolution_unset().
@@ -394,6 +424,8 @@ struct Settings {
     bool     disableWindows       = kDefaultDisableWindows;
     bool     screenGateDirect     = false;
     float    cameraFovFactor       = 1.0f;
+    float    smallObjectDistance   = 5.0f;
+    bool     depthAtTaaResolve     = kDefaultDepthAtTaaResolve;
     // Empty = keep the built-in hash. Only written out once the module has
     // one, which it always does, so these round-trip as documentation of what
     // the build currently targets.
@@ -471,6 +503,35 @@ std::string format_file(const Settings& s)
         "# with its default and the file rewritten. Nothing resets the whole\n"
         "# file except deleting it.\n"
         "\n"
+        "# RenderMethod: AlternateEye, SynchedSequential.\n"
+        "#   AlternateEye       every frame is a new moment, for one eye; the other\n"
+        "#                      eye is supplied by the stale-eye warp and DIBR shift\n"
+        "#                      below.\n"
+        "#   SynchedSequential  the game's time is frozen on every second frame, so\n"
+        "#                      the two eyes are rendered from the SAME moment and\n"
+        "#                      shown together; the world moves on once per pair,\n"
+        "#                      and the headset's own reprojection fills in between.\n"
+        "#                      The warp and DIBR shift settings are kept but unused.\n"
+        "RenderMethod=%s\n"
+        "# DLSS: off, dlaa, quality, balanced, performance, ultraperformance.\n"
+        "# NVIDIA DLSS in place of the game's own TAA (the DLSS tab). Needs an\n"
+        "# RTX card, the game's TAA switched ON, and nvngx_dlss.dll next to\n"
+        "# SnowRunner.exe -- not shipped with the mod; download it from NVIDIA's\n"
+        "# DLSS SDK on GitHub. In VR each eye keeps its own DLSS history.\n"
+        "# dlaa works at the game's own resolution and switches live. The others\n"
+        "# UPSCALE, in VR only: the game renders at 67/58/50/33%% of\n"
+        "# ForceGameResolution on each side and DLSS brings each eye up to it.\n"
+        "# Picked in the DLSS tab they apply straight away; edited here, at the\n"
+        "# next start. DIBR shift is off while they run.\n"
+        "DLSS=%s\n"
+        "# DLSSPreset: default, J, K, L, M -- the DLSS model. default lets DLSS\n"
+        "# choose (K for DLAA).\n"
+        "DLSSPreset=%s\n"
+        "# DLSSSharpness: 0.00 - 1.00, 0 = off. AMD's contrast adaptive\n"
+        "# sharpening (CAS) on DLSS's image, after the upscale -- with DLAA, on\n"
+        "# the finished frame. It lifts detail where the image is soft and holds\n"
+        "# back at edges that already have contrast.\n"
+        "DLSSSharpness=%.2f\n"
         "# DIBRShift: true, false. Reproject the rendered eye into the other one\n"
         "# using scene depth, instead of leaving that eye to the stale-eye warp\n"
         "# alone. The two compose: the shift lands where it has depth and a\n"
@@ -495,34 +556,33 @@ std::string format_file(const Settings& s)
         "# UIPlaneMode: headlocked, forward. Where that layer sits -- following\n"
         "# the head, or pinned in the world where you were looking at the last\n"
         "# recenter (the Recenter view button, or HOME).\n"
-        "# The map screen ignores this: it is always head-locked at full size, the\n"
-        "# only placement where its screen-space markers still line up with the map.\n"
+        "# The 3D map screen ignores this: it is always head-locked, sized by\n"
+        "# MapUIScale below.\n"
         "UIPlaneMode=%s\n"
         "# UIPlaneDistance: metres from the eye (0.3 - 20). Where the UI converges.\n"
         "# The MAP screen follows this too, but in DEPTH only: its plane always\n"
-        "# subtends the rendered view exactly and is hung on the eye its capture\n"
-        "# came from, so that eye overlays its own render at any distance and the\n"
-        "# other eye sees it shifted by roughly IPD/distance.\n"
+        "# subtends MapUIScale of the rendered view and is hung on the eye its\n"
+        "# capture came from.\n"
         "UIPlaneDistance=%.2f\n"
         "# RenderFovScale: base render size (0.30 - 1.00). Lowers the rendered\n"
         "# FOV and the compositor window together, so less scene is drawn into\n"
-        "# fewer pixels with no stretch. Everything else derives from this.\n"
+        "# fewer pixels with no stretch. Everything else derives from this, the\n"
+        "# map included.\n"
         "RenderFovScale=%.2f\n"
-        "# MapWindowShrink: map/garage window size as a fraction of the render\n"
-        "# size above (0.0 - 1.0) -- not of the headset native FOV.\n"
-        "MapWindowShrink=%.2f\n"
-        "# WorldMarkerFix: keeps world-projected markers (waypoints, building icons)\n"
-        "# correctly positioned in the scene instead of pinned flat to the HUD plane.\n"
-        "# Experimental right now. Will cause other UI Elements to flicker.\n"
-        "WorldMarkerFix=%s\n"
-        "# VerticalRecenter: pose-pitch vertical image recenter, radians (-0.5 - 0.5)\n"
+        "# MapUIScale: the 3D map's UI -- icons, panels, cursor -- as a share of\n"
+        "# the rendered view (0.20 - 1.00, 1.00 = all of it), about the same\n"
+        "# centre. The icons stay on the map features they mark; features\n"
+        "# outside the smaller UI lose their icons. No effect on a 2D map.\n"
+        "MapUIScale=%.2f\n"
+        "# VerticalRecenter: vertical image recenter, radians (-0.5 - 0.5). Tilts\n"
+        "# the game camera and the image together, on top of the headset's own\n"
+        "# offset: it moves where the picture sits, never where the world is.\n"
         "VerticalRecenter=%.4f\n"
         "# RenderMap / RenderGarage: 3D, 2D. 3D is the stereo world. 2D shows\n"
         "# that screen as a flat panel instead -- the frame on a plane, both\n"
         "# eyes the same image, placed and sized by the UI plane settings\n"
-        "# (UIPlaneMode, UIPlaneSize, UIPlaneDistance). MapWindowShrink does\n"
-        "# not apply in 2D: the panel size comes from UIPlaneSize, so all the\n"
-        "# shrink would do there is crop the map.\n"
+        "# (UIPlaneMode, UIPlaneSize, UIPlaneDistance). MapUIScale does not\n"
+        "# apply in 2D: the UI covers the panel.\n"
         "# RENDERGARAGE IS WIDER THAN ITS NAME. The garage cannot be told\n"
         "# apart from the menus -- it shares its interface with them and its\n"
         "# world with gameplay, and SnowRunner does not tick the drive camera\n"
@@ -563,7 +623,8 @@ std::string format_file(const Settings& s)
         "# stale. Off is a diagnostic: if a judder survives with this false,\n"
         "# the warp is not what is causing it.\n"
         "WarpEnabled=%s\n"
-        "# WarpType: Headset, GameRotation, Game6Dof. What the stale-eye warp is\n"
+        "# WarpType: Headset, GameRotation, Game6Dof, MotionVectors. What the\n"
+        "# stale-eye warp is\n"
         "# built from -- a ladder, each level containing the one before it.\n"
         "#   Headset       the headset pose at capture vs now. Blind to the game\n"
         "#                 camera, so stick look and vehicle turns pass through\n"
@@ -578,6 +639,11 @@ std::string format_file(const Settings& s)
         "#                 using the retained frame's own depth. Rotation is a\n"
         "#                 homography and needs none; a translation moves near\n"
         "#                 pixels further than far ones, which is why it does.\n"
+        "#   MotionVectors that, with every pixel moved by the motion the GAME\n"
+        "#                 measured for it (its TAA velocity buffer) instead of\n"
+        "#                 treating the truck as rigid with the camera. Needs the\n"
+        "#                 game's TAA on -- best with DLSS, as the game's own TAA\n"
+        "#                 blurs in VR. Frames without vectors run Game6Dof.\n"
         "WarpType=%s\n"
         "# DebugEyeCantDeg: synthetic per-eye display cant for TESTING (-15 - 15).\n"
         "# Leave at 0. Real canting is read from the OpenXR runtime automatically;\n"
@@ -589,6 +655,22 @@ std::string format_file(const Settings& s)
         "TruckLevelLock=%s\n"
         "# TruckYawLock: cockpit only -- same, for the stick's look-YAW.\n"
         "TruckYawLock=%s\n"
+        "# FirstPersonOffsetHorizontal / Vertical / Forward: where your head sits\n"
+        "# in the cab, in cm (-50 - 50), along the truck's own axes -- toward its\n"
+        "# right, its roof and its bonnet, however it lies. Cockpit only.\n"
+        "FirstPersonOffsetHorizontal=%.1f\n"
+        "FirstPersonOffsetVertical=%.1f\n"
+        "FirstPersonOffsetForward=%.1f\n"
+        "# WorldScale: how big the world looks, in percent (50 - 200). Every 3D\n"
+        "# view is rendered with your headset's IPD and head movement divided by\n"
+        "# it: 200 halves both, so everything looks twice the size.\n"
+        "WorldScale=%.0f\n"
+        "# HeadSmoothing: cockpit only, in milliseconds (0 - 250, 0 = off). The\n"
+        "# camera follows the truck's jolts sideways and toward its roof, and its\n"
+        "# roll and pitch, this much more softly, in the world -- never along the\n"
+        "# truck's length or its heading, so speeding up, braking and steering do\n"
+        "# not drag the view, and never your own head movement.\n"
+        "HeadSmoothing=%.0f\n"
         "# VRControllersAsGamepad: true, false. The VR controllers as Xbox pad 0:\n"
         "# triggers = LT/RT, grips = LB/RB, A/B/X/Y, sticks and stick clicks,\n"
         "# left menu button = Start on a tap, Back (Select) when held 0.5 s.\n"
@@ -601,14 +683,14 @@ std::string format_file(const Settings& s)
         "# whatever resolution the game itself picked (it clamps its own to the\n"
         "# desktop work area). The engine sizes its swapchain from the window,\n"
         "# so this sets the render resolution directly, with no video.dat edit.\n"
-        "# Normally driven by the settings menu's \"Render resolution\" slider.\n"
-        "# Applied at startup only -- changing it needs a game restart. There is\n"
-        "# no way to apply it live: the engine reads the window size once, at\n"
-        "# creation, and does not re-derive it from a later resize.\n"
+        "# Normally driven by the settings menu's \"Render resolution\" slider,\n"
+        "# which applies when you let go of it, in windowed mode. Edited here,\n"
+        "# it takes effect at the next start.\n"
         "# 'off' = leave the game's own resolution alone.\n"
         "# 'auto' = not chosen yet. The mod fills this in from the headset's\n"
-        "# own native width the first time a runtime is reachable, then asks you\n"
-        "# to restart so the game is created at that size.\n"
+        "# own native width the first time a runtime is reachable, and OK on the\n"
+        "# notice it shows applies it to the running game (windowed mode; if the\n"
+        "# game cannot be resized, it asks you to restart instead).\n"
         "ForceGameResolution=%s\n"
         "\n"
         "# ScreenGate: legacy, direct -- how the mod decides which screen you are\n"
@@ -633,6 +715,21 @@ std::string format_file(const Settings& s)
         "# keeps more geometry alive at the edges of vision and costs draw\n"
         "# calls.\n"
         "CameraFovFactor=%.2f\n"
+        "# SmallObjectDistance: how far away small stones, debris and loose\n"
+        "# branches are still drawn, as a multiple of the game's own rule at the\n"
+        "# headset's FOV (1.0 - 8.0). The game drops them once they cover less\n"
+        "# than a fixed share of the screen -- and works that out from the same\n"
+        "# FOV as above, so the wide headset view loses them at a third of the\n"
+        "# distance a monitor does, dead ahead first. 3.0 is about what a\n"
+        "# monitor shows, the default of 5.0 goes further; higher costs draw\n"
+        "# calls. Trees and plants are not affected.\n"
+        "SmallObjectDistance=%.2f\n"
+        "\n"
+        "# DepthAtTaaResolve: true, false -- with the game's TAA on, read the scene\n"
+        "# depth once a frame at the TAA resolve, where it is finished. 'false'\n"
+        "# reads it at every depth pass, up to 30 a frame, which is what runs with\n"
+        "# TAA off either way. The log's 'GPU time' line reports what each costs.\n"
+        "DepthAtTaaResolve=%s\n"
         "\n"
         "# DisableWindows: true, false -- skip the cab glass entirely. The glass\n"
         "# refracts the scene but writes no depth, so DIBR shift reprojects the\n"
@@ -676,14 +773,17 @@ std::string format_file(const Settings& s)
         "# what new signatures are made from -- the exe on disk is encrypted and\n"
         "# cannot be read. Leave false otherwise.\n"
         "DumpGameCode=%s\n",
+        xr::render_method_key(s.renderMethod),
+        dlss::mode_key(s.dlssMode),
+        dlss::preset_key(s.dlssPreset),
+        s.dlssSharpness,
         s.dibrShift ? "true" : "false",
         s.horizonLock ? "true" : "false", s.hideHud ? "true" : "false",
         vk_name(s.menuVk).c_str(), gamepad_combo_name(s.menuCombo).c_str(),
         s.modUiScale, s.uiPlaneSize,
         s.uiPlaneMode == xr::kUiPlaneForward ? "forward" : "headlocked",
         s.uiPlaneDistance,
-        s.renderFovScale, s.mapWindowShrink,
-        s.worldMarkerFix ? "true" : "false",
+        s.renderFovScale, s.mapUiScale,
         s.verticalRecenter,
         xr::screen_render_mode_key(s.mapRender),
         xr::screen_render_mode_key(s.garageRender),
@@ -694,10 +794,15 @@ std::string format_file(const Settings& s)
         wtKey,
         s.debugEyeCantDeg,
         s.truckLevelLock ? "true" : "false", s.truckYawLock ? "true" : "false",
+        s.firstPersonOffsetCm[0], s.firstPersonOffsetCm[1], s.firstPersonOffsetCm[2],
+        s.worldScalePct,
+        s.headSmoothingMs,
         s.vrControllersAsGamepad ? "true" : "false",
         s.resolutionUnset ? "auto" : size_str(s.forceResW, s.forceResH).c_str(),
         s.screenGateDirect ? "direct" : "legacy",
         s.cameraFovFactor,
+        s.smallObjectDistance,
+        s.depthAtTaaResolve ? "true" : "false",
         s.disableWindows ? "true" : "false",
         s.rigidShaderHash.c_str(),
         s.cullShaders ? "true" : "false", s.cullShaderHashes.c_str(),
@@ -796,6 +901,30 @@ void init()
     std::string* kRoleDst[hooks::kCullRoleCount] = {};
     for (int r = 0; r < hooks::kCullRoleCount; ++r) kRoleDst[r] = role_dst(s, r);
 
+    if (kv_find(kv, "RenderMethod", v)) {
+        int m;
+        if (xr::render_method_from_key(v.c_str(), m)) s.renderMethod = m;
+        else note_invalid("RenderMethod", v);
+    } else anyMissing = true;
+
+    if (kv_find(kv, "DLSS", v)) {
+        int m;
+        if (dlss::mode_from_key(v.c_str(), m)) s.dlssMode = m;
+        else note_invalid("DLSS", v);
+    } else anyMissing = true;
+
+    if (kv_find(kv, "DLSSPreset", v)) {
+        int p;
+        if (dlss::preset_from_key(v.c_str(), p)) s.dlssPreset = p;
+        else note_invalid("DLSSPreset", v);
+    } else anyMissing = true;
+
+    if (kv_find(kv, "DLSSSharpness", v)) {
+        float f;
+        if (parse_float(v, f) && f >= 0.0f && f <= 1.0f) s.dlssSharpness = f;
+        else note_invalid("DLSSSharpness", v);
+    } else anyMissing = true;
+
     if (kv_find(kv, "DIBRShift", v)) {
         if (_stricmp(v.c_str(), "true") == 0 || v == "1")       s.dibrShift = true;
         else if (_stricmp(v.c_str(), "false") == 0 || v == "0") s.dibrShift = false;
@@ -854,16 +983,10 @@ void init()
         else note_invalid("RenderFovScale", v);
     } else anyMissing = true;
 
-    if (kv_find(kv, "MapWindowShrink", v)) {
+    if (kv_find(kv, "MapUIScale", v)) {
         float f;
-        if (parse_float(v, f) && f >= 0.05f && f <= 1.0f) s.mapWindowShrink = f; else note_invalid("MapWindowShrink", v);
+        if (parse_float(v, f) && f >= 0.2f && f <= 1.0f) s.mapUiScale = f; else note_invalid("MapUIScale", v);
     } else anyMissing = true;
-
-    if (kv_find(kv, "WorldMarkerFix", v)) {
-        if (_stricmp(v.c_str(), "true") == 0 || v == "1")      s.worldMarkerFix = true;
-        else if (_stricmp(v.c_str(), "false") == 0 || v == "0") s.worldMarkerFix = false;
-        else note_invalid("WorldMarkerFix", v);
-    }
 
     if (kv_find(kv, "VerticalRecenter", v)) {
         float f;
@@ -929,6 +1052,31 @@ void init()
         else note_invalid("TruckYawLock", v);
     } else anyMissing = true;
 
+    {
+        static const char* const kOffsetKeys[3] = { "FirstPersonOffsetHorizontal",
+                                                    "FirstPersonOffsetVertical",
+                                                    "FirstPersonOffsetForward" };
+        for (int i = 0; i < 3; ++i) {
+            if (kv_find(kv, kOffsetKeys[i], v)) {
+                float f;
+                if (parse_float(v, f) && f >= -50.0f && f <= 50.0f) s.firstPersonOffsetCm[i] = f;
+                else note_invalid(kOffsetKeys[i], v);
+            } else anyMissing = true;
+        }
+    }
+
+    if (kv_find(kv, "WorldScale", v)) {
+        float f;
+        if (parse_float(v, f) && f >= 50.0f && f <= 200.0f) s.worldScalePct = f;
+        else note_invalid("WorldScale", v);
+    } else anyMissing = true;
+
+    if (kv_find(kv, "HeadSmoothing", v)) {
+        float f;
+        if (parse_float(v, f) && f >= 0.0f && f <= 250.0f) s.headSmoothingMs = f;
+        else note_invalid("HeadSmoothing", v);
+    } else anyMissing = true;
+
     if (kv_find(kv, "VRControllersAsGamepad", v)) {
         if (_stricmp(v.c_str(), "true") == 0 || v == "1")       s.vrControllersAsGamepad = true;
         else if (_stricmp(v.c_str(), "false") == 0 || v == "0") s.vrControllersAsGamepad = false;
@@ -961,6 +1109,18 @@ void init()
         float f;
         if (parse_float(v, f) && f >= 0.5f && f <= 2.5f) s.cameraFovFactor = f;
         else note_invalid("CameraFovFactor", v);
+    } else anyMissing = true;
+
+    if (kv_find(kv, "SmallObjectDistance", v)) {
+        float f;
+        if (parse_float(v, f) && f >= 1.0f && f <= 8.0f) s.smallObjectDistance = f;
+        else note_invalid("SmallObjectDistance", v);
+    } else anyMissing = true;
+
+    if (kv_find(kv, "DepthAtTaaResolve", v)) {
+        if (_stricmp(v.c_str(), "true") == 0 || v == "1")      s.depthAtTaaResolve = true;
+        else if (_stricmp(v.c_str(), "false") == 0 || v == "0") s.depthAtTaaResolve = false;
+        else note_invalid("DepthAtTaaResolve", v);
     } else anyMissing = true;
 
     if (kv_find(kv, "DisableWindows", v)) {
@@ -1017,6 +1177,10 @@ void init()
         VRLOG("config: loaded Snowrunner_VR_config.txt");
     }
 
+    xr::set_render_method(s.renderMethod);
+    dlss::set_mode(s.dlssMode);
+    dlss::set_preset(s.dlssPreset);
+    dlss::set_sharpness(s.dlssSharpness);
     xr::set_dibr_shift_enabled(s.dibrShift);
     hooks::set_horizon_lock_enabled(s.horizonLock);
     hooks::set_hide_hud_enabled(s.hideHud);
@@ -1027,8 +1191,7 @@ void init()
     xr::set_ui_plane_mode(s.uiPlaneMode);
     xr::set_ui_plane_distance(s.uiPlaneDistance);
     xr::set_render_fov_scale(s.renderFovScale);
-    xr::set_map_window_shrink(s.mapWindowShrink);
-    hooks::set_world_marker_fix_enabled(s.worldMarkerFix);
+    xr::set_map_ui_scale(s.mapUiScale);
     xr::set_vertical_recenter(s.verticalRecenter);
     xr::set_map_render_mode(s.mapRender);
     xr::set_garage_render_mode(s.garageRender);
@@ -1040,9 +1203,15 @@ void init()
     xr::set_debug_eye_cant_deg(s.debugEyeCantDeg);
     hooks::set_truck_level_lock_enabled(s.truckLevelLock);
     hooks::set_truck_yaw_lock_enabled(s.truckYawLock);
+    hooks::set_cockpit_offset(s.firstPersonOffsetCm[0] / 100.0f, s.firstPersonOffsetCm[1] / 100.0f,
+                              s.firstPersonOffsetCm[2] / 100.0f);
+    xr::set_world_scale(s.worldScalePct / 100.0f);
+    hooks::set_head_smoothing(s.headSmoothingMs / 1000.0f);
     xrinput::set_enabled(s.vrControllersAsGamepad);
     hooks::set_screen_gate_direct(s.screenGateDirect);
     hooks::set_camera_fov_factor(s.cameraFovFactor);
+    hooks::set_small_object_distance(s.smallObjectDistance);
+    hooks::set_depth_at_resolve(s.depthAtTaaResolve);
     hooks::set_force_resolution(s.forceResW, s.forceResH);
     hooks::set_dump_game_code(s.dumpGameCode);
     g_resolutionUnset.store(s.resolutionUnset);
@@ -1094,6 +1263,10 @@ bool resolution_unset() { return g_resolutionUnset.load(); }
 void save()
 {
     Settings s;
+    s.renderMethod    = xr::render_method();
+    s.dlssMode        = dlss::mode();
+    s.dlssPreset      = dlss::preset();
+    s.dlssSharpness   = dlss::sharpness();
     s.dibrShift       = xr::dibr_shift_enabled();
     s.horizonLock     = hooks::horizon_lock_enabled();
     s.hideHud         = hooks::hide_hud_enabled();
@@ -1104,8 +1277,7 @@ void save()
     s.uiPlaneMode     = xr::ui_plane_mode();
     s.uiPlaneDistance = xr::ui_plane_distance();
     s.renderFovScale  = xr::render_fov_scale();
-    s.mapWindowShrink = xr::map_window_shrink();
-    s.worldMarkerFix = hooks::world_marker_fix_enabled();
+    s.mapUiScale      = xr::map_ui_scale();
     s.verticalRecenter = xr::vertical_recenter();
     s.mapRender    = xr::map_render_mode();
     s.garageRender = xr::garage_render_mode();
@@ -1117,9 +1289,20 @@ void save()
     s.debugEyeCantDeg = xr::debug_eye_cant_deg();
     s.truckLevelLock = hooks::truck_level_lock_enabled();
     s.truckYawLock = hooks::truck_yaw_lock_enabled();
+    {
+        float r = 0.0f, u = 0.0f, f = 0.0f;
+        hooks::cockpit_offset(r, u, f);
+        s.firstPersonOffsetCm[0] = r * 100.0f;
+        s.firstPersonOffsetCm[1] = u * 100.0f;
+        s.firstPersonOffsetCm[2] = f * 100.0f;
+    }
+    s.worldScalePct = xr::world_scale() * 100.0f;
+    s.headSmoothingMs = hooks::head_smoothing() * 1000.0f;
     s.vrControllersAsGamepad = xrinput::enabled();
     s.screenGateDirect = hooks::screen_gate_direct();
     s.cameraFovFactor    = hooks::camera_fov_factor();
+    s.smallObjectDistance = hooks::small_object_distance();
+    s.depthAtTaaResolve   = hooks::depth_at_resolve();
     // Answering the question is what clears it, and setting a real size is the
     // only way to answer it -- so this is the one place that needs to remember.
     if (hooks::force_resolution_w() > 0) g_resolutionUnset.store(false);

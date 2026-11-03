@@ -85,4 +85,32 @@ void camera_fov_reassert();
 // says whether the camera was ever found.
 const char* camera_fov_status();
 
+// THE SMALL-OBJECT CULL, the other thing m_fFOV decides -- and the "forward
+// culling" the note above says was left over.
+//
+// Found 2026-10-30 (exe+0xDA4D60 in build 0x6AB52F5D, signature in
+// game_addresses.cpp). Stones, debris and loose branches -- never trees or
+// plants, which are a separate system -- are dropped when
+//
+//     half box diagonal * (1 / tan(m_fFOV / 2)) / view-space depth
+//
+// times the camera aspect where that is larger, falls under 0.0444: a fixed
+// share of the screen height. Two consequences, both measured in the headset
+// before anyone knew why:
+//
+//   WIDER IS WORSE. The headset's FOV shrinks 1/tan(fov/2) to a third of what
+//   the game sees on a 16:9 monitor (60.94 deg, aspect 1.78 against ~93 deg,
+//   aspect 1), so small things vanish at a third of the distance. Raising the
+//   culling factor cleared the periphery and culled more ahead.
+//   DEAD AHEAD GOES FIRST. It divides by DEPTH, not distance, and straight
+//   ahead is where depth is largest for a given distance.
+//
+// The hook scales that 1/tan(fov/2) by this factor before the test sees it,
+// and touches nothing else: the frustum still comes from m_fFOV, so this moves
+// only how near a small thing has to be to be drawn. 1.0 = the game's own
+// test at the headset's FOV; about 3 = what a monitor shows; 5 by default.
+// Clamped [1, 8].
+float small_object_distance();
+void  set_small_object_distance(float k);
+
 } // namespace hooks

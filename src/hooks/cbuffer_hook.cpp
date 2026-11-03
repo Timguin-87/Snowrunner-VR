@@ -14,7 +14,6 @@
 #include <cstdio>
 #include <cstring>
 #include <unordered_set>
-#include <unordered_map>
 #include <vector>
 
 #include <MinHook.h>
@@ -26,7 +25,6 @@ namespace {
 
 constexpr int kIdxMap                    = 14;  // ID3D11DeviceContext vtable
 constexpr int kIdxUnmap                  = 15;
-constexpr int kIdxPSSetConstantBuffers   = 16;
 constexpr int kIdxUpdateSubresource      = 48;
 constexpr int kIdxUpdateSubresource1 = 116; // ID3D11DeviceContext1 vtable (verified against
                                              // the SDK header: FinishCommandList=114,
@@ -49,17 +47,25 @@ constexpr int kOffViewProjPrev = 0xA0;
 constexpr int kCamCBSize      = 352;
 
 std::atomic<bool> g_hooked{false};
-std::atomic<bool> g_dumped{false};
-
-std::atomic<bool> g_worldMarkerFix{true};   // config is authoritative
 
 // Snapshot of the last main-camera CB (DIBR shift needs the projection to turn
 // reverse-Z depth into view-space Z; proj = viewProj * inverse(view)).
 SRWLOCK g_camSnapLock = SRWLOCK_INIT;
 float g_camView[16] = {};
 float g_camViewProj[16] = {};
+float g_camViewProjPrev[16] = {};
 // The game's OWN previous-frame viewProj (CB offset 0xA0). Deliberately never
 std::atomic<bool> g_camSnapValid{false};
+// WHICH BUILD the snapshot is (see classify_cam): the build its camera sits on
+// (0 = not recognised as one), the newest build when it was uploaded, how it
+// was recognised, and a count of snapshots. Under g_camSnapLock.
+uint32_t g_camSnapBuild = 0, g_camSnapNewest = 0, g_camSnapSeq = 0;
+int      g_camSnapHow = 0;
+// Main-camera uploads by how they were recognised, and camera buffers turned
+// down, for the periodic line in cbuffer_hook_on_present().
+std::atomic<uint32_t> g_camHowCount[6] = {};
+std::atomic<uint32_t> g_camRejected{0};
+std::atomic<float>    g_camBuildDistMax{0.0f};
 
 using PFN_UpdateSubresource = void(STDMETHODCALLTYPE*)(
     ID3D11DeviceContext*, ID3D11Resource*, UINT, const D3D11_BOX*,
@@ -76,26 +82,6 @@ PFN_UpdateSubresource real_UpdateSubresource_def = nullptr;
 // 268.01) and all of them must be rotated, while a shadow or light eye is
 // still well outside this window.
 constexpr float kEyeTol = 5.0f;
-// --- minimal 4x4 (column-vector: v' = M*v; memory row-major, m[r][c]=f[r*4+c]) ---
-struct Mat4 { float m[4][4]; };
-
-Mat4 load4(const float* f) {
-    Mat4 M; for (int r = 0; r < 4; ++r) for (int c = 0; c < 4; ++c) M.m[r][c] = f[r*4+c];
-    return M;
-}
-void store4(float* f, const Mat4& M) {
-    for (int r = 0; r < 4; ++r) for (int c = 0; c < 4; ++c) f[r*4+c] = M.m[r][c];
-}
-Mat4 mul4(const Mat4& A, const Mat4& B) {
-    Mat4 C{};
-    for (int r = 0; r < 4; ++r) for (int c = 0; c < 4; ++c) {
-        float s = 0; for (int k = 0; k < 4; ++k) s += A.m[r][k]*B.m[k][c];
-        C.m[r][c] = s;
-    }
-    return C;
-}
-
-
 // True if `data` is a camera CB (352 bytes) whose view matrix at 0x60 is a real
 // (orthonormal) view. Self-contained: no dependence on the wandering DRIVE
 // logic eye, so every player-camera pass is caught consistently. Each buffer is
@@ -124,6 +110,123 @@ bool is_main_cam(const void* data, UINT byteWidth)
             return false;
     }
     return true;
+}
+
+// THE MAIN VIEW'S CAMERA, recognised on every screen -- for the snapshot the
+// renderer-side work reads (main_camera_matrices: DLSS's vectors, the FOV
+// monitor, the presented-build measure). is_main_cam() above stays what it was
+// for the relocation tracker and the depth probe, which read "matches the
+// DRIVE_CAMERA" as "gameplay".
+//
+// is_main_cam() alone could not be used for this. Off gameplay it compares
+// against a DRIVE_CAMERA that is parked where the truck stands, while the map,
+// garage and menu cameras are elsewhere: from the first drive on, nothing
+// matched there and the snapshot froze at the last gameplay frame. Measured
+// 2026-10-28: 3000+ camera uploads per 3.75 s turned down on the map and in the
+// garage, DLSS jitter constant for 30 s (it is read from this snapshot) and its
+// vectors built from a camera that had stopped moving -- the heavy smearing in
+// the garage and the menus after a drive. The FOV monitor's "PROJ LOCK MISS
+// 103 deg vs 54" on the map was the same stale gameplay camera.
+//
+// So, in order:
+//   1. One of the mod's own camera builds. Every main camera the mod builds --
+//      cockpit, orbit, map, garage, menus (viewbuild_hook.cpp, detour_fna) --
+//      records the eye it handed the game. A buffer whose eye sits on one, and
+//      looks the same way, IS that build: exact (kCamBuild) within 2 cm, which
+//      also names the build; near (kCamNearBuild) within 1 m, which only says
+//      main. Asked at upload time, so later builds cannot be mistaken for it.
+//   2. The DRIVE_CAMERA while it drives, as is_main_cam() has always done.
+//   3. Off gameplay, a camera looking where one of the mod's builds looks,
+//      wherever it stands (kCamBuildDir) -- for a screen whose camera the game
+//      would move after the mod hands it over. Shadow and mirror cameras look
+//      elsewhere.
+//   4. Nothing to compare with yet (the first menu frames, before any camera
+//      was built): any real camera, unverified -- as before.
+// And over all four, one rule: while uploads sit on builds exactly, nothing
+// less is the main view (classify_cam).
+enum CamHow : int { kCamNot = 0, kCamBuild, kCamNearBuild, kCamLogic, kCamBuildDir,
+                    kCamUnverified, kCamHowCount };
+struct CamMatch { int how = kCamNot; uint32_t build = 0; float dist = 0.0f; };
+constexpr float kBuildExactTol = 0.02f;
+constexpr float kBuildNearTol  = 1.0f;
+// How long the DRIVE_CAMERA may go without ticking and still be driving.
+constexpr uint64_t kDriveTickMs = 400;
+// When an upload last sat on a build exactly (GetTickCount64), and how long that
+// turns the lesser matches away; the ones turned away, for the periodic line.
+std::atomic<uint64_t> g_exactBuildTick{0};
+constexpr uint64_t kExactBuildFreshMs = 250;
+std::atomic<uint32_t> g_camTurnedAway{0};
+
+CamMatch recognise_cam(const void* data, UINT byteWidth)
+{
+    CamMatch m;
+    if (byteWidth != kCamCBSize || !data)
+        return m;
+    const float* f = reinterpret_cast<const float*>(data);
+    const float* v = f + kOffView/4;
+    auto unit = [](const float* r) {
+        float l = r[0]*r[0] + r[1]*r[1] + r[2]*r[2];
+        return std::fabs(l - 1.0f) < 0.02f;
+    };
+    if (!(unit(v) && unit(v+4) && unit(v+8)))   // must be a real (orthonormal) view
+        return m;
+
+    const float fwd[3] = {v[8], v[9], v[10]};   // row 2: the view's forward axis
+    uint32_t b = 0;
+    float d = 0.0f;
+    if (xr::match_built_camera(f, fwd, kBuildNearTol, b, d)) {
+        m.how   = (d <= kBuildExactTol) ? kCamBuild : kCamNearBuild;
+        m.build = (m.how == kCamBuild) ? b : 0;
+        m.dist  = d;
+        return m;
+    }
+    // The drive camera keeps ticking on the map, where it is not the camera
+    // being rendered -- so the map is left to the build tests.
+    float le[3];
+    if (hooks::logic_eye(le) && hooks::logic_camera_idle_ms() <= kDriveTickMs &&
+        !hooks::in_map_view()) {
+        if (std::fabs(f[0]-le[0]) <= kEyeTol &&
+            std::fabs(f[1]-le[1]) <= kEyeTol &&
+            std::fabs(f[2]-le[2]) <= kEyeTol)
+            m.how = kCamLogic;
+        return m;
+    }
+    if (xr::match_built_camera(f, fwd, 1.0e9f, b, d)) {
+        m.how  = kCamBuildDir;
+        m.dist = d;
+        return m;
+    }
+    if (!xr::have_built_camera()) m.how = kCamUnverified;
+    return m;
+}
+
+// recognise_cam(), and then the rule over it: while uploads are sitting on
+// builds exactly, a camera that only passed a lesser test is not the main view.
+//
+// A TRUCK MIRROR'S CAMERA passes the drive-camera test: it stands within
+// kEyeTol of the driver's eye. Drawn after the main view's last camera upload
+// -- the round mirror, with the head turned towards it -- it was the last
+// "main" camera of the frame, and every reader of the snapshot took the mirror
+// for the view: the stale-eye warp turned and moved the stale eye by the
+// mirror camera's swing between the two eyes' builds (a few degrees and 12 cm
+// a frame, the truck parked), DLSS lost its jitter, and the FOV monitor read
+// the mirror's 22 deg as a PROJ LOCK MISS (Tim, 2026-11-02). The main view sat
+// on its build in those very frames, so the lesser tests had nothing left to
+// find but other cameras. They decide again once nothing has sat on a build
+// for kExactBuildFreshMs -- a game that moves its camera after the mod hands
+// it over, or a screen with no builds.
+CamMatch classify_cam(const void* data, UINT byteWidth)
+{
+    CamMatch m = recognise_cam(data, byteWidth);
+    const uint64_t now = GetTickCount64();
+    if (m.how == kCamBuild) {
+        g_exactBuildTick.store(now, std::memory_order_relaxed);
+    } else if (m.how != kCamNot &&
+               now - g_exactBuildTick.load(std::memory_order_relaxed) <= kExactBuildFreshMs) {
+        g_camTurnedAway.fetch_add(1, std::memory_order_relaxed);
+        m = CamMatch{};
+    }
+    return m;
 }
 
 // Cache of which resources are 352-byte constant buffers, so the hot Map path
@@ -161,182 +264,6 @@ bool is_cam352(ID3D11Resource* res)
     return cam;
 }
 
-// --- known marker constant-buffer tracking --------------------------------
-// Identifies CB_DYNAMIC_UI (the per-draw UI transform buffer -- confirmed via
-// D3DReflect to be 144 bytes, bound at PS slot 4) by CORRELATION rather than
-// by size: size alone collides with CB_INSTANCE (vehicle physics), which
-// happens to also be 144 bytes. Instead we tag a buffer the moment it is
-// bound at slot 4 while one of our two known world-marker pixel shaders is
-// the active one.
-constexpr uint64_t kMarkerHashes[] = { 0x182934D7084AB9D8ull, 0xC8C30095AB7B056Dull };
-constexpr int kUiCbSlot = kMarkerCbSlot;
-
-bool is_marker_hash(uint64_t h)
-{
-    for (uint64_t k : kMarkerHashes) if (k == h) return true;
-    return false;
-}
-
-struct MarkerCbEntry {
-    uint64_t hash = 0;
-    float x = 0.0f;
-    float y = 0.0f;
-    uint64_t lastSeenFrame = 0;
-};
-
-uint64_t g_markerCbFrame = 0;
-constexpr uint64_t kMarkerCbMaxAgeFrames = 300;   // ~5s at 60fps -- memory hygiene only,
-                                                    // NOT relied on for correctness (see
-                                                    // marker_cb_position's freshness check).
-std::unordered_map<void*, MarkerCbEntry> g_markerCbMap;
-SRWLOCK g_markerCbLock = SRWLOCK_INIT;
-
-void register_marker_cb(void* buf, uint64_t hash)
-{
-    if (!buf) return;
-    AcquireSRWLockExclusive(&g_markerCbLock);
-    MarkerCbEntry& e = g_markerCbMap[buf];
-    e.hash = hash;
-    e.lastSeenFrame = g_markerCbFrame;
-    ReleaseSRWLockExclusive(&g_markerCbLock);
-}
-
-bool marker_cb_hash(void* buf, uint64_t& outHash)
-{
-    if (!buf) return false;
-    AcquireSRWLockExclusive(&g_markerCbLock);
-    auto it = g_markerCbMap.find(buf);
-    bool found = (it != g_markerCbMap.end());
-    if (found) outHash = it->second.hash;
-    ReleaseSRWLockExclusive(&g_markerCbLock);
-    return found;
-}
-
-// --- static vs dynamic position classification ----------------------------
-// Byte offsets 12/28 (float index 3/7) within the 144-byte CB_DYNAMIC_UI
-// buffer are the screen X/Y -- confirmed for one clean sample, but later,
-// broader logging (2026-09-05) also showed the SAME shaders occasionally
-// carrying values in the tens of thousands, and even NaN/absurd bit patterns
-// -- almost certainly a different use of the same generic buffer/shader
-// (view-space data, or reads racing a write), not a real screen position.
-// kUiPosPlausibleMin/Max reject those before they ever reach the position
-// tables: a real screen coordinate on this canvas is comfortably within a
-// few thousand pixels either side of zero, nothing like 10s of thousands.
-constexpr int kUiPosXFloatIdx = 3;
-constexpr int kUiPosYFloatIdx = 7;
-constexpr float kUiPosEpsilon = 0.05f;   // guards against harmless float noise, not real movement
-constexpr float kUiPosPlausibleMin = -256.0f;   // small negative margin (off-screen edges)
-constexpr float kUiPosPlausibleMax = 4096.0f;   // canvas is 3072x3072 -- generous headroom
-
-bool is_plausible_ui_pos(float x, float y, float f2)
-{
-	//return f2 == 0.0f && std::isfinite(x) && std::isfinite(y) && std::isfinite(x) && std::isfinite(y) && x > kUiPosPlausibleMin && x < kUiPosPlausibleMax && y > kUiPosPlausibleMin && y < kUiPosPlausibleMax;
-    return std::isfinite(x) && std::isfinite(y) && x > kUiPosPlausibleMin && x < kUiPosPlausibleMax && y > kUiPosPlausibleMin && y < kUiPosPlausibleMax;
-}
-
-void note_marker_cb_position(void* buf, float x, float y)
-{
-    AcquireSRWLockExclusive(&g_markerCbLock);
-    auto it = g_markerCbMap.find(buf);
-    if (it != g_markerCbMap.end()) {   // must already be registered via PSSetConstantBuffers
-        it->second.x = x;
-        it->second.y = y;
-        it->second.lastSeenFrame = g_markerCbFrame;
-    }
-    ReleaseSRWLockExclusive(&g_markerCbLock);
-}
-
-bool marker_cb_position(void* buf, float& x, float& y)
-{
-    AcquireSRWLockExclusive(&g_markerCbLock);
-    auto it = g_markerCbMap.find(buf);
-    bool found = (it != g_markerCbMap.end());
-    if (found) { x = it->second.x; y = it->second.y; }
-    ReleaseSRWLockExclusive(&g_markerCbLock);
-    return found;
-}
-
-void evict_stale_marker_cbs()
-{
-    AcquireSRWLockExclusive(&g_markerCbLock);
-    for (auto it = g_markerCbMap.begin(); it != g_markerCbMap.end(); ) {
-        if (g_markerCbFrame - it->second.lastSeenFrame > kMarkerCbMaxAgeFrames)
-            it = g_markerCbMap.erase(it);
-        else
-            ++it;
-    }
-    ReleaseSRWLockExclusive(&g_markerCbLock);
-}
-
-constexpr int kMaxUiPositions = 4096; // per Swap
-struct PosSet {
-    float x[kMaxUiPositions];
-    float y[kMaxUiPositions];
-    int   count = 0;
-};
-PosSet g_uiPosPrev, g_uiPosCur;
-SRWLOCK g_uiPosLock = SRWLOCK_INIT;
-
-void note_ui_position_this_frame(float x, float y)
-{
-    AcquireSRWLockExclusive(&g_uiPosLock);
-    if (g_uiPosCur.count < kMaxUiPositions) {
-        g_uiPosCur.x[g_uiPosCur.count] = x;
-        g_uiPosCur.y[g_uiPosCur.count] = y;
-        ++g_uiPosCur.count;
-    }
-    ReleaseSRWLockExclusive(&g_uiPosLock);
-}
-
-bool position_was_static(float x, float y)
-{
-    AcquireSRWLockShared(&g_uiPosLock);
-    if (g_uiPosPrev.count == 0) {
-        // No comparison data yet (first frame(s), or a gap where
-        // in_gameplay() was false) -- default to the safe direction
-        // (today's behaviour) rather than "everything looks dynamic".
-        ReleaseSRWLockShared(&g_uiPosLock);
-        return true;
-    }
-    bool found = false;
-    for (int i = 0; i < g_uiPosPrev.count; ++i) {
-        if (std::fabs(g_uiPosPrev.x[i] - x) < kUiPosEpsilon &&
-            std::fabs(g_uiPosPrev.y[i] - y) < kUiPosEpsilon) { found = true; break; }
-    }
-    ReleaseSRWLockShared(&g_uiPosLock);
-    return found;
-}
-
-// PSSetConstantBuffers hook: catches WHICH buffer is bound, while
-// shader_cull.cpp's PSSetShader hook (already installed elsewhere) tells us
-// WHICH shader is currently active via hooks::current_draw_hash(). Same
-// immediate/deferred vtable split as every other hook in this codebase --
-// the UI is recorded on a deferred context, so a hook on the immediate
-// vtable alone would miss it entirely. Gated to in_gameplay(): the menu/
-// loading screen alone rebinds this slot constantly.
-using PFN_PSSetConstantBuffers = void(STDMETHODCALLTYPE*)(
-    ID3D11DeviceContext*, UINT, UINT, ID3D11Buffer* const*);
-PFN_PSSetConstantBuffers real_PSSetConstantBuffers_imm = nullptr;
-PFN_PSSetConstantBuffers real_PSSetConstantBuffers_def = nullptr;
-
-void STDMETHODCALLTYPE Detour_PSSetConstantBuffers(
-    ID3D11DeviceContext* ctx, UINT startSlot, UINT numBuffers, ID3D11Buffer* const* buffers)
-{
-    PFN_PSSetConstantBuffers fn = (ctx->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE)
-        ? real_PSSetConstantBuffers_imm
-        : (real_PSSetConstantBuffers_def ? real_PSSetConstantBuffers_def : real_PSSetConstantBuffers_imm);
-    fn(ctx, startSlot, numBuffers, buffers);
-
-    if (!hooks::in_gameplay()) return;
-    if ((int)startSlot > kUiCbSlot || (int)(startSlot + numBuffers) <= kUiCbSlot) return;
-    ID3D11Buffer* buf = buffers[kUiCbSlot - startSlot];
-    if (!buf) return;
-
-    const uint64_t h = hooks::current_draw_hash();
-    if (!is_marker_hash(h)) return;
-    register_marker_cb((void*)buf, h);
-}
-
 // Both our own rotations are OFF: we now inject the HMD look into the game's
 // native look-around system (camera_hook), so the game does the rotation with
 // the correct head pivot and full pass coherence.
@@ -353,73 +280,15 @@ void STDMETHODCALLTYPE Detour_PSSetConstantBuffers(
 // see commit 7d04ae4, "CPU-side view-matrix hook rotates all camera views
 // COHERENTLY", which is why the injection moved to the CPU side in the first
 // place. Rotate at detour_combine2 or in the projection matrix instead.
-constexpr bool  kEnableGpuStereo = false;  // CB shift causes cockpit artifacts — off
-constexpr float kStereoSign      = 1.0f;   // flip if stereo depth is inverted
+//
+// THE EYE OFFSET DOES NOT WORK HERE EITHER. apply_rotation() ended up as a lateral
+// +-IPD/2 shift of the main camera's final CB, cockpit only, and caused cockpit
+// artifacts; it sat switched off until it was deleted on 2026-10-30. Whoever tries
+// this again: leave g_tmViewProjPrev (0xA0) alone. Overwriting it corrupts the
+// passes that read the previous frame's ViewProj (water, SSR, velocity).
 
-// AER stereo: shift the main-camera view laterally by the current eye's ±IPD/2,
-// on the FINAL constant buffer (post the game's eye lerp) — so the cockpit stereo
-// is jitter-free. Rotation is done CPU-side; here we only translate. Cockpit only
-// (the orbit does its own stereo at FnA). A pure lateral shift leaves shadows
-// untouched -> no artifacts.
-void apply_rotation(float* f, const char* path)
-{
-    if (!kEnableGpuStereo) return;
-    if (hooks::logic_mode() < 0.75f) return;    // cockpit only
-    float s = kStereoSign * xr::eye_side_offset();
-    if (s == 0.0f) return;
-
-    if (!g_dumped.exchange(true))
-        VRLOG("=== camera CB stereo shift active (%s) ===", path);
-
-    Mat4 View = load4(f + kOffView/4);
-    // View row0 = world-space camera right. Eye shift delta = s * right.
-    float dx = s*View.m[0][0], dy = s*View.m[0][1], dz = s*View.m[0][2];
-    // View' = View * T(-delta): translate the world by -delta before the view.
-    Mat4 Tn{}; for (int i=0;i<4;++i) Tn.m[i][i]=1.0f;
-    Tn.m[0][3]=-dx; Tn.m[1][3]=-dy; Tn.m[2][3]=-dz;
-    Mat4 nView = mul4(View, Tn);
-    Mat4 nVP   = mul4(load4(f + kOffViewProj/4), Tn);
-    store4(f + kOffView/4,     nView);
-    store4(f + kOffViewProj/4, nVP);
-    // NOTE: leave g_tmViewProjPrev (0xA0) untouched — overwriting it corrupts
-    // passes that read the previous-frame ViewProj (water/SSR/velocity) -> artifacts.
-    // Move the world-space eye with it.
-    f[kOffEye/4+0]+=dx; f[kOffEye/4+1]+=dy; f[kOffEye/4+2]+=dz;
-}
-
-// DIAGNOSTIC: log each distinct 352-byte-CB eye we see, whether it matched
-// is_main_cam (rotated), and which D3D call wrote it. Map-camera recon:
-// is_main_cam requires the eye to match the DRIVE_CAMERA's logic eye, which
-// keeps updating even on the map screen (confirmed: DRIVE_CAMERA only goes
-// idle on the pause menu, not the map) -- so IF the map's own render camera
-// is also a 352-byte CB of this same layout, its writes will fail the
-// is_main_cam match (wrong eye) and show up here as a NEW, distinct,
-// non-rotated entry the moment the map opens. (The Y-key reset that used to
-// arm a fresh capture window here is gone along with the rest of the recon
-// bindings; the cache simply accumulates for the session now.)
-SRWLOCK g_eyeDiagLock = SRWLOCK_INIT;
-int g_eyeDiagSeen[64];
-int g_eyeDiagCount = 0;
-
-void diag_eye(const void* src, bool rotated, const char* path)
-{
-    const float* f = reinterpret_cast<const float*>(src);
-    int key = int(f[0]) * 1000 + int(f[1]) + (rotated ? 500000 : 0);
-    AcquireSRWLockExclusive(&g_eyeDiagLock);
-    bool have = false;
-    for (int i = 0; i < g_eyeDiagCount; ++i) if (g_eyeDiagSeen[i] == key) have = true;
-    bool go = !have && g_eyeDiagCount < 64;
-    if (go) g_eyeDiagSeen[g_eyeDiagCount++] = key;
-    ReleaseSRWLockExclusive(&g_eyeDiagLock);
-    // (A per-sighting "352-CB eye=..." line lived here, hunting the map's own
-    // camera by looking for a near-origin eye that is not the main cam. The
-    // map/garage classifier below settled that question another way, and this
-    // was left printing on every distinct eye it saw.)
-    (void)go;
-}
-
-// Second theory, orthogonal to the near-origin guess above: instead of a
-// magic radius, watch the SPECIFIC buffer that's normally the main view
+// Instead of guessing at a near-origin eye or some magic radius,
+// watch the SPECIFIC buffer that's normally the main view
 // camera and see if IT STOPS matching for several consecutive frames --
 // i.e. the main camera relocated, whatever its new eye is. Debounced
 // (kMainCamMismatchThreshold) to ignore the one-frame miss seen at level
@@ -548,13 +417,32 @@ void track_main_cam_relocation(ID3D11Resource* dst, bool mainCam, const float ey
 
 // Records the un-modified main-camera matrices for DIBR shift. Taken from the source
 // data before any of our edits, so it reflects what the game intends.
-void snapshot_camera(const float* f)
+void snapshot_camera(const float* f, const CamMatch& m)
 {
+    const uint32_t newest = xr::current_build();
     AcquireSRWLockExclusive(&g_camSnapLock);
     std::memcpy(g_camView,     f + kOffView/4,     sizeof(g_camView));
     std::memcpy(g_camViewProj, f + kOffViewProj/4, sizeof(g_camViewProj));
+    std::memcpy(g_camViewProjPrev, f + kOffViewProjPrev/4, sizeof(g_camViewProjPrev));
+    g_camSnapBuild  = m.build;
+    g_camSnapNewest = newest;
+    g_camSnapHow    = m.how;
+    ++g_camSnapSeq;
     ReleaseSRWLockExclusive(&g_camSnapLock);
     g_camSnapValid.store(true);
+}
+
+// One camera upload: counted, and snapshotted when it is the main view's.
+void observe_camera(const void* src)
+{
+    const CamMatch m = classify_cam(src, kCamCBSize);
+    if (m.how == kCamNot) { g_camRejected.fetch_add(1, std::memory_order_relaxed); return; }
+    g_camHowCount[m.how].fetch_add(1, std::memory_order_relaxed);
+    if (m.how == kCamBuild || m.how == kCamNearBuild) {
+        float mx = g_camBuildDistMax.load(std::memory_order_relaxed);
+        while (m.dist > mx && !g_camBuildDistMax.compare_exchange_weak(mx, m.dist)) {}
+    }
+    snapshot_camera(static_cast<const float*>(src), m);
 }
 
 // Shrink amount for ui_hook.cpp's reactive, PS-shader-identity-gated HUD
@@ -612,35 +500,8 @@ void STDMETHODCALLTYPE Detour_UpdateSubresource(
     if (is_cam352(dst) && src) {
         const bool mainCam = is_main_cam(src, kCamCBSize);
         note_camera_commit(ctx, mainCam);
-        diag_eye(src, mainCam, "UpdateSubresource");
         track_main_cam_relocation(dst, mainCam, static_cast<const float*>(src));
-        if (mainCam) {
-            snapshot_camera(static_cast<const float*>(src));
-            alignas(16) float copy[kCamCBSize/4];
-            std::memcpy(copy, src, kCamCBSize);
-            apply_rotation(copy, "UpdateSubresource");
-            real(ctx, dst, sub, box, copy, rowPitch, depthPitch);
-            return;
-        }
-    }
-
-    // Marker CB write. Confirmed this is the ONLY path CB_DYNAMIC_UI is ever
-    // written through for our two marker shaders -- Map/Unmap and
-    // UpdateSubresource1 never see it. Byte offsets 12 (X) and 28 (Y) within
-    // the 144-byte buffer are the screen-position floats -- IF plausible;
-    // see is_plausible_ui_pos() for why that check exists.
-    uint64_t uiHash = 0;
-    if (src && marker_cb_hash((void*)dst, uiHash) && hooks::in_gameplay()) {
-        const float* f = reinterpret_cast<const float*>(src);
-        const float x = f[kUiPosXFloatIdx];
-        const float y = f[kUiPosYFloatIdx];
-        if (is_plausible_ui_pos(x, y, f[2])) {
-            note_marker_cb_position((void*)dst, x, y);
-            note_ui_position_this_frame(x, y);
-        }
-        // else: not a real screen position (garbage/other use of this
-        // buffer/shader) -- skip. marker_cb_position() then stays at
-        // whatever it last validly held, or "not found" if never valid.
+        observe_camera(src);
     }
 
     real(ctx, dst, sub, box, src, rowPitch, depthPitch);
@@ -657,16 +518,8 @@ void STDMETHODCALLTYPE Detour_US1(ID3D11DeviceContext1* ctx, ID3D11Resource* dst
     if (is_cam352(dst) && src) {
         const bool mainCam = is_main_cam(src, kCamCBSize);
         note_camera_commit(ctx, mainCam);
-        diag_eye(src, mainCam, "UpdateSubresource1");
         track_main_cam_relocation(dst, mainCam, static_cast<const float*>(src));
-        if (mainCam) {
-            snapshot_camera(static_cast<const float*>(src));
-            alignas(16) float copy[kCamCBSize/4];
-            std::memcpy(copy, src, kCamCBSize);
-            apply_rotation(copy, "UpdateSubresource1");
-            real_US1(ctx, dst, sub, box, copy, rp, dp, cf);
-            return;
-        }
+        observe_camera(src);
     }
     real_US1(ctx, dst, sub, box, src, rp, dp, cf);
 }
@@ -700,23 +553,14 @@ void STDMETHODCALLTYPE Detour_Unmap(ID3D11DeviceContext* ctx, ID3D11Resource* re
     if (res == t_mapRes && t_mapPtr && is_cam352(res)) {
         const bool mainCam = is_main_cam(t_mapPtr, kCamCBSize);
         note_camera_commit(ctx, mainCam);
-        diag_eye(t_mapPtr, mainCam, "Map");
         track_main_cam_relocation(res, mainCam, reinterpret_cast<const float*>(t_mapPtr));
-        if (mainCam)
-            apply_rotation(reinterpret_cast<float*>(t_mapPtr), "Map");
+        observe_camera(t_mapPtr);
     }
     t_mapRes = nullptr; t_mapPtr = nullptr;
     real_Unmap(ctx, res, sub);
 }
 
 } // namespace
-
-bool marker_cb_position_is_dynamic(void* buf)
-{
-    float x = 0.0f, y = 0.0f;
-    if (!marker_cb_position(buf, x, y)) return false;   // not a tracked marker CB
-    return !position_was_static(x, y);
-}
 
 bool main_camera_matrices(float view[16], float viewProj[16])
 {
@@ -728,12 +572,29 @@ bool main_camera_matrices(float view[16], float viewProj[16])
     return true;
 }
 
-// Gates the HUD-shrink bypass and the compositor FOV shrink (xr_mirror.cpp's
-// composited_fov_scale()). Deliberately fires on EITHER kMap or kGarage --
-// both are "the main render camera relocated away from gameplay" the same
-// way, and garage wants the same UI-at-native-scale/reduced-FOV treatment as
-// the map. The MAP-vs-GARAGE split (driveIdle) still exists purely for the
-// VRLOG classification, not for gating this.
+bool main_camera_matrices(float view[16], float viewProj[16], float viewProjPrev[16])
+{
+    if (!g_camSnapValid.load()) return false;
+    AcquireSRWLockShared(&g_camSnapLock);
+    std::memcpy(view,         g_camView,         sizeof(g_camView));
+    std::memcpy(viewProj,     g_camViewProj,     sizeof(g_camViewProj));
+    std::memcpy(viewProjPrev, g_camViewProjPrev, sizeof(g_camViewProjPrev));
+    ReleaseSRWLockShared(&g_camSnapLock);
+    return true;
+}
+
+bool main_camera_snap(CamSnapInfo& out)
+{
+    if (!g_camSnapValid.load()) return false;
+    AcquireSRWLockShared(&g_camSnapLock);
+    out.seq      = g_camSnapSeq;
+    out.build    = g_camSnapBuild;
+    out.newestAt = g_camSnapNewest;
+    out.how      = g_camSnapHow;
+    ReleaseSRWLockShared(&g_camSnapLock);
+    return true;
+}
+
 // The MAP screen, now identified from the game's own camera POSE -- pitched
 // -45 deg with its eye at the origin. See hooks::map_by_pose().
 //
@@ -795,6 +656,12 @@ constexpr uint64_t kGameplayIdleMs = 400;
 
 bool in_gameplay()
 {
+    // THE MENU CAMERA ON SCREEN is a positive answer under either gate: the
+    // image was rendered by the main-menu camera builder, which only runs on
+    // the main menu and the garage and map opened from it (xr_mirror.h,
+    // onscreen_camera_builder). Per frame, so the menus no longer wait for the
+    // drive camera's idle timer.
+    if (xr::onscreen_camera_builder() == xr::kBuilderMenu) return false;
     if (hooks::screen_gate_direct()) {
         const int s = hooks::direct_screen();
         // A POSITIVE answer is taken at face value, in both directions: the
@@ -837,9 +704,9 @@ void install_cbuffer_hook(IDXGISwapChain* swapchain)
 
     void** vt = *reinterpret_cast<void***>(ctx.Get());
 
-    // Deferred-context vtable, for PSSetConstantBuffers and UpdateSubresource
-    // -- the UI is recorded on a deferred context, so a hook on the
-    // immediate vtable alone would miss every UI-related bind/write.
+    // Deferred-context vtable, for UpdateSubresource -- the engine records on
+    // deferred contexts too, and a hook on the immediate vtable alone would
+    // miss every write made there.
     ComPtr<ID3D11DeviceContext> defProbe;
     dev->CreateDeferredContext(0, &defProbe);
     void** vtDef = defProbe ? *reinterpret_cast<void***>(defProbe.Get()) : nullptr;
@@ -878,38 +745,40 @@ void install_cbuffer_hook(IDXGISwapChain* swapchain)
     ok = hook(vt, kIdxMap,   &Detour_Map,   reinterpret_cast<void**>(&real_Map),   "Map")   && ok;
     ok = hook(vt, kIdxUnmap, &Detour_Unmap, reinterpret_cast<void**>(&real_Unmap), "Unmap") && ok;
 
-    ok = hook(vt, kIdxPSSetConstantBuffers, reinterpret_cast<void*>(&Detour_PSSetConstantBuffers),
-              reinterpret_cast<void**>(&real_PSSetConstantBuffers_imm), "PSSetConstantBuffers(imm)") && ok;
-    if (vtDef) {
-        if (vtDef[kIdxPSSetConstantBuffers] == vt[kIdxPSSetConstantBuffers]) {
-            real_PSSetConstantBuffers_def = real_PSSetConstantBuffers_imm;
-        } else {
-            ok = hook(vtDef, kIdxPSSetConstantBuffers, reinterpret_cast<void*>(&Detour_PSSetConstantBuffers),
-                      reinterpret_cast<void**>(&real_PSSetConstantBuffers_def), "PSSetConstantBuffers(def)") && ok;
-        }
-    }
-
     // UpdateSubresource1 lives on the ID3D11DeviceContext1 vtable (same object).
     ComPtr<ID3D11DeviceContext1> ctx1;
     if (SUCCEEDED(ctx->QueryInterface(__uuidof(ID3D11DeviceContext1), (void**)&ctx1)))
         hook(vt, kIdxUpdateSubresource1, &Detour_US1, reinterpret_cast<void**>(&real_US1), "UpdateSubresource1");
 
     if (!ok) { g_hooked = false; return; }
-    VRLOG("camera CB hooks installed (UpdateSubresource[1] + Map/Unmap + PSSetConstantBuffers)");
+    VRLOG("camera CB hooks installed (UpdateSubresource[1] + Map/Unmap)");
 }
 
 void cbuffer_hook_on_present()
 {
-    AcquireSRWLockExclusive(&g_uiPosLock);
-    g_uiPosPrev = g_uiPosCur;
-    g_uiPosCur.count = 0;
-    ReleaseSRWLockExclusive(&g_uiPosLock);
-
-    evict_stale_marker_cbs();
-    ++g_markerCbFrame;
+    // How the main view's camera was recognised, every 10 s. "on a build" is
+    // the exact match that names the build; a large max distance there, or
+    // most uploads only "near a build", would mean the game moves the camera
+    // after the mod hands it over -- see classify_cam().
+    static ULONGLONG t0 = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (!t0) t0 = now;
+    if (now - t0 >= 10000) {
+        t0 = now;
+        const uint32_t onBuild = g_camHowCount[kCamBuild].exchange(0);
+        const uint32_t nearOne = g_camHowCount[kCamNearBuild].exchange(0);
+        const uint32_t drive   = g_camHowCount[kCamLogic].exchange(0);
+        const uint32_t dir     = g_camHowCount[kCamBuildDir].exchange(0);
+        const uint32_t unver   = g_camHowCount[kCamUnverified].exchange(0);
+        const uint32_t rej     = g_camRejected.exchange(0);
+        const uint32_t away    = g_camTurnedAway.exchange(0);
+        const float    dmax    = g_camBuildDistMax.exchange(0.0f);
+        if (onBuild || nearOne || drive || dir || unver)
+            VRLOG("camera: main view uploads in 10 s -- on a build %u, near one %u (max "
+                  "%.3f m), drive camera %u, a build's direction only %u, unverified %u; "
+                  "other cameras %u (%u of them passed a lesser test while the builds "
+                  "matched -- mirrors)", onBuild, nearOne, dmax, drive, dir, unver, rej, away);
+    }
 }
-
-bool world_marker_fix_enabled() { return g_worldMarkerFix.load(); }
-void set_world_marker_fix_enabled(bool on) { g_worldMarkerFix.store(on); }
 
 } // namespace hooks

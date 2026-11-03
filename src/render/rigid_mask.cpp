@@ -31,13 +31,28 @@ struct State {
 // The ComPtrs above are only ever rebuilt while this is false, so a recording
 // thread that sees true has a stable set of objects to use.
 std::atomic<bool> g_active{false};
+// Whether the draws are being duplicated: only ever true while g_active is.
+std::atomic<bool> g_marking{false};
+// Marks may be in the texture since it was last cleared. Present only.
+bool g_dirty = false;
+
+// The target only. The mark shader and its blend state do not depend on the size,
+// so they are made once and kept until shutdown: every pixel shader freed is an
+// address D3D can hand to the game's next one, and shader_cull.cpp knows shaders
+// by address. A resize used to free one each time.
+void release_targets()
+{
+    g_marking.store(false);
+    g_active.store(false);
+    g_dirty = false;
+    g.srv.Reset(); g.rtv.Reset(); g.tex.Reset();
+    g.w = g.h = 0;
+}
 
 void release_all()
 {
-    g_active.store(false);
-    g.srv.Reset(); g.rtv.Reset(); g.tex.Reset();
+    release_targets();
     g.markPs.Reset(); g.opaqueBlend.Reset();
-    g.w = g.h = 0;
 }
 
 bool build(ID3D11Device* dev, uint32_t w, uint32_t h)
@@ -60,29 +75,33 @@ bool build(ID3D11Device* dev, uint32_t w, uint32_t h)
         return false;
     }
 
-    ComPtr<ID3DBlob> code, err;
-    if (FAILED(D3DCompile(kMarkPs, sizeof(kMarkPs) - 1, nullptr, nullptr, nullptr,
-                          "psmain", "ps_5_0", 0, 0, &code, &err))) {
-        VRLOG("rigid mask: mark PS compile FAILED: %s",
-              err ? (const char*)err->GetBufferPointer() : "?");
-        return false;
-    }
-    if (FAILED(dev->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(),
-                                      nullptr, &g.markPs))) {
-        VRLOG("rigid mask: CreatePixelShader FAILED");
-        return false;
+    if (!g.markPs) {
+        ComPtr<ID3DBlob> code, err;
+        if (FAILED(D3DCompile(kMarkPs, sizeof(kMarkPs) - 1, nullptr, nullptr, nullptr,
+                              "psmain", "ps_5_0", 0, 0, &code, &err))) {
+            VRLOG("rigid mask: mark PS compile FAILED: %s",
+                  err ? (const char*)err->GetBufferPointer() : "?");
+            return false;
+        }
+        if (FAILED(dev->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(),
+                                          nullptr, &g.markPs))) {
+            VRLOG("rigid mask: CreatePixelShader FAILED");
+            return false;
+        }
     }
 
     // The mirror's own blend state could be anything -- additive, multiplied,
     // alpha-weighted -- and a mark that goes through it is a mark whose value
     // depends on the reflection's colour. Coverage has to be unconditional, so
     // the duplicate draws with blending off.
-    D3D11_BLEND_DESC bd{};
-    bd.RenderTarget[0].BlendEnable = FALSE;
-    bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
-    if (FAILED(dev->CreateBlendState(&bd, &g.opaqueBlend))) {
-        VRLOG("rigid mask: CreateBlendState FAILED");
-        return false;
+    if (!g.opaqueBlend) {
+        D3D11_BLEND_DESC bd{};
+        bd.RenderTarget[0].BlendEnable = FALSE;
+        bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        if (FAILED(dev->CreateBlendState(&bd, &g.opaqueBlend))) {
+            VRLOG("rigid mask: CreateBlendState FAILED");
+            return false;
+        }
     }
 
     g.w = w; g.h = h;
@@ -92,34 +111,37 @@ bool build(ID3D11Device* dev, uint32_t w, uint32_t h)
 
 } // namespace
 
-bool active() { return g_active.load(std::memory_order_acquire); }
+bool active() { return g_marking.load(std::memory_order_acquire); }
 
 ID3D11ShaderResourceView* srv()
 {
     return g_active.load(std::memory_order_acquire) ? g.srv.Get() : nullptr;
 }
 
-void update(ID3D11Device* dev, uint32_t canvasW, uint32_t canvasH, bool wanted)
+void update(ID3D11Device* dev, uint32_t canvasW, uint32_t canvasH, bool wanted, bool marking)
 {
     if (!wanted || !dev || canvasW == 0 || canvasH == 0) {
         // The duplicated truck draws are the only cost here that scales with
         // scene complexity, and they are hundreds per frame -- so when nothing
         // reads the mask, give the memory back AND stop the marking.
-        if (g.tex) { release_all(); VRLOG("rigid mask: released (not wanted)"); }
+        if (g.tex) { release_targets(); VRLOG("rigid mask: released (not wanted)"); }
         return;
     }
-    if (g.tex && g.w == canvasW && g.h == canvasH) return;
-
-    release_all();
-    if (build(dev, canvasW, canvasH))
-        g_active.store(true, std::memory_order_release);
-    else
-        release_all();
+    if (!g.tex || g.w != canvasW || g.h != canvasH) {
+        release_targets();
+        if (build(dev, canvasW, canvasH)) {
+            g_active.store(true, std::memory_order_release);
+        } else {
+            release_targets();
+            return;
+        }
+    }
+    g_marking.store(marking, std::memory_order_release);
 }
 
 bool begin_mark(ID3D11DeviceContext* ctx, Saved& saved)
 {
-    if (!ctx || !g_active.load(std::memory_order_acquire) || !g.rtv) return false;
+    if (!ctx || !g_marking.load(std::memory_order_acquire) || !g.rtv) return false;
 
     // OMGetRenderTargets AddRefs everything it hands back; end_mark releases.
     ctx->OMGetRenderTargets(8, saved.rtv, &saved.dsv);
@@ -164,13 +186,18 @@ void end_mark(ID3D11DeviceContext* ctx, Saved& saved)
 void clear(ID3D11DeviceContext* ctx)
 {
     if (!ctx || !g_active.load(std::memory_order_acquire) || !g.rtv) return;
+    // Once more on the Present the marking stops: the last frame's marks are
+    // still in there, and they would be read when it starts again.
+    const bool marking = g_marking.load(std::memory_order_acquire);
+    if (!marking && !g_dirty) return;
     const float zero[4] = {0, 0, 0, 0};
     ctx->ClearRenderTargetView(g.rtv.Get(), zero);
+    g_dirty = marking;
 }
 
 ID3D11Texture2D* texture()
 {
-    return g_active.load(std::memory_order_acquire) ? g.tex.Get() : nullptr;
+    return g_marking.load(std::memory_order_acquire) ? g.tex.Get() : nullptr;
 }
 void shutdown() { release_all(); }
 

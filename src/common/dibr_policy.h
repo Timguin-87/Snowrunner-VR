@@ -33,11 +33,12 @@ namespace dibrpolicy {
 inline constexpr float kMaxDisparityPx = 512.0f;
 
 // The full rendered eye separation must land in this band. No human IPD is
-// outside it, and a value outside it saturates the clamp above -- which does
-// not look like a bug, it looks like the whole synthesized eye rigidly
-// translated.
+// outside it at any world scale (xr::world_scale(): the IPD over 0.5 to 2, so
+// up to twice a wide 80 mm), and a value outside it saturates the clamp above
+// -- which does not look like a bug, it looks like the whole synthesized eye
+// rigidly translated.
 inline constexpr float kMinSeparationM = 0.005f;
-inline constexpr float kMaxSeparationM = 0.15f;
+inline constexpr float kMaxSeparationM = 0.20f;
 
 // How long a last-good projection may be reused against freshly captured
 // depth before it is dropped. A transient bad camera-CB read lasts a frame or
@@ -231,9 +232,9 @@ constexpr float eye_sign(float bakedOffsetM, float rightIsScreenRight) noexcept
 // NOT ALWAYS THE FULL SEPARATION, and assuming it was is what produced jitter
 // on the main menu. The stale eye is normally the partner of the rendered one,
 // but the two identities come from different places: the eye being warped comes
-// from the AER parity ring, while the rendered eye comes from the camera hook's
-// applied-eye record. On any screen where no camera build runs -- the main menu,
-// loading, the map -- the record FREEZES while the Present hook keeps advancing
+// from the AER parity ring, while the rendered eye comes from the camera build
+// the image on screen was drawn with. On any screen where no camera build runs
+// -- loading, say -- that record FREEZES while the Present hook keeps advancing
 // the parity on its own 250 ms fallback. The two then disagree every other
 // frame.
 //
@@ -249,6 +250,18 @@ constexpr float stale_eye_lateral(int staleEye, int renderedEye,
                                   float separationM) noexcept
 {
     return staleEye == renderedEye ? 0.0f : separationM;
+}
+
+// THE OFFSET THE EYE ON SCREEN WAS BUILT WITH, from the latest build's.
+//
+// In gameplay the image at a Present is the latest build, so the two are the
+// same. On the map, in the garage and on the menus it is the build before, whose
+// eye is the partner of the latest and whose offset is the opposite one. Taking
+// the latest build's eye there makes the stale eye look like the rendered one:
+// no lateral displacement at all, and flat stereo on every warped frame.
+constexpr float shown_eye_offset(int shownEye, int latestEye, float latestOffsetM) noexcept
+{
+    return shownEye == latestEye ? latestOffsetM : -latestOffsetM;
 }
 
 // WHETHER THE 6-DoF REPROJECTION'S MODEL OF THE EYE OFFSET IS TRUE THIS FRAME.
@@ -269,36 +282,52 @@ constexpr float stale_eye_lateral(int staleEye, int renderedEye,
 //                    the map/garage projection site, which shears m[12] instead
 //                    of moving the camera. A projection shift displaces every
 //                    depth by the SAME amount, so reprojecting it through depth
-//                    both over- and under-shoots, and its sign is opposite too
-//                    (see kMapEyeSign in viewbuild_hook.cpp).
+//                    both over- and under-shoots. No live path records one any
+//                    more: those screens take their offset at the camera build
+//                    like gameplay does.
 //   eyeFresh         false when no camera build baked an eye into THIS frame.
 //                    The applied-eye record is sticky: it keeps answering with
 //                    the last frame's eye while the parity advances past it, so
-//                    half the answers are for the wrong eye. This is the level
-//                    fly-in -- a camera that MOVES, so the idle timer stays
-//                    open, on a screen that is not gameplay, so the
-//                    static-screen test does not catch it either. It fell
-//                    through both existing guards.
-//
-// Both facts were previously inferred from screen identity. Asking the record
-// what it actually holds is exact, and it costs nothing.
+//                    half the answers are for the wrong eye.
 //   eyeMapSign       true when the render baked the eye on the side OPPOSITE
 //                    to gameplay (kMapEyeSign). The flip corrects for how those
 //                    screens render; it does not say where the camera was, so a
-//                    model built on camera geometry must not inherit it. This is
-//                    the LEVEL FLY-IN as actually measured. The flip there
-//                    comes from the menu/cutscene camera CALL SITE (isMenuCam),
-//                    which is a property of where the view was built, not a
-//                    screen classification -- so it fires whatever the screen
-//                    gate is set to, while that gate calls the same frame a
-//                    garage and leaves the reprojection switched on.
-inline bool sixdof_model_applies(bool uses6dof, bool onStaticScreen,
-                                 bool driveIdle, bool eyeValid,
-                                 bool eyeFresh, bool eyeIsCameraMove,
-                                 bool eyeMapSign) noexcept
+//                    model built on camera geometry must not inherit it. The flip
+//                    itself is gone (kMapEyeSign is +1), which is the other half
+//                    of why the map and the garage now run this.
+//
+// NOT A LIST OF SCREENS, and it used to be: "not the map, the garage or a menu",
+// from when those screens broke both of the premises above. Asking the record
+// what it actually holds is exact, it costs nothing, and it does not go stale
+// when a screen's camera changes the way that one did.
+inline bool sixdof_model_applies(bool uses6dof, bool eyeValid, bool eyeFresh,
+                                 bool eyeIsCameraMove, bool eyeMapSign) noexcept
 {
-    return uses6dof && !onStaticScreen && !driveIdle &&
-           eyeValid && eyeFresh && eyeIsCameraMove && !eyeMapSign;
+    return uses6dof && eyeValid && eyeFresh && eyeIsCameraMove && !eyeMapSign;
+}
+
+// --- which masks the next render marks ---------------------------------------
+//
+// A mask costs a duplicate of every draw it covers, so a render marks one only
+// if something can read the result.
+//
+// THE TRUCK MASK is read by the rigid path, which the motion-vector warp replaces
+// on every frame that has a field. `fieldsArriving` is motionfield::covering():
+// fields measured just now, not merely TAA being on -- so if they stop for any
+// reason the marking comes back by itself and the worst case is the rigid path
+// as it always ran. DIBR shift keeps the mask whatever the warp type, since it
+// was never measured how often its hole fill goes without a field.
+inline bool rigid_mask_marks(bool dibrShift, bool usesMotion, bool fieldsArriving) noexcept
+{
+    return dibrShift || !usesMotion || !fieldsArriving;
+}
+
+// THE MIRROR MASK is read by DIBR shift, and by the motion-vector warp on frames
+// with a field: motionMeasured is motionfield::measuring(), which stays false
+// with the game's TAA off, when that warp is really the plain 6-DoF one.
+inline bool mirror_mask_marks(bool dibrShift, bool motionMeasured) noexcept
+{
+    return dibrShift || motionMeasured;
 }
 
 // --- disparity: mirrors the HLSL in render/dibr.cpp ---------------------------

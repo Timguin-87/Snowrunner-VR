@@ -7,6 +7,7 @@
 #include <d3d11.h>
 #include <dxgi.h>
 #include <wrl/client.h>
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <string>
@@ -82,6 +83,8 @@ struct Slot {
     // as candidates at all -- no search step can reach them however the
     // thread-local flag happens to be sitting.
     std::atomic<bool>     exempt{false};
+    // The game's TAA resolve (see is_taa_resolve_bytecode()).
+    std::atomic<bool>     taa{false};
 };
 Slot g_slots[kSlots];
 std::atomic<int> g_slotCount{0};
@@ -353,7 +356,15 @@ std::atomic<uint64_t> g_roleHash[kCullRoleCount][kMaxRoleHashes] = {
       std::atomic<uint64_t>{0xC901FED400BE074Bull},
       std::atomic<uint64_t>{0x4B3885B96F72F43Full},
       std::atomic<uint64_t>{0xC90D1842A7C52213ull} },  // kCullUi
-    { std::atomic<uint64_t>{0x2833C7477B5978A5ull} },   // kCullMirror
+    // kCullMirror. The second is the SAME mirror with the game's anti-aliasing
+    // on TAA (found 2026-10-29 in the TAA cockpit capture: the pixel shader
+    // binding g_txMirror / g_txMirrorINTZ / g_txAlbedo). TAA swaps the mirror
+    // material for a variant of its own -- with only the first known, the
+    // mirror mask stayed empty under TAA ("0 mirror draws marked"), so DIBR
+    // shift reprojected the mirrors and the motion-vector warp moved them by
+    // vectors that describe the reflection, not the glass.
+    { std::atomic<uint64_t>{0x2833C7477B5978A5ull},
+      std::atomic<uint64_t>{0x7911734DEE6C1944ull} },
     // kCullRigid -- everything that moves with the camera. Mapped by hand
     // 2026-08-20: truck bodies, cab interiors, trailers and loads.
     //
@@ -412,7 +423,7 @@ std::atomic<uint64_t> g_roleHash[kCullRoleCount][kMaxRoleHashes] = {
 // install found that the build did not know about" -- which is what the config
 // file stores, instead of a copy of the built-in set that would go stale the
 // next time these are updated.
-constexpr int kRoleBuiltinCount[kCullRoleCount] = { 1, 3, 7, 1, 66, 5 };
+constexpr int kRoleBuiltinCount[kCullRoleCount] = { 1, 3, 7, 2, 66, 5 };
 std::atomic<int>  g_roleHashCount[kCullRoleCount] = {
     std::atomic<int>{kRoleBuiltinCount[0]}, std::atomic<int>{kRoleBuiltinCount[1]},
     std::atomic<int>{kRoleBuiltinCount[2]}, std::atomic<int>{kRoleBuiltinCount[3]},
@@ -488,12 +499,29 @@ bool hash_is_culled(uint64_t h)
 thread_local int  t_idx  = -1;
 thread_local bool t_cull = false;
 thread_local bool t_selfRender = false;
+thread_local bool t_taa  = false;   // the bound PS is the game's TAA resolve
+
+// THE GAME'S TAA RESOLVE, by what it reads rather than by its hash: its
+// bytecode's reflection data names the velocity texture it samples, and a
+// name survives the recompile a game patch would bring where a hash does not.
+// The hash is the fallback for a shader created before this hook was in --
+// 0xC129E634D887289A, RenderDoc's d887289a-c129e634-... read the way
+// dxbc_hash() reads it (docs/dlss_investigation.md).
+constexpr uint64_t kTaaResolveHash = 0xC129E634D887289Aull;
+bool is_taa_resolve_bytecode(const void* bytecode, SIZE_T len)
+{
+    static const char kName[] = "PS_EDGE_AA_VELOCITY_TEX";
+    const char* p = static_cast<const char*>(bytecode);
+    const char* end = p + len;
+    return p && std::search(p, end, kName, kName + sizeof(kName) - 1) != end;
+}
 
 std::atomic<int>  g_unknownHashDraws{0};
 std::atomic<bool> g_firstCullLogged{false};
 
 void note_ps_bound(ID3D11PixelShader* ps)
 {
+    t_taa = false;
     if (t_selfRender || !ps) { t_idx = -1; t_cull = false; return; }
 
     Slot* s = find_slot((void*)ps);
@@ -506,6 +534,8 @@ void note_ps_bound(ID3D11PixelShader* ps)
         g_unknownHashDraws.fetch_add(1, std::memory_order_relaxed);
     }
     if (s->exempt.load(std::memory_order_relaxed)) { t_idx = -1; t_cull = false; return; }
+    t_taa = s->taa.load(std::memory_order_relaxed) ||
+            s->hash.load(std::memory_order_relaxed) == kTaaResolveHash;
 
     int idx = s->usedPlus1.load(std::memory_order_acquire) - 1;
     if (idx < 0) {
@@ -543,12 +573,29 @@ HRESULT STDMETHODCALLTYPE Detour_CreatePixelShader(
     const HRESULT hr = real_CreatePixelShader(dev, bytecode, len, linkage, out);
     if (SUCCEEDED(hr) && out && *out) {
         if (Slot* s = claim_slot((void*)*out)) {
-            s->hash.store(dxbc_hash(bytecode, len), std::memory_order_relaxed);
-            // Every shader the mod compiles for itself is built lazily from
-            // inside the Present hook, so this is a reliable "ours, hands off"
-            // test -- including ImGui's, which is created by backend code we
-            // do not otherwise touch.
-            if (t_selfRender) s->exempt.store(true, std::memory_order_relaxed);
+            // A NEW SHADER, WHATEVER THE TABLE SAYS. An address already in it
+            // belonged to a shader that has since been freed -- D3D hands the
+            // memory straight back out -- and every field of the slot is still
+            // that shader's: its exemption, its TAA flag, and through usedPlus1
+            // its candidate entry, with the hash, role and map marker the bind
+            // path reads. Left there, the new shader answers as the old one for
+            // the rest of the session: a map marker that never counts, a UI
+            // shader that stays in the render. Nothing is ever removed from the
+            // table, so this is the one moment the slot can be put right. The old
+            // entry stays in the list as a shader that was once bound.
+            const uint64_t h = dxbc_hash(bytecode, len);
+            const bool taa = !t_selfRender && is_taa_resolve_bytecode(bytecode, len);
+            s->hash.store(h, std::memory_order_relaxed);
+            s->taa.store(taa, std::memory_order_relaxed);
+            // Every shader the mod compiles for itself is built from inside the
+            // Present hook or a draw detour's self-render bracket, so this is a
+            // reliable "ours, hands off" test -- including ImGui's, which is
+            // created by backend code we do not otherwise touch.
+            s->exempt.store(t_selfRender, std::memory_order_relaxed);
+            s->usedPlus1.store(0, std::memory_order_release);
+            if (taa)
+                VRLOG("TAA resolve shader created (hash %016llX) -- DLSS can replace it",
+                      (unsigned long long)h);
         }
     }
     return hr;
@@ -600,12 +647,16 @@ bool cull_current_draw(unsigned elemCount)
     return true;
 }
 
-void note_ps_state_lost() { t_idx = -1; t_cull = false; }
+void note_ps_state_lost() { t_idx = -1; t_cull = false; t_taa = false; }
 
-void set_self_render(bool on)
+bool current_draw_is_taa_resolve() { return t_taa; }
+
+bool set_self_render(bool on)
 {
+    const bool was = t_selfRender;
     t_selfRender = on;
-    if (on) { t_idx = -1; t_cull = false; }
+    if (on) { t_idx = -1; t_cull = false; t_taa = false; }
+    return was;
 }
 
 // --- install -------------------------------------------------------------

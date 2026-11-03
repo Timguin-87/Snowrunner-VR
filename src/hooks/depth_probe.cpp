@@ -1,11 +1,15 @@
 #include "hooks/depth_probe.h"
 #include "hooks/cbuffer_hook.h"
+#include "render/gpu_timer.hpp"
+#include "render/motion_field.hpp"
+#include "render/reproject.hpp"
 #include "xr/xr_mirror.h"
 #include "common/dibr_policy.h"
 #include "common/log.h"
 
 #include <windows.h>
 #include <wrl/client.h>
+#include <algorithm>
 #include <atomic>
 #include <vector>
 #include <cmath>
@@ -287,9 +291,18 @@ void CS_CopyDepth(uint3 tid : SV_DispatchThreadID)
     // needing to know which transition that was.
     OutDepth[tid.xy] = max(OutDepth[tid.xy], SrcDepth[tid.xy]);
 }
+// The finished depth in one read: see depth_capture_at_resolve().
+[numthreads(8, 8, 1)]
+void CS_TakeDepth(uint3 tid : SV_DispatchThreadID)
+{
+    uint w, h;
+    OutDepth.GetDimensions(w, h);
+    if (tid.x >= w || tid.y >= h) return;
+    OutDepth[tid.xy] = SrcDepth[tid.xy];
+}
 )";
 
-ComPtr<ID3D11ComputeShader> g_csCopyDepth;
+ComPtr<ID3D11ComputeShader> g_csCopyDepth, g_csTakeDepth;
 // TWO accumulators, swapped once per Present.
 //
 // MEASURED RACE. depth_probe_on_present() re-arms g_clearedThisFrame at
@@ -365,20 +378,25 @@ ID3D11ShaderResourceView* src_depth_srv(ID3D11Device* dev, ID3D11Texture2D* tex,
 
 bool ensure_copy_shader(ID3D11Device* dev)
 {
-    if (g_csCopyDepth) return true;
-    ComPtr<ID3DBlob> code, err;
-    if (FAILED(D3DCompile(kDepthCopyHlsl, sizeof(kDepthCopyHlsl) - 1, "depthcopy",
-                          nullptr, nullptr, "CS_CopyDepth", "cs_5_0", 0, 0, &code, &err))) {
-        VRLOG("depth acquire: shader compile FAILED: %s",
-              err ? (const char*)err->GetBufferPointer() : "(no message)");
+    if (g_csCopyDepth && g_csTakeDepth) return true;
+    auto build = [&](const char* entry, ComPtr<ID3D11ComputeShader>& out) -> bool {
+        ComPtr<ID3DBlob> code, err;
+        if (FAILED(D3DCompile(kDepthCopyHlsl, sizeof(kDepthCopyHlsl) - 1, "depthcopy",
+                              nullptr, nullptr, entry, "cs_5_0", 0, 0, &code, &err))) {
+            VRLOG("depth acquire: shader compile FAILED: %s",
+                  err ? (const char*)err->GetBufferPointer() : "(no message)");
+            return false;
+        }
+        if (FAILED(dev->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(),
+                                            nullptr, &out))) {
+            VRLOG("depth acquire: CreateComputeShader FAILED");
+            return false;
+        }
+        return true;
+    };
+    if (!build("CS_CopyDepth", g_csCopyDepth) || !build("CS_TakeDepth", g_csTakeDepth))
         return false;
-    }
-    if (FAILED(dev->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(),
-                                        nullptr, &g_csCopyDepth))) {
-        VRLOG("depth acquire: CreateComputeShader FAILED");
-        return false;
-    }
-    VRLOG("depth acquire: R32_FLOAT copy shader ready");
+    VRLOG("depth acquire: R32_FLOAT copy shaders ready");
     return true;
 }
 
@@ -397,26 +415,10 @@ UINT g_depthW = 0, g_depthH = 0;
 // appears and nothing was captured at all (measured: ~90% of frames missed,
 // leaving the warp on stale wrong-eye depth).
 //
-// Instead, count scene-sized depth unbinds and copy only for the last few,
-// using the previous frame's count as the predictor. Self-calibrating, costs a
-// handful of copies per frame, and does not care what else the frame did.
+// Instead, every scene-sized depth unbind is accumulated -- see
+// capture_if_pass_ended() -- and these count them.
 std::atomic<int> g_sceneTransIdx{0};        // scene-sized unbinds so far this frame
 std::atomic<int> g_lastSceneTransCount{0};  // how many the previous frame had
-// How many trailing scene-sized unbinds to accumulate. Max-accumulation makes
-// a WIDER window strictly safer: under reverse-Z, depth only ever increases as
-// the frame draws (nearer geometry wins) and cleared sources contribute 0, so
-// extra captures can only add information, never destroy it. Too NARROW a window
-// is the failure mode -- if it lands entirely on already-cleared sources the
-// frame yields nothing, which is the residual cockpit flicker.
-constexpr int kCaptureTail = 10;
-// Self-correcting capture threshold. Deriving it purely from the previous
-// frame's count is unsafe: when the count SHRINKS, the window lands past the
-// end of the frame and nothing is captured at all -- the buffer then keeps
-// whatever it last held, which may be a cleared one. That is exactly what made
-// cockpit fail while orbit (identical transition structure) worked. So: on any
-// frame that captured nothing, halve the threshold. It converges back to the
-// tail on its own and cannot get stuck beyond the end.
-std::atomic<int> g_captureThreshold{0};
 std::atomic<bool> g_capturedThisFrame{false};  // did THIS frame capture?
 std::atomic<bool> g_clearedThisFrame{false};   // depth copy zeroed for accumulation
 // Eye offset that was baked into the frame this depth belongs to, snapshotted at
@@ -470,7 +472,7 @@ std::atomic<int>   g_windowRestarts{0};   // eye changed mid-frame -> window res
 // It is the direct measure of the "the window was cut short" theory: a frame
 // whose depth passes numbered 20-30 but whose surviving window holds 1 is a
 // fragment, whatever the depth itself turns out to contain.
-std::atomic<int>   g_slotCaps[2] = {};
+std::atomic<int>   g_slotCaps[kDepthSlots] = {};
 // Scene-depth unbinds dropped this frame for being on a DEFERRED context. Those
 // passes are never captured at all -- if the engine moves the world pass onto a
 // worker context under load while the cockpit pass stays on the immediate one,
@@ -505,6 +507,51 @@ std::atomic<int>   g_rsFirstW{0}, g_rsEyeW{0}, g_rsCamW{0};
 std::atomic<float> g_lastCamMove{0.0f};
 std::atomic<int>  g_totalFrames{0};
 std::atomic<bool> g_depthValid{false};         // copy holds usable depth (persists)
+
+// --- the finished depth, once, at the TAA resolve ----------------------------
+// WITH THE GAME'S TAA ON, ALL OF THE ACCUMULATION BELOW IS UNNECESSARY, and it is
+// the most repeated GPU work the mod does: a full-screen read per scene-sized
+// unbind, which the log of 2026-11-01 puts at 14-30 a frame in a level (the 6.4
+// in the note further down was a far lighter scene).
+//
+// Measured the same day from the four RenderDoc captures with TAA on (cockpit
+// and orbit while driving, the two-mirror car, flat), reading the depth at every
+// unbind and at the resolve, 20-22 scene-sized unbinds a frame:
+//
+//   - The main depth is cleared once, before the world, and not again before the
+//     resolve. What the resolve finds is byte-identical to the last unbind before
+//     it, and nothing after the resolve brought any surface nearer. The world is
+//     all in there: the deferred lists have been executed by then.
+//   - It equals the max() of all those unbinds, with one exception that is not
+//     an improvement: the frame's FIRST unbind of that target comes before its
+//     clear, so it still holds the previous frame -- under AER, the other eye.
+//     Read against the finished depth it is nearer on 17-31% of the pixels in
+//     three of the four captures, and empty in the fourth. Whether the camera
+//     test keeps it out of the window depends on when the frame's camera was
+//     uploaded, which was not established. A single read cannot have the problem.
+//   - The other scene-sized target the accumulation folds in held nothing in any
+//     read of any of them.
+//   - In the driving cockpit capture the game clears the main depth right AFTER
+//     the resolve, and every unbind from there on reads empty. That is what "the
+//     depth is gone by Present" was always seeing. The resolve is the last moment
+//     that is safe, and the moment the motion field reads the frame's velocity.
+//
+// So once a resolve has supplied a frame's depth, the next frame's unbinds only
+// note which texture is the scene's, and the resolve reads it. A frame with no
+// resolve -- TAA off, a screen without it -- simply supplies nothing, and the
+// frame after it accumulates as before, so TAA off behaves exactly as it did.
+std::atomic<bool> g_depthAtResolve{true};      // the setting; see depth_at_resolve()
+std::atomic<bool> g_resolveFeeds{false};       // the last frame's depth came from its resolve
+std::atomic<bool> g_resolveTook{false};        // this frame's has
+// The scene-sized depth this frame's last unbind left. Immediate context only,
+// like everything else about the capture. A raw pointer to the game's target,
+// so it is dropped at Present rather than carried across a frame.
+ID3D11Texture2D*  g_finishedDepth = nullptr;
+
+// What the copies cost. One timer takes any dispatch it has a free slot for, and
+// reads per frame times the mean is the frame's bill.
+GpuTimer          g_copyTimer;
+std::atomic<int>  g_copyDispatches{0};         // since the last report
 
 bool ensure_depth_copy(ID3D11Device* dev, const D3D11_TEXTURE2D_DESC& src)
 {
@@ -569,8 +616,18 @@ bool ensure_depth_copy(ID3D11Device* dev, const D3D11_TEXTURE2D_DESC& src)
 // declined for want of an input nothing was producing.
 bool depth_capture_wanted()
 {
-    return xr::dibr_shift_enabled() ||
-           (xr::warp_uses_6dof() && xr::warp_enabled());
+    return xr::dibr_shift_active() ||
+           (xr::warp_uses_6dof() && xr::warp_active());
+}
+
+// THE EYE OF THE RENDER IN PROGRESS, from the camera it is drawn with: the build
+// its Present will route, so the warp finds this depth under the eye it asks for.
+// The applied-eye record is only the newest build, which by the end of a frame
+// on the map, in the garage and on the menus already belongs to the next one.
+int rendering_eye(const xr::AppliedEye& ae)
+{
+    xr::RenderInfo ri;
+    return xr::render_in_progress(ri) ? ri.eye : (ae.valid ? ae.eye : -1);
 }
 
 void capture_if_pass_ended(ID3D11DeviceContext* ctx, ID3D11Texture2D* previouslyBound)
@@ -641,6 +698,10 @@ void capture_if_pass_ended(ID3D11DeviceContext* ctx, ID3D11Texture2D* previously
     // --- Phase 1 acquisition: copy for the last few scene-sized unbinds ---
     if (sceneSized) {
         const int idx = g_sceneTransIdx.fetch_add(1);
+        g_finishedDepth = previouslyBound;
+        // The resolve is supplying this frame's depth, or already has. After it
+        // the slot holds the frame's capture, and a window restart would wipe it.
+        if (g_resolveFeeds.load() || g_resolveTook.load()) return;
         g_scenePasses.fetch_add(1, std::memory_order_relaxed);
 
         // WHY THIS NO LONGER REFUSES ANYTHING, 2026-08-25.
@@ -688,8 +749,9 @@ void capture_if_pass_ended(ID3D11DeviceContext* ctx, ID3D11Texture2D* previously
         // partially-drawn passes cannot change the final result -- but it does
         // guarantee we can never miss the frame's real depth, which is what a
         // trailing window kept doing when it landed on cleared sources.
-        // Cost is the trade here (a dispatch per unbind); half-res accumulation
-        // is the obvious optimisation once this is proven correct.
+        // Cost is the trade here (a dispatch per unbind), which is why this only
+        // runs on frames the TAA resolve does not supply: see the note on
+        // g_resolveFeeds.
         if (idx >= 0) {
         ComPtr<ID3D11Device> dev;
         ctx->GetDevice(&dev);
@@ -761,9 +823,10 @@ void capture_if_pass_ended(ID3D11DeviceContext* ctx, ID3D11Texture2D* previously
                                     (camMove > kCamSpreadLimit);
 
             const xr::AppliedEye ae = xr::applied_eye();
+            const int   eye           = rendering_eye(ae);
             const bool  firstOfFrame  = !g_clearedThisFrame.exchange(true);
-            const bool  eyeChanged    = !firstOfFrame && ae.valid &&
-                                        (ae.eye != g_windowEye.load());
+            const bool  eyeChanged    = !firstOfFrame && eye >= 0 &&
+                                        (eye != g_windowEye.load());
             // Read ONCE and used for both the clear and the dispatch, so a swap
             // landing between them cannot split this capture across two slots.
             const int slot = g_captureSlot.load();
@@ -771,7 +834,7 @@ void capture_if_pass_ended(ID3D11DeviceContext* ctx, ID3D11Texture2D* previously
             if (firstOfFrame || eyeChanged || camJumped) {
                 const float zero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
                 ctx->ClearUnorderedAccessViewFloat(g_depthUAV[slot].Get(), zero);
-                g_windowEye.store(ae.valid ? ae.eye : -1);
+                g_windowEye.store(eye);
                 g_windowCamValid = false;
                 g_slotCaps[slot].store(0);
                 if (firstOfFrame) g_rsFirst.fetch_add(1);
@@ -791,7 +854,10 @@ void capture_if_pass_ended(ID3D11DeviceContext* ctx, ID3D11Texture2D* previously
             ctx->CSSetShader(g_csCopyDepth.Get(), nullptr, 0);
             ctx->CSSetShaderResources(0, 1, srvs);
             ctx->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+            g_copyTimer.begin(ctx);
             ctx->Dispatch((d.Width + 7) / 8, (d.Height + 7) / 8, 1);
+            g_copyTimer.end(ctx);
+            g_copyDispatches.fetch_add(1, std::memory_order_relaxed);
             ID3D11ShaderResourceView*  nsrv[1] = {nullptr};
             ID3D11UnorderedAccessView* nuav[1] = {nullptr};
             ctx->CSSetShaderResources(0, 1, nsrv);
@@ -803,7 +869,7 @@ void capture_if_pass_ended(ID3D11DeviceContext* ctx, ID3D11Texture2D* previously
             g_depthValid.store(true);
             // The eye this depth belongs to, carried alongside it so the warp
             // can refuse a colour/depth pair that came from different eyes.
-            g_depthEye.store(ae.valid ? ae.eye : -1);
+            g_depthEye.store(eye);
             g_depthEyeOffset.store(ae.offset);
         }
         }
@@ -954,6 +1020,72 @@ bool install_depth_probe(IDXGISwapChain* swapchain)
     return true;
 }
 
+void depth_capture_at_resolve(ID3D11DeviceContext* ctx)
+{
+    if (!ctx || !g_depthAtResolve.load() || !depth_capture_wanted()) return;
+    ID3D11Texture2D* const src = g_finishedDepth;
+    if (!src) return;
+
+    // Still bound to be written, it cannot also be read: leave this frame to the
+    // accumulation. Not seen in any capture (nothing is bound at the resolve).
+    ComPtr<ID3D11DepthStencilView> bound;
+    ctx->OMGetRenderTargets(0, nullptr, &bound);
+    if (bound && dsv_texture(bound.Get()) == src) return;
+
+    D3D11_TEXTURE2D_DESC d{};
+    src->GetDesc(&d);
+    ComPtr<ID3D11Device> dev;
+    ctx->GetDevice(&dev);
+    if (!dev || !ensure_copy_shader(dev.Get()) || !ensure_depth_copy(dev.Get(), d)) return;
+    ID3D11ShaderResourceView* const srcSRV = src_depth_srv(dev.Get(), src, d);
+    if (!srcSRV) return;
+
+    const xr::AppliedEye ae = xr::applied_eye();
+    const int eye = rendering_eye(ae);
+
+    // Mid-frame, and the game's resolve draw comes straight after, so unlike the
+    // accumulation this puts the compute stage back as it was.
+    ComPtr<ID3D11ComputeShader>       oldCs;
+    ComPtr<ID3D11ShaderResourceView>  oldSrv;
+    ComPtr<ID3D11UnorderedAccessView> oldUav;
+    ctx->CSGetShader(&oldCs, nullptr, nullptr);
+    ctx->CSGetShaderResources(0, 1, oldSrv.GetAddressOf());
+    ctx->CSGetUnorderedAccessViews(0, 1, oldUav.GetAddressOf());
+
+    const int slot = g_captureSlot.load();
+    ID3D11ShaderResourceView*  srvs[1] = {srcSRV};
+    ID3D11UnorderedAccessView* uavs[1] = {g_depthUAV[slot].Get()};
+    ctx->CSSetShader(g_csTakeDepth.Get(), nullptr, 0);
+    ctx->CSSetShaderResources(0, 1, srvs);
+    ctx->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+    g_copyTimer.begin(ctx);
+    ctx->Dispatch((d.Width + 7) / 8, (d.Height + 7) / 8, 1);
+    g_copyTimer.end(ctx);
+    g_copyDispatches.fetch_add(1, std::memory_order_relaxed);
+
+    ID3D11ShaderResourceView*  restoreSrv[1] = {oldSrv.Get()};
+    ID3D11UnorderedAccessView* restoreUav[1] = {oldUav.Get()};
+    ctx->CSSetUnorderedAccessViews(0, 1, restoreUav, nullptr);
+    ctx->CSSetShaderResources(0, 1, restoreSrv);
+    ctx->CSSetShader(oldCs.Get(), nullptr, 0);
+
+    g_slotCaps[slot].store(1);
+    g_capturedThisFrame.store(true);
+    g_depthValid.store(true);
+    g_depthEye.store(eye);
+    g_depthEyeOffset.store(ae.offset);
+    g_resolveTook.store(true);
+}
+
+bool depth_at_resolve() { return g_depthAtResolve.load(); }
+
+void set_depth_at_resolve(bool on)
+{
+    if (g_depthAtResolve.exchange(on) == on) return;
+    VRLOG("scene depth -> %s", on ? "read once a frame at the TAA resolve"
+                                  : "accumulated over every depth pass");
+}
+
 bool scene_depth_for_eye(int eye, SceneDepth& out)
 {
     out = SceneDepth{};
@@ -1091,7 +1223,7 @@ void depth_probe_on_present(IDXGISwapChain* swapchain)
     // detour runs on -- a use-after-free plus an unordered_map cleared under a
     // concurrent reader. The dispatches are already gated by
     // depth_capture_wanted(), which is where the real cost was; holding the
-    // texture while DIBR shift is inactive is a few tens of MB and is not worth a race.
+    // textures while DIBR shift is inactive is under 200 MB and is not worth a race.
     // Do not reinstate without moving the capture path behind the same lock.)
 
     // The main scene depth is identified by matching the render size, so the
@@ -1160,7 +1292,7 @@ void depth_probe_on_present(IDXGISwapChain* swapchain)
         const int otherPasses = g_otherCamPasses.exchange(0);
         const int scenePasses  = g_scenePasses.exchange(0);
         const uint32_t otherCams = hooks::non_main_camera_commits();
-        if (otherPasses || otherCams)
+        if (scenePasses && (otherPasses || otherCams))
             VRLOG("depth acquire: %d of %d scene-sized passes accumulated with "
                   "another camera as the last commit (%u non-main commits, first "
                   "at pass %d) -- observed, NOT refused",
@@ -1171,6 +1303,19 @@ void depth_probe_on_present(IDXGISwapChain* swapchain)
             VRLOG("depth acquire: %d/%d windows RESTARTED at an eye change "
                   "(kept current-eye captures instead of dropping the frame)",
                   restarts, total);
+
+        // What the warp's inputs and the warp cost the GPU, per frame that ran
+        // them. Negative is "not measured", which here means it did not run.
+        const int   reads    = g_copyDispatches.exchange(0);
+        const float readMs   = (std::max)(g_copyTimer.take_mean_ms(), 0.0f);
+        const float motionMs = (std::max)(motionfield::take_gpu_ms(), 0.0f);
+        const float warpMs   = (std::max)(reproject::take_gpu_ms(), 0.0f);
+        if (readMs > 0.0f || motionMs > 0.0f || warpMs > 0.0f) {
+            const float perFrame = (float)reads / (float)total;
+            VRLOG("GPU time: depth capture %.2f ms a frame (%.1f reads at %.3f ms), "
+                  "motion field %.2f ms, stale-eye warp %.2f ms", perFrame * readMs,
+                  perFrame, readMs, motionMs, warpMs);
+        }
     }
 
     // Carried to the report window: which pass index the non-main commit first
@@ -1181,13 +1326,6 @@ void depth_probe_on_present(IDXGISwapChain* swapchain)
 
     const int seen = g_sceneTransIdx.exchange(0);
     g_lastSceneTransCount.store(seen);
-    if (g_capturedThisFrame.load()) {
-        // Healthy: aim at the tail of what this frame actually did.
-        g_captureThreshold.store(seen > kCaptureTail ? seen - kCaptureTail : 0);
-    } else {
-        // Missed entirely -- the window was past the end. Widen and retry.
-        g_captureThreshold.store(g_captureThreshold.load() / 2);
-    }
     // PUBLISH THE SLOT JUST FILLED, then move capture on to the next one -- so
     // the clears the render thread is about to issue for the next frame land
     // somewhere no consumer is reading. (That much was the original fix for the
@@ -1242,6 +1380,8 @@ void depth_probe_on_present(IDXGISwapChain* swapchain)
     g_rsCamW.store(g_rsCam.exchange(0));
     g_capturedThisFrame.store(false);
     g_clearedThisFrame.store(false);
+    g_resolveFeeds.store(g_resolveTook.exchange(false));
+    g_finishedDepth = nullptr;
 }
 
 } // namespace hooks
