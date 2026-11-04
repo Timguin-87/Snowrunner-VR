@@ -1261,10 +1261,13 @@ void draw_advanced_tab()
                 "\n"
                 "In the warped eye: solid = the next render's own vectors, striped\n"
                 "/ = borrowed from a neighbour, striped \\ = its own motion from\n"
-                "the frame before, carried on. Magenta dots = nothing landed there\n"
-                "at all, so it shows the rotation-only image, a frame old: what\n"
-                "the last render could not see (beside the cab when you lean or\n"
-                "the truck moves, the edge of view when you turn) and the mirrors.");
+                "the frame before, corrected by the change measured further along\n"
+                "the same surface, striped across = that motion uncorrected, as\n"
+                "nothing on the surface was measured nearby. Magenta dots =\n"
+                "nothing landed there at all, so it shows the rotation-only image,\n"
+                "a frame old: what the last render could not see (beside the cab\n"
+                "when you lean or the truck moves, the edge of view when you turn)\n"
+                "and the mirrors.");
         if (mv && !xr::warp_uses_motion())
             ImGui::TextDisabled("Motion vectors: select the Motion vectors warp type");
     }

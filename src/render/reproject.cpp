@@ -84,16 +84,74 @@ uint2 depth_px(uint2 p)
 //    been, and the nearest one landed here -- if that is the surface this
 //    pixel shows (same depth, 3%), not one hidden behind it.
 // 2. This frame's own velocity buffer says something moving is here, but
-//    nothing landed on it -- a scatter gap, or a strip one eye sees and the
-//    other does not: a neighbour on the same surface.
-// 3. Still nothing: the surface's own last motion, carried one frame on.
-// 4. Static.
+//    nothing landed on it -- a scatter gap: a neighbour on the same surface.
+// 3. Wider than that -- a strip one eye sees and the other does not: the
+//    surface's own last motion, corrected by how much the motion has changed
+//    since, measured where the next render did see that surface
+//    (motion_change()).
+// 4. Nothing measured on that surface within reach: its own last motion,
+//    carried one frame on.
+// Otherwise static.
 static const int2 kNeighbour[8] = { int2(-1, -1), int2(0, -1), int2(1, -1), int2(-1, 0),
                                     int2(1, 0), int2(-1, 1), int2(0, 1), int2(1, 1) };
 
-// `how` says which of the four it was, for the overlay (motion_overlay.hpp):
-// the case's number, 0 for static.
-float3 motion_how(uint2 dp, float dHere, out uint how)
+bool is_glass(uint2 mp)
+{
+    return hasMirror > 0.5f && MirrorMask[mp] > 0.5f;
+}
+
+// CARRYING THE LAST MOTION ON ASSUMED THE TRUCK COVERS THE SAME DISTANCE EVERY
+// RENDER, and it does not. The game moves it by each frame's own time, and the
+// renders are not evenly spaced (about 80 a second in Tim's log), so the travel
+// varies from one render to the next: millimetres in a steady drive,
+// centimetres at a hitch or over a bump. In the cab that travel is nearly all
+// of the motion; the cab only keeps its place because the camera moved as far.
+// Last render's travel against this render's camera left a one-eye strip short
+// or long by the difference, which it showed one for one while the measured cab
+// beside it held still: the strip beside the dashboard flickering in a steady
+// drive (Tim, 2026-11-04). In dump 225855 f2 the dump's own first stall made it
+// extreme: the render before had moved the truck by 12.5 ms, this one by about
+// 40, so the strip lagged the cab by some 19 cm, came that much nearer and
+// landed across the door.
+//
+// So the change is measured: walk out from the pixel along its own surface
+// (depth continuous, 3% a step) to the first pixel the next render did see,
+// each of eight ways, and take that pixel's motion now less its own last
+// motion. On one rigid body that is the change in travel and turn, which holds
+// for the whole body, while the pixel's own last motion keeps whatever was its
+// own, an arm moving against the cab. Averaged over the ways that found one.
+static const int kWalkStep  = 3;    // depth texels
+static const int kWalkSteps = 32;   // 96 texels: a hand at 35 cm against the dashboard
+
+bool motion_change(uint2 dp, float dHere, out float3 change)
+{
+    change = float3(0.0f, 0.0f, 0.0f);
+    float n = 0.0f;
+    [loop] for (int k = 0; k < 8; ++k) {
+        float dLast = dHere;
+        [loop] for (int i = 1; i <= kWalkSteps; ++i) {
+            const int2 t = int2(dp) + kNeighbour[k] * (i * kWalkStep);
+            if (t.x < 0 || t.y < 0 || t.x >= (int)depthSize.x || t.y >= (int)depthSize.y) break;
+            if (is_glass(uint2(t))) break;
+            const float d = SrcDepth[uint2(t)].r;
+            if (abs(d - dLast) > 0.03f * dLast + 1.0e-7f) break;   // another surface
+            dLast = d;
+            const float4 o = MotionNext[uint2(t)];
+            if (o.w > 0.0f && abs(o.w - d) <= 0.03f * d + 1.0e-7f) {
+                const float4 own = MotionOwn[uint2(t)];
+                if (own.w > 0.5f) { change += o.xyz - own.xyz; n += 1.0f; }
+                break;
+            }
+        }
+    }
+    if (!(n > 0.5f)) return false;
+    change /= n;
+    return true;
+}
+
+// `how` says which case it was, for the overlay (motion_overlay.hpp): the
+// case's number, 0 for static. `walk` false leaves case 3 out.
+float3 motion_how(uint2 dp, float dHere, bool walk, out uint how)
 {
     how = 1u;
     const float tol = 0.03f * dHere + 1.0e-7f;
@@ -110,6 +168,9 @@ float3 motion_how(uint2 dp, float dHere, out uint how)
         if (on.w > 0.0f && abs(on.w - dHere) <= tol) return on.xyz;
     }
     how = 3u;
+    float3 change;
+    if (walk && motion_change(dp, dHere, change)) return own.xyz + change;
+    how = 4u;
     return own.xyz;
 }
 
@@ -130,11 +191,6 @@ float3 motion_how(uint2 dp, float dHere, out uint how)
 // the glass is left out as before.
 static const int2 kOut[4] = { int2(1, 0), int2(-1, 0), int2(0, 1), int2(0, -1) };
 
-bool is_glass(uint2 mp)
-{
-    return hasMirror > 0.5f && MirrorMask[mp] > 0.5f;
-}
-
 bool housing_motion(uint2 mp, float dGlass, out float3 m)
 {
     m = float3(0.0f, 0.0f, 0.0f);
@@ -146,8 +202,9 @@ bool housing_motion(uint2 mp, float dGlass, out float3 m)
             if (is_glass(uint2(t))) continue;
             const float d = SrcDepth[uint2(t)].r;
             if (abs(d - dGlass) <= 0.15f * dGlass) {
+                // No walk here: one for every glass pixel's housing is too many.
                 uint how;
-                const float3 hm = motion_how(uint2(t), d, how);
+                const float3 hm = motion_how(uint2(t), d, false, how);
                 if (how != 0u) { m += hm; n += 1.0f; }
             }
             break;
@@ -169,7 +226,7 @@ bool surface_motion(uint2 mp, float d, out float3 m, out uint how)
         ok = rotH0.w > 0.5f;
         if (ok) ok = housing_motion(mp, d, m);
     } else {
-        m = motion_how(mp, d, how);
+        m = motion_how(mp, d, true, how);
     }
     return ok;
 }

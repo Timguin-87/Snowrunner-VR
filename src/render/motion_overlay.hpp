@@ -16,12 +16,14 @@ struct ID3D11ShaderResourceView;
 //
 // TWO PLACES PAINT IT, with one encoding (kColourHlsl):
 //   - the WARPED eye, in reproject.cpp's resolve: every pixel by the motion it
-//     actually took. Solid: the next render's vectors put it there. Striped one
-//     way: a neighbour's were borrowed. Striped the other way: nothing landed on
-//     it, and its own motion from the frame before was carried on. Untinted:
-//     moved as static world. Magenta on every other pixel: no source pixel
-//     landed there at all, so it shows the rotation-only base, a frame old --
-//     a disocclusion, the edge of view after a turn, or a mirror.
+//     actually took. Solid: the next render's vectors put it there. Striped "/":
+//     a neighbour's were borrowed. Striped "\": nothing landed on it, so its own
+//     motion from the frame before, corrected by the change measured further
+//     along its surface. Striped across: the same uncorrected, nothing measured
+//     within reach. Untinted: moved as static world. Magenta on every other
+//     pixel: no source pixel landed there at all, so it shows the rotation-only
+//     base, a frame old -- a disocclusion, the edge of view after a turn, or a
+//     mirror.
 //   - the RENDERED eye, here: the render's own motion, which is the very motion
 //     the other eye's warp takes as "the next render's" this frame. So the
 //     overlay sits in both eyes at once rather than flickering between them.
@@ -33,8 +35,8 @@ namespace motionoverlay {
 // The shared encoding, prepended to both shaders. It defines
 //   float4 motion_colour(float2 px, uint how, uint2 at)
 // with px the motion on screen in pixels of the image (x right, y up), how 1 the
-// next render's own, 2 a neighbour's, 3 its own last one, and at the pixel, for
-// the stripes. Alpha included.
+// next render's own, 2 a neighbour's, 3 its own last one corrected, 4 its own
+// last one as it was, and at the pixel, for the stripes. Alpha included.
 extern const char kColourHlsl[];
 
 // Not saved: a debug view, off at every start.

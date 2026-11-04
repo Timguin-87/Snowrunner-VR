@@ -29,6 +29,7 @@ float4 motion_colour(float2 px, uint how, uint2 at)
     float a = 0.5;
     if (how == 2u && ((at.x + at.y) / 6u) % 2u == 1u) a = 0.0;
     if (how == 3u && ((at.x + 8192u - at.y) / 6u) % 2u == 1u) a = 0.0;
+    if (how == 4u && (at.y / 6u) % 2u == 1u) a = 0.0;
     return float4(lerp(float3(1.0, 1.0, 1.0), motion_hue(hue), sat), a);
 }
 )";
