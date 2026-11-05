@@ -1,5 +1,6 @@
 #include "render/dlss.hpp"
 #include "render/d3d11_state.hpp"
+#include "render/fsr.hpp"
 #include "render/mat4d.hpp"
 #include "render/sharpen.hpp"
 #include "hooks/cbuffer_hook.h"
@@ -24,12 +25,18 @@
 #include <nvsdk_ngx_helpers.h>
 #endif
 
+// THE PIPELINE is every method's -- the vectors, the depth, the pass-through,
+// the upscale at Present -- so it is in any build with one of them. Only the
+// calls that make the image are DLSS's or FSR's.
+#define SRVR_HAVE_UPSCALER (SRVR_HAVE_DLSS || SRVR_HAVE_FSR)
+
 using Microsoft::WRL::ComPtr;
 
 namespace dlss {
 namespace {
 
-std::atomic<int>   g_mode{kOff};
+std::atomic<int>   g_method{kMethodOff};
+std::atomic<int>   g_quality{kDlaa};
 std::atomic<bool>  g_flipY{false};
 std::atomic<int>   g_preset{kPresetDefault};
 std::atomic<float> g_sharpness{0.30f};   // config is authoritative
@@ -57,9 +64,10 @@ void set_status(const char* fmt, ...)
     ReleaseSRWLockExclusive(&g_statusLock);
 }
 
-#if SRVR_HAVE_DLSS
+#if SRVR_HAVE_UPSCALER
 
-// THE MOTION VECTORS DLSS WANTS: from each pixel back to where it was in THIS
+// THE MOTION VECTORS DLSS WANTS -- and FSR, which takes the same: from each
+// pixel back to where it was in THIS
 // EYE's last render. On a flat screen that is simply the previous frame; in VR
 // the frames alternate eyes, so every "previous" the game knows -- its velocity
 // buffer, its previous camera -- is the OTHER eye's render, and the vectors are
@@ -175,10 +183,12 @@ using mat4d::mul;
 using mat4d::inverse;
 using mat4d::relative_to;
 
+#if SRVR_HAVE_DLSS
 // NGX identifies a non-registered application by a project id plus "custom
 // engine". Any stable GUID will do; this one is ours.
 constexpr const char* kProjectId     = "3f6c2b1e-8a47-4d5e-9b2c-5e1d7a0c4f93";
 constexpr const char* kEngineVersion = "1.0";
+#endif
 
 // One render's record, for the next render's vectors.
 struct Rec {
@@ -205,10 +215,12 @@ struct Pending {
     float    jx = 0.0f, jy = 0.0f;  // its jitter, render pixels
     UINT     w = 0, h = 0;          // render size: its vectors, depth and frame
     UINT     outW = 0, outH = 0;    // the headset image
+    float    nearZ = 0.0f, farZ = 0.0f, vfov = 0.0f;   // its camera, for FSR
     Rec      x;                     // the render itself, for its eye's history
 };
 
 struct State {
+#if SRVR_HAVE_DLSS
     bool tried = false;             // NGX init attempted (once per device)
     bool ngxOk = false;
     ID3D11Device* dev = nullptr;    // the device NGX was initialised on, not owned
@@ -221,6 +233,13 @@ struct State {
     int  featPreset[2] = {-1, -1};
     int  featPq[2] = {-1, -1};
     bool featHdr[2] = {false, false};
+#endif
+    // The method's own start-up -- NGX, or FSR's D3D12 side -- last succeeded.
+    // Until it has, the "waiting for the game's TAA" line does not overwrite
+    // why it failed.
+    bool backendOk = false;
+    // When each eye was last upscaled, for FSR's frame time.
+    LARGE_INTEGER eyeUpscaledAt[2] = {};
 
     UINT texW = 0, texH = 0;
     ComPtr<ID3D11Texture2D>           mv;
@@ -248,6 +267,9 @@ struct State {
     // DLAA ran for the frame the coming Present shows: its result is in that
     // frame, so that is DLSS's image to sharpen. Cleared by on_present().
     bool dlaaThisFrame = false;
+    // The method is Off and the game's own TAA resolved that frame: it is what
+    // the sharpening works on then. Cleared by on_present() too.
+    bool taaThisFrame = false;
 
     // The unblended pass-through, for a resolve target the frame cannot simply
     // be copied into.
@@ -281,6 +303,7 @@ struct State {
     bool      lastVr = false;
 } g;
 
+#if SRVR_HAVE_DLSS
 std::wstring module_dir()
 {
     HMODULE self = nullptr;
@@ -376,6 +399,7 @@ void release_feature(int eye)
     g.featPq[eye] = -1;
     g.featHdr[eye] = false;
 }
+#endif // SRVR_HAVE_DLSS
 
 bool compile_cs(ID3D11Device* dev)
 {
@@ -528,7 +552,7 @@ bool ensure_upscale_textures(ID3D11Device* dev, DXGI_FORMAT bbFmt, UINT w, UINT 
     const DXGI_FORMAT of = uav_store_ok(dev, f) ? f : DXGI_FORMAT_R8G8B8A8_UNORM;
     if (!make_tex(dev, w, h, f, D3D11_BIND_SHADER_RESOURCE, g.upIn, nullptr, nullptr) ||
         !make_tex(dev, ow, oh, of, kSrvUav, g.upOut, nullptr, &g.upOutSrv)) {
-        VRLOG("DLSS: could not create the %ux%u -> %ux%u upscaling textures (format %d)",
+        VRLOG("upscaling: could not create the %ux%u -> %ux%u upscaling textures (format %d)",
               w, h, ow, oh, (int)f);
         set_status("could not create the upscaling textures");
         release_upscale_textures();
@@ -536,11 +560,12 @@ bool ensure_upscale_textures(ID3D11Device* dev, DXGI_FORMAT bbFmt, UINT w, UINT 
     }
     g.upFmt = f;
     g.upInW = w; g.upInH = h; g.upOutW = ow; g.upOutH = oh;
-    VRLOG("DLSS: upscaling textures %ux%u -> %ux%u (frame format %d, output %d)",
+    VRLOG("upscaling: textures %ux%u -> %ux%u (frame format %d, output %d)",
           w, h, ow, oh, (int)f, (int)of);
     return true;
 }
 
+#if SRVR_HAVE_DLSS
 NVSDK_NGX_PerfQuality_Value perf_quality(int m)
 {
     switch (m) {
@@ -643,6 +668,81 @@ bool ensure_feature(ID3D11DeviceContext* ctx, int eye, UINT w, UINT h, UINT ow, 
           hdr ? "HDR, auto exposure" : "LDR");
     return true;
 }
+#endif // SRVR_HAVE_DLSS
+
+// IS THE METHOD'S UPSCALER UP on this device: NGX for DLSS, the D3D12 side and
+// AMD's DLLs for FSR. Says why not in the panel.
+bool backend_ready(ID3D11Device* dev, int meth)
+{
+    bool ok = false;
+    if (meth == kMethodDlss) {
+#if SRVR_HAVE_DLSS
+        ok = ensure_ngx(dev);
+#else
+        set_status("not available: this build of the mod has no DLSS");
+#endif
+    } else if (meth == kMethodFsr3 || meth == kMethodFsr4) {
+        ok = fsr::ensure(dev);
+        if (!ok) set_status("not available: %s", fsr::why());
+    }
+    g.backendOk = ok;
+    return ok;
+}
+
+// ONE EYE'S UPSCALER for a shape of work -- a DLSS feature, an FSR context --
+// made when anything differs, which empties that eye's history: then `created`
+// is set and the eye has no last render to build vectors against.
+bool ensure_eye(ID3D11DeviceContext* ctx, int meth, int eye, UINT w, UINT h, UINT ow, UINT oh,
+                int qualityMode, bool hdr, bool* created)
+{
+    if (created) *created = false;
+    if (meth == kMethodDlss) {
+#if SRVR_HAVE_DLSS
+        return ensure_feature(ctx, eye, w, h, ow, oh, perf_quality(qualityMode), hdr, created);
+#else
+        (void)ctx; (void)qualityMode;
+        return false;
+#endif
+    }
+    bool made = false;
+    if (!fsr::ensure_context(eye, meth == kMethodFsr4 ? 4 : 3, w, h, ow, oh, hdr, &made)) {
+        set_status("FSR did not start at %ux%u -> %ux%u: %s", w, h, ow, oh, fsr::why());
+        return false;
+    }
+    if (made) {
+        g.lastOfEye[eye] = Rec{};   // its history starts here
+        if (created) *created = true;
+    }
+    return true;
+}
+
+// Milliseconds since this eye was last upscaled -- FSR's frame time, which is
+// the eye's own: under AER each eye is upscaled every other frame.
+float eye_frame_ms(int eye)
+{
+    static LARGE_INTEGER freq{};
+    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    LARGE_INTEGER& last = g.eyeUpscaledAt[eye & 1];
+    const double ms = last.QuadPart ? 1000.0 * double(now.QuadPart - last.QuadPart) /
+                                          double(freq.QuadPart)
+                                    : 0.0;
+    last = now;
+    return (ms > 0.0 && ms < 1000.0) ? (float)ms : 0.0f;
+}
+
+// The method as it names itself in the panel and the log: "DLSS", or the FSR
+// version this eye actually runs ("FSR 4.1.2").
+const char* running_name(int meth, int eye)
+{
+    if (meth == kMethodDlss) return "DLSS";
+    static thread_local char buf[64];
+    const char* v = fsr::version_name(eye);
+    if (!v || !*v) return meth == kMethodFsr4 ? "FSR 4" : "FSR 3";
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE, (*v >= '0' && *v <= '9') ? "FSR %s" : "%s", v);
+    return buf;
+}
 
 // THE FRAME WITHOUT ITS TAA BLEND: the resolve's input straight into its
 // output. DLSS wants the raw jittered image, and when it upscales it gets it at
@@ -741,6 +841,7 @@ struct Camera {
     M4     vpJ, vpU, vpPrevGame;
     double cam[3];
     double jx, jy;   // NDC
+    float  nearZ, farZ, vfov;   // metres, metres, radians -- for FSR 3's depth tests
 };
 
 bool read_camera(Camera& c)
@@ -764,6 +865,18 @@ bool read_camera(Camera& c)
     }
     // camera position: the inverse view's translation
     c.cam[0] = invV.m[3]; c.cam[1] = invV.m[7]; c.cam[2] = invV.m[11];
+    // Near, far and the vertical FOV, from the same projection. Depth is
+    // A + B / z with A and B its z row over its w row -- reversed, so 1 at the
+    // near plane and 0 at the far one, A = 0 for no far plane at all. Only FSR 3
+    // reads these, for its depth tests; anything implausible gets the game's
+    // usual 0.5 and 3500.
+    const double A = P.m[10] / w32, B = P.m[11] / w32;
+    double n = std::fabs(1.0 - A) > 1e-9 ? std::fabs(B / (1.0 - A)) : 0.0;
+    double f = std::fabs(A) > 1e-12 ? std::fabs(B / A) : 1.0e6;
+    if (!(n > 1e-4 && f > n)) { n = 0.5; f = 3500.0; }
+    c.nearZ = (float)n;
+    c.farZ  = (float)f;
+    c.vfov  = std::fabs(P.m[5]) > 1e-9 ? (float)(2.0 * std::atan(std::fabs(w32 / P.m[5]))) : 1.0f;
     return true;
 }
 
@@ -776,51 +889,100 @@ void note_jitter(float jx, float jy)
     if (jy > g.jyMax) g.jyMax = jy;
 }
 
-#endif // SRVR_HAVE_DLSS
+#endif // SRVR_HAVE_UPSCALER
 
 } // namespace
 
 namespace {
 struct ModeInfo { const char* key; const char* name; double scale; };
-// The render scale per side: NVIDIA's own ratios for each mode.
+// The render scale per side: NVIDIA's own ratios for each mode. FSR takes them
+// as they are -- AMD's own are within a percent, and FSR upscales from whatever
+// size it is handed.
 constexpr ModeInfo kModes[kModeCount] = {
     {"off",              "Off",               1.0},
-    {"dlaa",             "DLAA",              1.0},
+    {"native",           "DLAA",              1.0},
     {"quality",          "Quality",           2.0 / 3.0},
     {"balanced",         "Balanced",          0.58},
     {"performance",      "Performance",       0.5},
     {"ultraperformance", "Ultra Performance", 1.0 / 3.0},
+};
+struct MethodInfo { const char* key; const char* name; };
+constexpr MethodInfo kMethods[kMethodCount] = {
+    {"off", "Off"}, {"dlss", "DLSS"}, {"fsr3", "FSR 3"}, {"fsr4", "FSR 4"},
 };
 struct PresetInfo { int value; const char* key; };
 constexpr PresetInfo kPresets[] = {
     {kPresetDefault, "default"}, {kPresetJ, "J"}, {kPresetK, "K"}, {kPresetL, "L"},
     {kPresetM, "M"},
 };
+bool is_fsr(int meth) { return meth == kMethodFsr3 || meth == kMethodFsr4; }
 } // namespace
 
-int  mode() { return g_mode.load(); }
-bool mode_available(int m) { return m >= 0 && m < kModeCount; }
-bool is_upscaling(int m) { return m >= kQuality && m < kModeCount; }
-void set_mode(int m)
+int  method() { return g_method.load(); }
+bool method_compiled_in(int m)
 {
-    if (m < 0 || m >= kModeCount) m = kOff;
-    if (g_mode.exchange(m) == m) return;
-    if (m == kOff)       VRLOG("DLSS -> off");
-    else if (m == kDlaa) VRLOG("DLSS -> DLAA (in place of the game's TAA resolve)");
-    else                 VRLOG("DLSS -> %s (upscaling: sets the game's render size)",
-                               kModes[m].name);
-    g_modeChanged.store(true);
-    if (m == kOff) set_status("off");
+    switch (m) {
+    case kMethodOff:  return true;
+    case kMethodDlss: return SRVR_HAVE_DLSS != 0;
+    case kMethodFsr3:
+    case kMethodFsr4: return fsr::compiled_in();
+    default:          return false;
+    }
 }
-void on_resized() { g_modeChanged.store(true); }
-const char* mode_name(int m) { return (m >= 0 && m < kModeCount) ? kModes[m].name : "?"; }
-const char* mode_key(int m)  { return (m >= 0 && m < kModeCount) ? kModes[m].key : "off"; }
-bool mode_from_key(const char* key, int& out)
+void set_method(int m)
+{
+    if (m < 0 || m >= kMethodCount || !method_compiled_in(m)) m = kMethodOff;
+    if (g_method.exchange(m) == m) return;
+    if (m == kMethodOff)
+        VRLOG("UPSCALING -> off (the game's own TAA)");
+    else
+        VRLOG("UPSCALING -> %s %s%s", kMethods[m].name, mode_name(g_quality.load()),
+              is_upscaling(g_quality.load()) ? " (upscaling: sets the game's render size)"
+                                              : " (in place of the game's TAA resolve)");
+    if (is_fsr(m)) fsr::retry();   // the DLLs may be there now
+    g_modeChanged.store(true);
+    set_status(m == kMethodOff ? "off" : "starting");
+}
+const char* method_name(int m) { return (m >= 0 && m < kMethodCount) ? kMethods[m].name : "?"; }
+const char* method_key(int m)  { return (m >= 0 && m < kMethodCount) ? kMethods[m].key : "off"; }
+bool method_from_key(const char* key, int& out)
 {
     if (!key) return false;
-    for (int m = 0; m < kModeCount; ++m)
-        if (_stricmp(key, kModes[m].key) == 0) { out = m; return true; }
+    for (int m = 0; m < kMethodCount; ++m)
+        if (_stricmp(key, kMethods[m].key) == 0) { out = m; return true; }
     return false;
+}
+
+int  quality() { return g_quality.load(); }
+void set_quality(int q)
+{
+    if (q < kDlaa || q >= kModeCount) q = kDlaa;
+    if (g_quality.exchange(q) == q) return;
+    const int meth = g_method.load();
+    if (meth != kMethodOff)
+        VRLOG("UPSCALING -> %s %s%s", kMethods[meth].name, mode_name(q),
+              is_upscaling(q) ? " (upscaling: sets the game's render size)"
+                              : " (in place of the game's TAA resolve)");
+    g_modeChanged.store(true);
+}
+const char* quality_key(int q) { return (q >= kDlaa && q < kModeCount) ? kModes[q].key : "native"; }
+bool quality_from_key(const char* key, int& out)
+{
+    if (!key) return false;
+    // DLSS's own word for native, and what the old DLSS= key wrote.
+    if (_stricmp(key, "dlaa") == 0) { out = kDlaa; return true; }
+    for (int q = kDlaa; q < kModeCount; ++q)
+        if (_stricmp(key, kModes[q].key) == 0) { out = q; return true; }
+    return false;
+}
+
+int  mode() { return g_method.load() == kMethodOff ? (int)kOff : g_quality.load(); }
+bool is_upscaling(int m) { return m >= kQuality && m < kModeCount; }
+void on_resized() { g_modeChanged.store(true); }
+const char* mode_name(int m)
+{
+    if (m == kDlaa && is_fsr(g_method.load())) return "Native AA";
+    return (m >= 0 && m < kModeCount) ? kModes[m].name : "?";
 }
 
 void render_size_for(int m, int outW, int outH, int& rw, int& rh)
@@ -862,7 +1024,7 @@ bool preset_from_key(const char* key, int& out)
 
 bool compiled_in()
 {
-#if SRVR_HAVE_DLSS
+#if SRVR_HAVE_UPSCALER
     return true;
 #else
     return false;
@@ -885,8 +1047,8 @@ bool jitter_flip_y() { return g_flipY.load(); }
 void set_jitter_flip_y(bool on)
 {
     if (g_flipY.exchange(on) != on) {
-        VRLOG("DLSS: vertical jitter sign %s", on ? "FLIPPED (debug)" : "as derived");
-#if SRVR_HAVE_DLSS
+        VRLOG("UPSCALING: vertical jitter sign %s", on ? "FLIPPED (debug)" : "as derived");
+#if SRVR_HAVE_UPSCALER
         g.resetAll = true;
 #endif
     }
@@ -894,12 +1056,16 @@ void set_jitter_flip_y(bool on)
 
 bool replace_taa_resolve(ID3D11DeviceContext* ctx, unsigned vertexCount)
 {
-#if !SRVR_HAVE_DLSS
+#if !SRVR_HAVE_UPSCALER
     (void)ctx; (void)vertexCount;
     return false;
 #else
-    const int selected = g_mode.load();
-    if (selected == kOff || !ctx || vertexCount != 3) return false;
+    const int meth = g_method.load();
+    const int selected = mode();
+    if (!ctx || vertexCount != 3) return false;
+    // Off: the game's own TAA draws, and the frame it finishes is what the
+    // sharpening works on (image_for_present()).
+    if (selected == kOff) { g.taaThisFrame = true; return false; }
 
     // What the game bound for its resolve: t0 colour, t2 depth, t3 velocity.
     ID3D11ShaderResourceView* srvRaw[4] = {};
@@ -994,7 +1160,7 @@ bool replace_taa_resolve(ID3D11DeviceContext* ctx, unsigned vertexCount)
 
     ComPtr<ID3D11Device> dev;
     ctx->GetDevice(&dev);
-    if (!ensure_ngx(dev.Get())) return false;
+    if (!backend_ready(dev.Get(), meth)) return false;
     if (!compile_cs(dev.Get())) { set_status("motion vector shader failed"); return false; }
     if (!ensure_textures(dev.Get(), w, h)) return false;
     if (!upscale && !ensure_dlaa_target(dev.Get(), w, h, od.Format)) return false;
@@ -1010,11 +1176,10 @@ bool replace_taa_resolve(ID3D11DeviceContext* ctx, unsigned vertexCount)
     saved.capture(ctx);
     const bool wasSelf = hooks::set_self_render(true);
 
-    // DLAA: first, so that a feature created just now -- its history empty --
-    // is seen below as an eye with no last render. Upscaling creates its
-    // feature at Present, and resets it there when it is new.
-    bool ok = upscale ||
-              ensure_feature(ctx, eye, w, h, w, h, NVSDK_NGX_PerfQuality_Value_DLAA, true);
+    // NATIVE: first, so that a feature or context created just now -- its
+    // history empty -- is seen below as an eye with no last render. Upscaling
+    // creates its own at Present, and resets it there when it is new.
+    bool ok = upscale || ensure_eye(ctx, meth, eye, w, h, w, h, kDlaa, true, nullptr);
 
     // Y: the game's previous frame. Z: this eye's last render DLSS has seen --
     // when upscaling, the last one evaluated at a Present. A record is only
@@ -1080,22 +1245,59 @@ bool replace_taa_resolve(ID3D11DeviceContext* ctx, unsigned vertexCount)
             if (!ok) set_status("could not pass the frame through the TAA -- game TAA "
                                 "left running");
         } else {
-            // 2. DLSS for this eye, into our own UAV-capable copy of the TAA target.
-            NVSDK_NGX_D3D11_DLSS_Eval_Params ep{};
-            ep.Feature.pInColor  = colourRes.Get();
-            ep.Feature.pInOutput = g.out.Get();
-            ep.pInDepth          = g.depth[slot].Get();
-            ep.pInMotionVectors  = g.mv.Get();
-            ep.InJitterOffsetX   = (float)jxPx;
-            ep.InJitterOffsetY   = (float)(g_flipY.load() ? -jyPx : jyPx);
-            ep.InRenderSubrectDimensions.Width  = w;
-            ep.InRenderSubrectDimensions.Height = h;
-            ep.InReset           = (mode == 2) ? 1 : 0;
-            ep.InMVScaleX        = 1.0f;
-            ep.InMVScaleY        = 1.0f;
-            const NVSDK_NGX_Result r =
-                NGX_D3D11_EVALUATE_DLSS_EXT(ctx, g.feature[eye], g.params, &ep);
-            ok = NVSDK_NGX_SUCCEED(r);
+            // 2. The method for this eye, into our own UAV-capable copy of the
+            // TAA target.
+            if (meth == kMethodDlss) {
+#if SRVR_HAVE_DLSS
+                NVSDK_NGX_D3D11_DLSS_Eval_Params ep{};
+                ep.Feature.pInColor  = colourRes.Get();
+                ep.Feature.pInOutput = g.out.Get();
+                ep.pInDepth          = g.depth[slot].Get();
+                ep.pInMotionVectors  = g.mv.Get();
+                ep.InJitterOffsetX   = (float)jxPx;
+                ep.InJitterOffsetY   = (float)(g_flipY.load() ? -jyPx : jyPx);
+                ep.InRenderSubrectDimensions.Width  = w;
+                ep.InRenderSubrectDimensions.Height = h;
+                ep.InReset           = (mode == 2) ? 1 : 0;
+                ep.InMVScaleX        = 1.0f;
+                ep.InMVScaleY        = 1.0f;
+                const NVSDK_NGX_Result r =
+                    NGX_D3D11_EVALUATE_DLSS_EXT(ctx, g.feature[eye], g.params, &ep);
+                ok = NVSDK_NGX_SUCCEED(r);
+                if (!ok && g.failures++ < 5) {
+                    VRLOG("DLSS: evaluate FAILED (0x%08X) -- the game's TAA draws instead",
+                          (unsigned)r);
+                    set_status("evaluate failed (0x%08X)", (unsigned)r);
+                }
+#else
+                ok = false;
+#endif
+            } else {
+                // FSR's native AA: the same inputs, HDR before the tonemapper
+                // exactly as DLAA takes them.
+                fsr::Eval e;
+                e.eye     = eye;
+                e.colour  = colourTex.Get();
+                e.depth   = g.depth[slot].Get();
+                e.motion  = g.mv.Get();
+                e.output  = g.out.Get();
+                e.w = e.ow = w;
+                e.h = e.oh = h;
+                e.jitterX = (float)jxPx;
+                e.jitterY = (float)(g_flipY.load() ? -jyPx : jyPx);
+                e.reset   = (mode == 2);
+                e.hdr     = true;
+                e.nearZ   = cam.nearZ;
+                e.farZ    = cam.farZ;
+                e.vfovRad = cam.vfov;
+                e.frameMs = eye_frame_ms(eye);
+                ok = fsr::evaluate(ctx, e);
+                if (!ok && g.failures++ < 5) {
+                    VRLOG("FSR: native AA FAILED -- the game's TAA draws instead (%s)",
+                          fsr::why());
+                    set_status("FSR failed: %s", fsr::why());
+                }
+            }
             if (ok) {
                 g.lastEval = now;
                 ++g.frames;
@@ -1106,10 +1308,6 @@ bool replace_taa_resolve(ID3D11DeviceContext* ctx, unsigned vertexCount)
                 // post-processing buffer comes next.
                 ctx->OMSetRenderTargets(0, nullptr, nullptr);
                 ctx->CopyResource(outRes.Get(), g.out.Get());
-            } else if (g.failures++ < 5) {
-                VRLOG("DLSS: evaluate FAILED (0x%08X) -- the game's TAA draws instead",
-                      (unsigned)r);
-                set_status("evaluate failed (0x%08X)", (unsigned)r);
             }
         }
     }
@@ -1149,34 +1347,40 @@ bool replace_taa_resolve(ID3D11DeviceContext* ctx, unsigned vertexCount)
         p.jy = (float)jyPx;
         p.w = w; p.h = h;
         p.outW = outW; p.outH = outH;
+        p.nearZ = cam.nearZ; p.farZ = cam.farZ; p.vfov = cam.vfov;
         p.x = x;
         ++g.passes;
     }
 
     if (!ok) return false;
     if (!upscale) {
+        // DLAA, or FSR's native AA by the version this eye runs.
+        char nat[80];
+        if (meth == kMethodDlss) strcpy_s(nat, "DLAA");
+        else _snprintf_s(nat, sizeof(nat), _TRUNCATE, "%s native AA", running_name(meth, eye));
         if (is_upscaling(selected) && g.upBroken)
-            set_status("upscaling failed (see the log) -- DLAA at %ux%u instead", w, h);
+            set_status("upscaling failed (see the log) -- %s at %ux%u instead", nat, w, h);
         else if (is_upscaling(selected) && !vr)
-            set_status("DLAA at %ux%u -- upscaling is for VR only", w, h);
+            set_status("%s at %ux%u -- upscaling is for VR only", nat, w, h);
         else if (is_upscaling(selected) && gridOff)
-            set_status("DLAA at %ux%u per eye -- the frame is not the render size, see "
-                       "the log", w, h);
+            set_status("%s at %ux%u per eye -- the frame is not the render size, see "
+                       "the log", nat, w, h);
         else if (is_upscaling(selected))
-            set_status("DLAA at %ux%u per eye -- %s %s", w, h, kModes[selected].name,
+            set_status("%s at %ux%u per eye -- %s %s", nat, w, h, mode_name(selected),
                        hooks::live_resize_available() ? "is being applied" : "takes a restart");
         else if (upCanvas)
-            set_status("DLAA at %ux%u per eye, stretched to %ux%u -- full size %s", w, h, outW,
-                       outH, hooks::live_resize_available() ? "in a moment" : "after a restart");
+            set_status("%s at %ux%u per eye, stretched to %ux%u -- full size %s", nat, w, h,
+                       outW, outH,
+                       hooks::live_resize_available() ? "in a moment" : "after a restart");
         else
-            set_status(vr ? "DLAA running at %ux%u per eye" : "DLAA running at %ux%u", w, h);
+            set_status(vr ? "%s running at %ux%u per eye" : "%s running at %ux%u", nat, w, h);
     }
     return true;
 #endif
 }
 
-#if SRVR_HAVE_DLSS
-// UPSCALING, at Present: DLSS's image of the frame in `backbuffer` at the
+#if SRVR_HAVE_UPSCALER
+// UPSCALING, at Present: the method's image of the frame in `backbuffer` at the
 // headset size, or null -- not upscaling, or nothing to upscale this frame.
 static ID3D11Texture2D* upscale(ID3D11DeviceContext* ctx, ID3D11Texture2D* backbuffer, int eye)
 {
@@ -1185,7 +1389,8 @@ static ID3D11Texture2D* upscale(ID3D11DeviceContext* ctx, ID3D11Texture2D* backb
     p.valid = false;
     // Made for an earlier Present: that frame was never routed to an eye.
     if (p.present != g.presentCount) { ++g.notShown; return nullptr; }
-    if (!ctx || !backbuffer || g_mode.load() == kOff) return nullptr;
+    const int meth = g_method.load();
+    if (!ctx || !backbuffer || meth == kMethodOff) return nullptr;
     D3D11_TEXTURE2D_DESC bd{};
     backbuffer->GetDesc(&bd);
     if (bd.Width != p.w || bd.Height != p.h || bd.SampleDesc.Count != 1) {
@@ -1197,6 +1402,8 @@ static ID3D11Texture2D* upscale(ID3D11DeviceContext* ctx, ID3D11Texture2D* backb
 
     ComPtr<ID3D11Device> dev;
     ctx->GetDevice(&dev);
+    // A method picked since this frame's TAA resolve has not had its backend started.
+    if (!backend_ready(dev.Get(), meth)) return nullptr;
     if (!ensure_upscale_textures(dev.Get(), bd.Format, p.w, p.h, p.outW, p.outH)) {
         g.upBroken = true;
         return nullptr;
@@ -1205,40 +1412,65 @@ static ID3D11Texture2D* upscale(ID3D11DeviceContext* ctx, ID3D11Texture2D* backb
     // The quality mode the game is sized for: what matches the render size, until
     // a mode picked since has been applied.
     const int sizedMode = hooks::upscale_mode_applied();
-    const int pqMode = is_upscaling(sizedMode) ? sizedMode : g_mode.load();
+    const int pqMode = is_upscaling(sizedMode) ? sizedMode : mode();
 
     D3D11StateBackup saved;
     saved.capture(ctx);
     // Inside Present's own bracket, so it goes back to that rather than off.
     const bool wasSelf = hooks::set_self_render(true);
     bool created = false;
-    bool ok = ensure_feature(ctx, p.eye, p.w, p.h, p.outW, p.outH, perf_quality(pqMode), false,
-                             &created);
+    bool ok = ensure_eye(ctx, meth, p.eye, p.w, p.h, p.outW, p.outH, pqMode, false, &created);
     if (ok) {
         ctx->CopyResource(g.upIn.Get(), backbuffer);
-        NVSDK_NGX_D3D11_DLSS_Eval_Params ep{};
-        ep.Feature.pInColor  = g.upIn.Get();
-        ep.Feature.pInOutput = g.upOut.Get();
-        ep.pInDepth          = g.depth[p.x.slot].Get();
-        ep.pInMotionVectors  = g.mv.Get();
-        ep.InJitterOffsetX   = p.jx;
-        ep.InJitterOffsetY   = g_flipY.load() ? -p.jy : p.jy;
-        ep.InRenderSubrectDimensions.Width  = p.w;
-        ep.InRenderSubrectDimensions.Height = p.h;
-        // A feature created just now has no history to keep.
-        ep.InReset           = (p.vecMode == 2 || created) ? 1 : 0;
-        ep.InMVScaleX        = 1.0f;
-        ep.InMVScaleY        = 1.0f;
-        const NVSDK_NGX_Result r =
-            NGX_D3D11_EVALUATE_DLSS_EXT(ctx, g.feature[p.eye], g.params, &ep);
-        ok = NVSDK_NGX_SUCCEED(r);
-        if (!ok) {
-            if (g.failures++ < 5)
-                VRLOG("DLSS: upscaling evaluate FAILED (0x%08X)", (unsigned)r);
-            set_status("upscaling evaluate failed (0x%08X)", (unsigned)r);
-            // Not for ever: the frames it should have upscaled are unblended.
-            if (++g.upFailRun >= 10) g.upBroken = true;
+        if (meth == kMethodDlss) {
+#if SRVR_HAVE_DLSS
+            NVSDK_NGX_D3D11_DLSS_Eval_Params ep{};
+            ep.Feature.pInColor  = g.upIn.Get();
+            ep.Feature.pInOutput = g.upOut.Get();
+            ep.pInDepth          = g.depth[p.x.slot].Get();
+            ep.pInMotionVectors  = g.mv.Get();
+            ep.InJitterOffsetX   = p.jx;
+            ep.InJitterOffsetY   = g_flipY.load() ? -p.jy : p.jy;
+            ep.InRenderSubrectDimensions.Width  = p.w;
+            ep.InRenderSubrectDimensions.Height = p.h;
+            // A feature created just now has no history to keep.
+            ep.InReset           = (p.vecMode == 2 || created) ? 1 : 0;
+            ep.InMVScaleX        = 1.0f;
+            ep.InMVScaleY        = 1.0f;
+            const NVSDK_NGX_Result r =
+                NGX_D3D11_EVALUATE_DLSS_EXT(ctx, g.feature[p.eye], g.params, &ep);
+            ok = NVSDK_NGX_SUCCEED(r);
+            if (!ok) {
+                if (g.failures++ < 5)
+                    VRLOG("DLSS: upscaling evaluate FAILED (0x%08X)", (unsigned)r);
+                set_status("upscaling evaluate failed (0x%08X)", (unsigned)r);
+            }
+#else
+            ok = false;
+#endif
+        } else {
+            fsr::Eval e;
+            e.eye     = p.eye;
+            e.colour  = g.upIn.Get();
+            e.depth   = g.depth[p.x.slot].Get();
+            e.motion  = g.mv.Get();
+            e.output  = g.upOut.Get();
+            e.w = p.w;     e.h = p.h;
+            e.ow = p.outW; e.oh = p.outH;
+            e.jitterX = p.jx;
+            e.jitterY = g_flipY.load() ? -p.jy : p.jy;
+            // A context created just now has no history to keep.
+            e.reset   = (p.vecMode == 2 || created);
+            e.hdr     = false;
+            e.nearZ   = p.nearZ;
+            e.farZ    = p.farZ;
+            e.vfovRad = p.vfov;
+            e.frameMs = eye_frame_ms(p.eye);
+            ok = fsr::evaluate(ctx, e);
+            if (!ok) set_status("FSR upscaling failed: %s", fsr::why());
         }
+        // Not for ever: the frames it should have upscaled are unblended.
+        if (!ok && ++g.upFailRun >= 10) g.upBroken = true;
     } else {
         g.upBroken = true;   // no feature: the game's frames stop being passed through
     }
@@ -1251,22 +1483,23 @@ static ID3D11Texture2D* upscale(ID3D11DeviceContext* ctx, ID3D11Texture2D* backb
     g.lastEval = GetTickCount64();
     ++g.frames;
     ++g.perEye[p.eye];
-    const int selected = g_mode.load();
+    const int selected = mode();
+    const char* who = running_name(meth, p.eye);
     if (is_upscaling(selected) && selected != pqMode)
-        set_status("%s: %ux%u -> %ux%u per eye -- %s %s", kModes[pqMode].name, p.w, p.h, p.outW,
-                   p.outH, kModes[selected].name,
+        set_status("%s %s: %ux%u -> %ux%u per eye -- %s %s", who, mode_name(pqMode), p.w, p.h,
+                   p.outW, p.outH, mode_name(selected),
                    hooks::live_resize_available() ? "is being applied" : "takes a restart");
     else
-        set_status("%s: %ux%u -> %ux%u per eye", kModes[pqMode].name, p.w, p.h, p.outW,
+        set_status("%s %s: %ux%u -> %ux%u per eye", who, mode_name(pqMode), p.w, p.h, p.outW,
                    p.outH);
     return g.upOut.Get();
 }
-#endif // SRVR_HAVE_DLSS
+#endif // SRVR_HAVE_UPSCALER
 
 ID3D11Texture2D* image_for_present(ID3D11DeviceContext* ctx, ID3D11Texture2D* backbuffer,
                                    int eye)
 {
-#if !SRVR_HAVE_DLSS
+#if !SRVR_HAVE_UPSCALER
     (void)ctx; (void)backbuffer; (void)eye;
     return nullptr;
 #else
@@ -1274,9 +1507,12 @@ ID3D11Texture2D* image_for_present(ID3D11DeviceContext* ctx, ID3D11Texture2D* ba
     // Ours, so the sharpening can read it through a view of its own; the
     // backbuffer it has to copy.
     ID3D11ShaderResourceView* view = img ? g.upOutSrv.Get() : nullptr;
-    // DLAA: DLSS's image IS the frame by now, through the game's own
-    // tonemapping -- the space the sharpening is meant for.
-    if (!img && g.dlaaThisFrame && backbuffer && g_mode.load() != kOff) img = backbuffer;
+    // NATIVE AA: the method's image IS the frame by now, through the game's own
+    // tonemapping -- the space the sharpening is meant for. And with the method
+    // Off, the frame the game's own TAA finished.
+    const bool off = mode() == kOff;
+    if (!img && backbuffer && ((!off && g.dlaaThisFrame) || (off && g.taaThisFrame)))
+        img = backbuffer;
     if (!img) return nullptr;
     const float amount = g_sharpness.load();
     if (!(amount > 0.0f)) {
@@ -1293,49 +1529,64 @@ ID3D11Texture2D* image_for_present(ID3D11DeviceContext* ctx, ID3D11Texture2D* ba
 
 void on_present()
 {
-#if SRVR_HAVE_DLSS
+#if SRVR_HAVE_UPSCALER
     // A render's upscale belongs to the Present it was made before; from here
     // on it is a frame that was not shown (see upscale()). Its DLAA too.
     ++g.presentCount;
     g.dlaaThisFrame = false;
-    if (g_mode.load() == kOff && (g.feature[0] || g.feature[1] || g.upOut)) {
+    g.taaThisFrame = false;
+    const int meth = g_method.load();
+    // What the method in use does not need goes: the other method's per-eye
+    // state, and everything but the sharpening once the method is Off -- with
+    // the sharpening still running on the game's own TAA then.
+#if SRVR_HAVE_DLSS
+    if (meth != kMethodDlss && (g.feature[0] || g.feature[1])) {
         release_feature(0);
         release_feature(1);
+        VRLOG("DLSS: released (not in use)");
+    }
+#endif
+    if (!is_fsr(meth)) fsr::release();
+    if (meth == kMethodOff && (g.mv || g.upOut)) {
         release_textures();
-        sharpen::release();
-        VRLOG("DLSS: released (off)");
+        VRLOG("UPSCALING: released (off)");
     }
     static ULONGLONG t0 = 0;
     const ULONGLONG now = GetTickCount64();
     if (!t0) t0 = now;
     // Nothing to take over: the resolve has not drawn for a while. Either the
     // game's TAA is off -- the usual reason -- or no 3D scene is up (menus,
-    // loading). Said in the panel rather than leaving it looking idle.
+    // loading). Said in the panel rather than leaving it looking idle -- but
+    // never over why the method failed to start.
     static ULONGLONG onSince = 0;
-    if (g_mode.load() == kOff) onSince = 0;
+    if (meth == kMethodOff) onSince = 0;
     else if (!onSince) onSince = now;
     if (onSince && now - onSince > 2000 && (!g.lastEval || now - g.lastEval > 2000) &&
-        (!g.tried || g.ngxOk))
+        g.backendOk)
         set_status("waiting for the game's TAA -- switch it on in the game's graphics "
                    "settings");
     if (now - t0 >= 10000) {
         const bool any = g.frames != g.framesLogged || g.passes;
         const int sharpPct = (int)std::lround(g_sharpness.load() * 100.0f);
+        const char* who = running_name(meth, 0);
         if (any && g.passes)
-            VRLOG("DLSS upscaling: %u renders in 10 s, %u upscaled (eye 0 %u, eye 1 %u), %u "
+            VRLOG("%s upscaling: %u renders in 10 s, %u upscaled (eye 0 %u, eye 1 %u), %u "
                   "never shown, %u routed to the other eye | vectors: same eye or moment %u, "
                   "looked up one render back %u, approximated %u, reset %u | jitter "
-                  "%+.3f..%+.3f / %+.3f..%+.3f px | sharpened %u at %d%%",
+                  "%+.3f..%+.3f / %+.3f..%+.3f px | sharpened %u at %d%%", who,
                   g.passes, g.frames - g.framesLogged, g.perEye[0], g.perEye[1], g.notShown,
                   g.eyeDisagree, g.modeCount[0], g.modeCount[1], g.modeCount[3],
                   g.modeCount[2], g.jxMin, g.jxMax, g.jyMin, g.jyMax, g.sharpened, sharpPct);
         else if (any)
-            VRLOG("DLSS: %u resolves in 10 s (eye 0 %u, eye 1 %u) | vectors: same eye or "
+            VRLOG("%s: %u resolves in 10 s (eye 0 %u, eye 1 %u) | vectors: same eye or "
                   "moment %u, looked up one render back %u, approximated %u, reset %u | "
-                  "jitter %+.3f..%+.3f / %+.3f..%+.3f px | sharpened %u at %d%%",
+                  "jitter %+.3f..%+.3f / %+.3f..%+.3f px | sharpened %u at %d%%", who,
                   g.frames - g.framesLogged, g.perEye[0], g.perEye[1], g.modeCount[0],
                   g.modeCount[1], g.modeCount[3], g.modeCount[2], g.jxMin, g.jxMax,
                   g.jyMin, g.jyMax, g.sharpened, sharpPct);
+        else if (meth == kMethodOff && g.sharpened)
+            VRLOG("sharpening: %u frames of the game's own TAA in 10 s at %d%%", g.sharpened,
+                  sharpPct);
         g.framesLogged = g.frames;
         g.perEye[0] = g.perEye[1] = 0;
         g.modeCount[0] = g.modeCount[1] = g.modeCount[2] = g.modeCount[3] = 0;
@@ -1349,6 +1600,7 @@ void on_present()
 
 void shutdown()
 {
+    fsr::shutdown();
 #if SRVR_HAVE_DLSS
     if (!g.ngxOk || !g.dev) return;
     release_feature(0);

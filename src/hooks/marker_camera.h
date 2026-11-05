@@ -22,9 +22,9 @@
 //
 // BETWEEN THE EYES so that both eyes' frames place every marker alike. Then the
 // UI of either frame is the UI of both, and the plane takes every frame's
-// instead of one eye's (marker_camera_placing()). Each eye sees a marker off by
-// half the parallax between the plane and the thing it marks, in opposite
-// directions, which is where a single plane can put it for two eyes.
+// (build_ui_quad_layer) instead of one eye's at half the rate. Each eye sees a
+// marker off by half the parallax between the plane and the thing it marks, in
+// opposite directions, which is where a single plane can put it for two eyes.
 //
 // TWO LISTS, ONE OF THEM APPROXIMATE. The module places 2D markers itself,
 // through the projection above, and those land exactly. A second list is placed
@@ -34,22 +34,19 @@
 // half the IPD for a plane hung on one eye). Small at 7 m; those markers are
 // near, not exact.
 //
-// Gameplay and the map. Found 2026-11-02 by static analysis; game_addresses.cpp
-// finds the class by name and checks every slot that reads the camera before
-// this may run.
+// Every screen whose UI is on its own plane -- gameplay, the map, and since
+// 2026-11-05 the garage and the menus. Found 2026-11-02 by static analysis;
+// game_addresses.cpp finds the class by name and checks every slot that reads
+// the camera before this may run.
 namespace hooks {
 
 // Hooks the UI camera's Update. Call once the game's addresses are resolved.
-// Without the address nothing is installed and the markers are the game's own.
+// Without the address nothing is installed and the markers are the game's own,
+// projected per eye -- which is when the UI plane goes back to one eye's UI.
 void install_marker_camera();
 bool marker_camera_available();
 
 // One line for the settings menu: what it is doing right now.
 const char* marker_camera_status();
-
-// The game's markers are being placed from between the eyes right now (a
-// camera was replaced in the last few frames), so every frame's UI is the same
-// for both eyes.
-bool marker_camera_placing();
 
 } // namespace hooks

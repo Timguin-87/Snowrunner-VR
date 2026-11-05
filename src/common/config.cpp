@@ -320,11 +320,13 @@ constexpr float kDefaultVerticalRecenter = 0.0f;
 // avoid -- so off is a measurement ("is the warp what is wrong, or is what it
 // is warping wrong?"), not a way anyone should be playing. It persists anyway:
 constexpr int   kDefaultRenderMethod = 0;  // xr::kRenderAER
-constexpr int   kDefaultDlssMode     = 0;  // dlss::kOff
+constexpr int   kDefaultUpscaler     = 0;  // dlss::kMethodOff
+// Native, so picking a method first does not change the game's render size.
+constexpr int   kDefaultUpQuality    = 1;  // dlss::kDlaa
 constexpr int   kDefaultDlssPreset   = 0;  // dlss::kPresetDefault
-// Takes the softness off DLSS's image, short of making it crisp: at 30% the
+// Takes the softness off the image, short of making it crisp: at 30% the
 // detail is lifted by about the CAS filter's own lowest setting.
-constexpr float kDefaultDlssSharpness = 0.30f;
+constexpr float kDefaultSharpness    = 0.30f;
 constexpr bool  kDefaultWarpEnabled = true;
 // Stale-eye warp source: the top of the ladder, the game's own motion vectors.
 // A frame without any (TAA off) runs the 6-DoF warp, so this is safe on every
@@ -403,9 +405,10 @@ struct Settings {
     bool     alignFovAsymmetry  = kDefaultAlignFovAsymmetry;
     bool     matchHeadsetVfov   = kDefaultMatchHeadsetVfov;
     int      renderMethod       = kDefaultRenderMethod;
-    int      dlssMode           = kDefaultDlssMode;
+    int      upscaler           = kDefaultUpscaler;
+    int      upQuality          = kDefaultUpQuality;
     int      dlssPreset         = kDefaultDlssPreset;
-    float    dlssSharpness      = kDefaultDlssSharpness;
+    float    sharpness          = kDefaultSharpness;
     bool     warpEnabled        = kDefaultWarpEnabled;
     int      warpType           = kDefaultWarpType;
     float    debugEyeCantDeg    = kDefaultDebugEyeCantDeg;
@@ -513,25 +516,35 @@ std::string format_file(const Settings& s)
         "#                      and the headset's own reprojection fills in between.\n"
         "#                      The warp and DIBR shift settings are kept but unused.\n"
         "RenderMethod=%s\n"
-        "# DLSS: off, dlaa, quality, balanced, performance, ultraperformance.\n"
-        "# NVIDIA DLSS in place of the game's own TAA (the DLSS tab). Needs an\n"
-        "# RTX card, the game's TAA switched ON, and nvngx_dlss.dll next to\n"
-        "# SnowRunner.exe -- not shipped with the mod; download it from NVIDIA's\n"
-        "# DLSS SDK on GitHub. In VR each eye keeps its own DLSS history.\n"
-        "# dlaa works at the game's own resolution and switches live. The others\n"
-        "# UPSCALE, in VR only: the game renders at 67/58/50/33%% of\n"
-        "# ForceGameResolution on each side and DLSS brings each eye up to it.\n"
-        "# Picked in the DLSS tab they apply straight away; edited here, at the\n"
-        "# next start. DIBR shift is off while they run.\n"
-        "DLSS=%s\n"
+        "# Upscaler: off, dlss, fsr3, fsr4 (the Upscaling tab). What stands in\n"
+        "# for the game's own TAA; off leaves the game's TAA as it is. All of\n"
+        "# them need the game's TAA switched ON, and none ships with the mod:\n"
+        "#   dlss  NVIDIA DLSS. An RTX card and nvngx_dlss.dll next to\n"
+        "#         SnowRunner.exe, from NVIDIA's DLSS SDK on GitHub.\n"
+        "#   fsr3  AMD FSR 3, any DirectX 12 GPU. amd_fidelityfx_loader_dx12.dll\n"
+        "#         and amd_fidelityfx_upscaler_dx12.dll next to SnowRunner.exe,\n"
+        "#         from AMD's FSR SDK on GitHub.\n"
+        "#   fsr4  AMD FSR 4, the same two DLLs; on a GPU FSR 4 does not run on,\n"
+        "#         FSR 3 runs instead.\n"
+        "# In VR each eye keeps its own history.\n"
+        "Upscaler=%s\n"
+        "# UpscalingQuality: native, quality, balanced, performance,\n"
+        "# ultraperformance. native is DLAA or FSR's Native AA, at the game's own\n"
+        "# resolution, and switches live. The others UPSCALE, in VR only: the game\n"
+        "# renders at 67/58/50/33%% of ForceGameResolution on each side and the\n"
+        "# upscaler brings each eye up to it. Picked in the Upscaling tab they\n"
+        "# apply straight away; edited here, at the next start. DIBR shift is off\n"
+        "# while they run.\n"
+        "UpscalingQuality=%s\n"
         "# DLSSPreset: default, J, K, L, M -- the DLSS model. default lets DLSS\n"
         "# choose (K for DLAA).\n"
         "DLSSPreset=%s\n"
-        "# DLSSSharpness: 0.00 - 1.00, 0 = off. AMD's contrast adaptive\n"
-        "# sharpening (CAS) on DLSS's image, after the upscale -- with DLAA, on\n"
-        "# the finished frame. It lifts detail where the image is soft and holds\n"
-        "# back at edges that already have contrast.\n"
-        "DLSSSharpness=%.2f\n"
+        "# Sharpness: 0.00 - 1.00, 0 = off. AMD's contrast adaptive sharpening\n"
+        "# (CAS), for every upscaler: on its image after the upscale -- natively,\n"
+        "# and with Upscaler off after the game's own TAA, on the finished frame.\n"
+        "# It lifts detail where the image is soft and holds back at edges that\n"
+        "# already have contrast.\n"
+        "Sharpness=%.2f\n"
         "# DIBRShift: true, false. Reproject the rendered eye into the other one\n"
         "# using scene depth, instead of leaving that eye to the stale-eye warp\n"
         "# alone. The two compose: the shift lands where it has depth and a\n"
@@ -581,7 +594,8 @@ std::string format_file(const Settings& s)
         "# RenderMap / RenderGarage: 3D, 2D. 3D is the stereo world. 2D shows\n"
         "# that screen as a flat panel instead -- the frame on a plane, both\n"
         "# eyes the same image, placed and sized by the UI plane settings\n"
-        "# (UIPlaneMode, UIPlaneSize, UIPlaneDistance). MapUIScale does not\n"
+        "# (UIPlaneMode, UIPlaneSize, UIPlaneDistance), from the game's own\n"
+        "# camera at the game's own FOV, as on a monitor. MapUIScale does not\n"
         "# apply in 2D: the UI covers the panel.\n"
         "# RENDERGARAGE IS WIDER THAN ITS NAME. The garage cannot be told\n"
         "# apart from the menus -- it shares its interface with them and its\n"
@@ -774,9 +788,10 @@ std::string format_file(const Settings& s)
         "# cannot be read. Leave false otherwise.\n"
         "DumpGameCode=%s\n",
         xr::render_method_key(s.renderMethod),
-        dlss::mode_key(s.dlssMode),
+        dlss::method_key(s.upscaler),
+        dlss::quality_key(s.upQuality),
         dlss::preset_key(s.dlssPreset),
-        s.dlssSharpness,
+        s.sharpness,
         s.dibrShift ? "true" : "false",
         s.horizonLock ? "true" : "false", s.hideHud ? "true" : "false",
         vk_name(s.menuVk).c_str(), gamepad_combo_name(s.menuCombo).c_str(),
@@ -907,10 +922,26 @@ void init()
         else note_invalid("RenderMethod", v);
     } else anyMissing = true;
 
-    if (kv_find(kv, "DLSS", v)) {
+    // Upscaler and UpscalingQuality replaced DLSS= on 2026-11-05: its one value
+    // was both, off or DLSS at a mode. A file that still has it is read as that
+    // and saved in the new keys.
+    if (kv_find(kv, "Upscaler", v)) {
         int m;
-        if (dlss::mode_from_key(v.c_str(), m)) s.dlssMode = m;
-        else note_invalid("DLSS", v);
+        if (dlss::method_from_key(v.c_str(), m)) s.upscaler = m;
+        else note_invalid("Upscaler", v);
+    } else {
+        anyMissing = true;
+        int q;
+        if (kv_find(kv, "DLSS", v) && dlss::quality_from_key(v.c_str(), q)) {
+            s.upscaler  = dlss::kMethodDlss;
+            s.upQuality = q;
+        }
+    }
+
+    if (kv_find(kv, "UpscalingQuality", v)) {
+        int q;
+        if (dlss::quality_from_key(v.c_str(), q)) s.upQuality = q;
+        else note_invalid("UpscalingQuality", v);
     } else anyMissing = true;
 
     if (kv_find(kv, "DLSSPreset", v)) {
@@ -919,11 +950,13 @@ void init()
         else note_invalid("DLSSPreset", v);
     } else anyMissing = true;
 
-    if (kv_find(kv, "DLSSSharpness", v)) {
+    // Sharpness was DLSSSharpness until it served every upscaler.
+    if (kv_find(kv, "Sharpness", v) || kv_find(kv, "DLSSSharpness", v)) {
         float f;
-        if (parse_float(v, f) && f >= 0.0f && f <= 1.0f) s.dlssSharpness = f;
-        else note_invalid("DLSSSharpness", v);
-    } else anyMissing = true;
+        if (parse_float(v, f) && f >= 0.0f && f <= 1.0f) s.sharpness = f;
+        else note_invalid("Sharpness", v);
+    }
+    if (!kv_find(kv, "Sharpness", v)) anyMissing = true;
 
     if (kv_find(kv, "DIBRShift", v)) {
         if (_stricmp(v.c_str(), "true") == 0 || v == "1")       s.dibrShift = true;
@@ -1178,9 +1211,10 @@ void init()
     }
 
     xr::set_render_method(s.renderMethod);
-    dlss::set_mode(s.dlssMode);
+    dlss::set_quality(s.upQuality);
+    dlss::set_method(s.upscaler);
     dlss::set_preset(s.dlssPreset);
-    dlss::set_sharpness(s.dlssSharpness);
+    dlss::set_sharpness(s.sharpness);
     xr::set_dibr_shift_enabled(s.dibrShift);
     hooks::set_horizon_lock_enabled(s.horizonLock);
     hooks::set_hide_hud_enabled(s.hideHud);
@@ -1264,9 +1298,10 @@ void save()
 {
     Settings s;
     s.renderMethod    = xr::render_method();
-    s.dlssMode        = dlss::mode();
+    s.upscaler        = dlss::method();
+    s.upQuality       = dlss::quality();
     s.dlssPreset      = dlss::preset();
-    s.dlssSharpness   = dlss::sharpness();
+    s.sharpness       = dlss::sharpness();
     s.dibrShift       = xr::dibr_shift_enabled();
     s.horizonLock     = hooks::horizon_lock_enabled();
     s.hideHud         = hooks::hide_hud_enabled();

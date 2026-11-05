@@ -7,7 +7,7 @@ No game files are modified and nothing is patched on disk — delete one DLL and
 
 ## Install
 
-**Set the game to windowed mode.** On the first launch the mod reads your headset's native per-eye resolution, writes it into the config and says so; press OK and the game resizes to it. After that, resolution and DLSS changes apply in the running game. If the game cannot be resized, in fullscreen for one, the notice asks you to restart instead.
+**Set the game to windowed mode.** On the first launch the mod reads your headset's native per-eye resolution, writes it into the config and says so; press OK and the game resizes to it. After that, resolution and upscaling changes apply in the running game. If the game cannot be resized, in fullscreen for one, the notice asks you to restart instead.
 
 1. Download from releases or build `dxgi.dll` (below).
 2. Drop it next to `SnowRunner.exe` — on a Steam install that is
@@ -43,31 +43,40 @@ AER has two options to improve smoothness; they are hidden while Synched Sequent
 
 | | what it does |
 |---|---|
-| **Stale-eye warp** | Brings that eye's own last real render forward to now. Four modes: headset rotation only; plus the game camera's rotation; plus a 6-DoF reprojection by the camera's translation; plus the game's own motion vectors (the default). Motion vectors is the most accurate and needs the game's anti-aliasing set to TAA (can also be used with DLSS) |
+| **Stale-eye warp** | Brings that eye's own last real render forward to now. Four modes: headset rotation only; plus the game camera's rotation; plus a 6-DoF reprojection by the camera's translation; plus the game's own motion vectors (the default). Motion vectors is the most accurate and needs the game's anti-aliasing set to TAA (can also be used with DLSS or FSR) |
 | **DIBR shift** | Reprojects the eye that *was* rendered into the other one using the scene depth buffer, with disocclusion holes filled up with the stale eye warp. Has artefacts and needed workarounds, default off. With the introduction of the motion vector stale eye warp I don't consider this as usefull as it once was.|
 
-## DLSS (optional)
+## Upscaling (optional)
 
-The **DLSS** tab replaces the game's own TAA with NVIDIA DLSS: the frame,
-depth and motion vectors the game already renders for its TAA go through DLSS
-instead. It needs:
+The **Upscaling** tab can replace the game's own TAA with NVIDIA DLSS or AMD
+FSR: the frame, depth and motion vectors the game already renders for its TAA go
+through the upscaler instead. Every method needs the game's anti-aliasing set to
+**TAA** in its graphics settings, and **no upscaler DLL is included with the
+mod** — each method's are named below, to put next to `SnowRunner.exe`.
 
-1. An NVIDIA RTX card.
-2. The game's anti-aliasing set to **TAA** in its graphics settings.
-3. **`nvngx_dlss.dll` next to `SnowRunner.exe`. It is not included with the mod**:
-   download it from NVIDIA's DLSS SDK on GitHub —
-   [`lib/Windows_x86_64/rel/nvngx_dlss.dll`](https://github.com/NVIDIA/DLSS/blob/v310.9.16/lib/Windows_x86_64/rel/nvngx_dlss.dll)
-   ("Download raw file"), version 310.9.16 or newer. NVIDIA's licence applies to it.
+**Upscaling method**:
 
-**Mode**:
+| | what it needs |
+|---|---|
+| **Off** (default) | Nothing: the game's own TAA, as it is. |
+| **DLSS** | An NVIDIA RTX card, and `nvngx_dlss.dll` from NVIDIA's DLSS SDK on GitHub — [`lib/Windows_x86_64/rel/nvngx_dlss.dll`](https://github.com/NVIDIA/DLSS/blob/v310.9.16/lib/Windows_x86_64/rel/nvngx_dlss.dll) ("Download raw file"), version 310.9.16 or newer. NVIDIA's licence applies to it. |
+| **FSR 3** | Any DirectX 12 GPU, NVIDIA and Intel included, and `amd_fidelityfx_loader_dx12.dll` and `amd_fidelityfx_upscaler_dx12.dll` from AMD's FSR SDK on GitHub — both in [`Kits/FidelityFX/signedbin`](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/tree/v2.4.0/Kits/FidelityFX/signedbin) ("Download raw file" on each), SDK 2.4.0 or newer. AMD's licence applies to them. |
+| **FSR 4** | The same two DLLs, on a Radeon RX 9000, 7000 or 6000 card or a supported Ryzen APU. On any other GPU FSR 3 runs instead. |
+
+FSR is DirectX 12 only, so the mod runs it on a DirectX 12 device of its own
+beside the game's DirectX 11 one; the two hand the images over through shared
+textures.
+
+**Quality**, for whichever method runs:
 
 | | what it does |
 |---|---|
-| **DLAA** | DLSS at the game's own resolution, as anti-aliasing. Switches live. |
-| **Quality / Balanced / Performance / Ultra Performance** | The game renders smaller — 67%, 58%, 50% or 33% of your render resolution on each side — and DLSS brings each eye back up to the full size. VR only. Applied as soon as you pick one: the game rebuilds at the new size, which takes a moment. DIBR shift is off while it runs. |
+| **DLAA / Native AA** | The upscaler at the game's own resolution, as anti-aliasing. Switches live. |
+| **Quality / Balanced / Performance / Ultra Performance** | The game renders smaller — 67%, 58%, 50% or 33% of your render resolution on each side — and the upscaler brings each eye back up to the full size. VR only. Applied as soon as you pick one: the game rebuilds at the new size, which takes a moment. DIBR shift is off while it runs. |
 
-**Preset** picks the DLSS model: Default (DLSS decides), J, K, L or M.
-**Sharpness** (default 30%, 0% is off) runs AMD's FidelityFX CAS for a sharper picture.
+**Preset** (DLSS only) picks the DLSS model: Default (DLSS decides), J, K, L or M.
+**Sharpness** (default 30%, 0% is off) runs AMD's FidelityFX CAS for a sharper
+picture, for every method — with Off, on the game's own TAA.
 
 ### VR controllers
 
@@ -126,7 +135,8 @@ Dependencies are fetched on the first configure and need no setup:
 | [MinHook](https://github.com/TsudaKageyu/minhook) 1.3.4 | function detours |
 | [OpenXR-SDK](https://github.com/KhronosGroup/OpenXR-SDK) 1.1.36 | linked **statically**, so only `dxgi.dll` ships |
 | [Dear ImGui](https://github.com/ocornut/imgui) 1.92.9b | the settings overlay |
-| [NVIDIA DLSS SDK](https://github.com/NVIDIA/DLSS) 310.9.16 | headers and library, downloaded into the build directory and checked against pinned SHA-256s — nothing of NVIDIA's is in this repository. No network, or `-DSRVR_DLSS=OFF`: the DLL builds without DLSS. The runtime DLL is never part of the build (see DLSS above). |
+| [NVIDIA DLSS SDK](https://github.com/NVIDIA/DLSS) 310.9.16 | headers and library, downloaded into the build directory and checked against pinned SHA-256s — nothing of NVIDIA's is in this repository. No network, or `-DSRVR_DLSS=OFF`: the DLL builds without DLSS. The runtime DLL is never part of the build (see Upscaling above). |
+| [AMD FSR SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK) 2.4.0 | four API headers, downloaded into the build directory and checked against pinned SHA-256s — nothing of AMD's is in this repository, and nothing is linked. No network, or `-DSRVR_FSR=OFF`: the DLL builds without FSR. The runtime DLLs are never part of the build (see Upscaling above). |
 
 x64 only — the build fails fast on anything else. Uses the dynamic VC++ runtime
 (MSVCP140), which is present on any machine that runs the game.
@@ -146,8 +156,8 @@ src/hooks/    the engine hooks -- swapchain/Present, the camera and view
               (game_addresses.cpp)
 src/render/   D3D11 work the mod does itself: the DIBR reprojection, the
               6-DoF reprojection, the UI/smudge/winch composition layers,
-              the truck and mirror masks, frame dumps, and DLSS in place of
-              the game's TAA
+              the truck and mirror masks, frame dumps, and DLSS and FSR in
+              place of the game's TAA
 src/xr/       OpenXR session, swapchains, eye views, layer submission, and
               the AER scheduling
 src/common/   logging, the config file, and the pure decision rules that are
@@ -185,7 +195,8 @@ DLSS SDK portions of a DLSS build are not MIT licensed**: see below.
 | [Dear ImGui](https://github.com/ocornut/imgui) 1.92.9b | the settings overlay | MIT |
 | [OpenXR-SDK](https://github.com/KhronosGroup/OpenXR-SDK) 1.1.36 | the OpenXR loader, linked statically | Apache 2.0 |
 | [JsonCpp](https://github.com/open-source-parsers/jsoncpp), as bundled with the OpenXR loader | JSON parsing inside the loader | Public domain / MIT |
-| [AMD FidelityFX CAS](https://github.com/GPUOpen-Effects/FidelityFX-CAS) 1.20190610 | the DLSS tab's Sharpness: its filter, ported into the mod's shader in `src/render/sharpen.cpp` | MIT |
+| [AMD FidelityFX CAS](https://github.com/GPUOpen-Effects/FidelityFX-CAS) 1.20190610 | the Upscaling tab's Sharpness: its filter, ported into the mod's shader in `src/render/sharpen.cpp` | MIT |
+| [AMD FSR SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK) 2.4.0 | FSR 3 and 4: its API headers (`ffx_api.h`, `ffx_api_types.h`, `dx12/ffx_api_dx12.h`, `ffx_upscale.h`), compiled into `dxgi.dll` | MIT |
 
 ### NVIDIA DLSS
 
@@ -199,9 +210,20 @@ object code from the SDK's library. That code is NVIDIA's, it is distributed und
 License, and the license grant above does not extend to it. `nvngx_dlss.dll` is covered by the same license.
 Building with `-DSRVR_DLSS=OFF` leaves all of it out, along with DLSS.
 
+### AMD FSR
+
+This mod uses the AMD FSR SDK. AMD, FSR, FidelityFX and Radeon are trademarks of Advanced Micro Devices, Inc.
+This mod is not sponsored or endorsed by AMD.
+
+No AMD file is in this repository: the build downloads four of the SDK's API headers from AMD, which are
+MIT licensed (text below), and players download the runtime, `amd_fidelityfx_loader_dx12.dll` and
+`amd_fidelityfx_upscaler_dx12.dll`, themselves. Those two DLLs are AMD's prebuilt, signed binaries and come
+under the terms in the SDK's own [license file](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/blob/v2.4.0/docs/license.md).
+Building with `-DSRVR_FSR=OFF` leaves the headers out, along with FSR.
+
 ### AMD FidelityFX CAS
 
-The DLSS tab's Sharpness filter is ported from AMD's FidelityFX Contrast Adaptive Sharpening (`ffx_cas.h`,
+The Upscaling tab's Sharpness filter is ported from AMD's FidelityFX Contrast Adaptive Sharpening (`ffx_cas.h`,
 version 1.20190610) into the mod's own shader in `src/render/sharpen.cpp`. That filter keeps AMD's copyright
 notice and MIT license, below. AMD and FidelityFX are trademarks of Advanced Micro Devices, Inc. This mod is
 not sponsored or endorsed by AMD.
@@ -616,6 +638,33 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE AUTHORS OR
 COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
 ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+```
+
+</details>
+
+<details>
+<summary>AMD FSR SDK API headers (MIT)</summary>
+
+```text
+Copyright (C) 2026 Advanced Micro Devices, Inc.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files(the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and /or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions :
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
 ```
 
 </details>

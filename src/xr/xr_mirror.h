@@ -493,6 +493,12 @@ float headset_vfov_deg();
 // the UI plane settings (head-locked or pinned, size, distance), and the eye
 // projection layer is not submitted at all.
 //
+// THE SCREEN'S CAMERA IS THE GAME'S OWN in 2D, as on a monitor: no head
+// tracking, no eye offset, no FOV lock and none of the camera conditioning
+// (viewbuild_hook.cpp's detour_projbuild and detour_fna), the game's m_fFOV
+// handed back (camera_fov.h) and the small-object cull at the game's own test.
+// Only the canvas stays ours -- square, at the render size.
+//
 // "GARAGE" IS WIDER THAN ITS NAME. The garage cannot be identified -- see the
 // note at g_garageRender in xr_mirror.cpp -- so it is the fallback bucket:
 // the garage, the main menu, every pause menu, loading screens and the level

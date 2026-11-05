@@ -40,18 +40,38 @@ struct ID3D11Texture2D;
 // Needs the game's TAA switched ON (that is what renders the jitter and the
 // velocity buffer), the DLSS SDK at build time (CMakeLists.txt fetches it) and
 // nvngx_dlss.dll next to SnowRunner.exe, which players download themselves.
+//
+// AMD FSR 3 AND 4 RUN THE SAME WAY (render/fsr.hpp), in this same pipeline: the
+// same vectors, depth and jitter, at the resolve for native AA and at Present
+// when upscaling, one history per eye. Only the call that produces the image
+// differs -- and FSR needs AMD's two DLLs next to SnowRunner.exe instead.
 namespace dlss {
 
+// THE METHOD, the Upscaling tab's first choice. Off is the game's own TAA,
+// untouched. Changing it resets every eye's history.
+enum Method : int { kMethodOff = 0, kMethodDlss, kMethodFsr3, kMethodFsr4, kMethodCount };
+int  method();
+void set_method(int m);
+bool method_compiled_in(int m);   // DLSS: its SDK at build time; FSR: AMD's headers
+const char* method_name(int m);   // "Off", "DLSS", "FSR 3", "FSR 4"
+const char* method_key(int m);    // config spelling: "off", "dlss", "fsr3", "fsr4"
+bool method_from_key(const char* key, int& out);
+
+// THE MODE of whichever method runs: native (DLAA, or FSR's Native AA) or one of
+// four render scales, shared by the methods. kOff is only ever mode()'s answer
+// while the method is Off.
 enum Mode : int {
     kOff = 0, kDlaa, kQuality, kBalanced, kPerformance, kUltraPerformance, kModeCount
 };
+int  quality();                   // kDlaa .. kUltraPerformance
+void set_quality(int q);
+const char* quality_key(int q);   // config spelling: "native", "quality", ...
+bool quality_from_key(const char* key, int& out);   // "dlaa" too
 
+// What the rest of the mod asks: kOff while the method is Off, its mode
+// otherwise.
 int  mode();
-void set_mode(int m);
-bool mode_available(int m);
-const char* mode_name(int m);                    // for the panel
-const char* mode_key(int m);                     // config spelling: "off", "dlaa", ...
-bool mode_from_key(const char* key, int& out);
+const char* mode_name(int m);     // "DLAA" under DLSS, "Native AA" under FSR, "Quality", ...
 
 // Quality and below: the game renders smaller than the headset image.
 bool is_upscaling(int m);
@@ -76,21 +96,24 @@ void set_preset(int p);
 const char* preset_key(int p);                   // "default", "J", "K", "L", "M"
 bool preset_from_key(const char* key, int& out);
 
-// SHARPENING after DLSS, 0 - 1, 0 = off: AMD's contrast adaptive sharpening
-// (render/sharpen.hpp) on DLSS's image -- after the upscale, or with DLAA on the
-// finished frame, which has been through the game's tonemapping by then. Takes
-// effect at the next Present.
+// SHARPENING, 0 - 1, 0 = off, for every method: AMD's contrast adaptive
+// sharpening (render/sharpen.hpp) on the upscaler's image after the upscale, or
+// with native AA -- and with the method Off, after the game's own TAA -- on the
+// finished frame, which has been through the game's tonemapping by then. Only
+// frames the TAA ran on: menus and loading screens are left alone. Takes effect
+// at the next Present.
 float sharpness();
 void  set_sharpness(float s);
 
-// This build was made with the SDK. False = no DLSS in this DLL at all.
+// This build has an upscaler in it, DLSS or FSR. False = this tab has nothing.
 bool compiled_in();
 
 // One line for the settings panel: what it is doing, or why it is not.
 const char* status();
 
-// Debug: flip the sign of the vertical jitter handed to DLSS. Session only. A
-// wrong sign reads as a soft or faintly shaking image when standing still.
+// Debug: flip the sign of the vertical jitter handed to the upscaler. Session
+// only. A wrong sign reads as a soft or faintly shaking image when standing
+// still.
 bool jitter_flip_y();
 void set_jitter_flip_y(bool on);
 

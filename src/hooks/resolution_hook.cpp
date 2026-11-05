@@ -429,9 +429,11 @@ void apply_resolution()
     g_upOutH.store(outH);
     g_upMode.store(upscaling ? upMode : (int)dlss::kOff);
     g_upApplied.store(upscaling);
-    if (upscaling)
-        VRLOG("resolution: DLSS %s -- the game renders at %dx%d, and DLSS brings each eye up "
-              "to %dx%d", dlss::mode_name(upMode), gotW, gotH, outW, outH);
+    if (upscaling) {
+        const char* by = dlss::method_name(dlss::method());
+        VRLOG("resolution: %s %s -- the game renders at %dx%d, and %s brings each eye up "
+              "to %dx%d", by, dlss::mode_name(upMode), gotW, gotH, by, outW, outH);
+    }
 
     dlss::on_resized();
     xr::on_game_resized((uint32_t)gotW, (uint32_t)gotH);

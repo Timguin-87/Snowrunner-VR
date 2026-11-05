@@ -290,6 +290,12 @@ void mark_if_rigid(ID3D11DeviceContext* ctx, DrawFn&& draw)
 // way it always was. That is a mixed placement -- that element sits in the eye
 // image while the rest of the UI is on the plane -- and it is still the right
 // trade: the alternative is a black bar on the plane.
+//
+// Its MASKS still reach the layer's stencil (uilayer::begin_capture's
+// masksOnly), so what they clip on the plane is clipped. The black bars may
+// well have been those masks: Scaleform draws them with colour off, and until
+// 2026-11-05 the capture turned colour on for every draw. If so, the exclusion
+// is no longer needed -- untested.
 constexpr uint64_t kUiCopyExclude[] = {
     0x4B3885B96F72F43Full,   // black bars in the corners of the captured layer
 };
@@ -323,8 +329,9 @@ bool ui_copy_excluded(uint64_t hash)
 // alternates eyes every frame. On ONE shared plane that hands the same surface
 // two different positions on consecutive frames, and it reads as a doubled or
 // jittering marker. The world markers are placed from between the eyes instead
-// (marker_camera.h), so wherever that runs every frame's UI is the same and
-// all of it goes to the plane; anywhere else only one eye's frames do.
+// (marker_camera.h), on every screen with the UI on the plane, so every frame's
+// UI is the same and all of it goes to the plane; only a game build without
+// that hook falls back to one eye's frames.
 //
 // That is picked at PRESENT, in build_ui_quad_layer, and not from here. Two
 // reasons, both about this being the wrong place to ask: the UI is recorded on
@@ -345,15 +352,19 @@ bool redirect_if_ui(ID3D11DeviceContext* ctx, DrawFn&& draw)
     // A one-quad runtime on a 2D screen: the panel holds the only quad, so the
     // UI draws into the frame it is a panel of. See xr::ui_stays_in_frame().
     if (xr::ui_stays_in_frame()) return false;
-    if (ui_copy_excluded(hooks::current_draw_hash())) return false;
 
-    // Every UI draw belongs on the plane: the world markers in it were placed
-    // for the plane in the first place (marker_camera.h).
+    // Every UI draw ON THE CANVAS belongs on the plane: the world markers in it
+    // were placed for the plane in the first place (marker_camera.h). One into
+    // any other target is a Scaleform offscreen pass, which begin_capture()
+    // leaves where it was going -- see ui_layer.hpp.
     uilayer::Saved saved;
-    if (!uilayer::begin_capture(ctx, saved)) return false;
+    const uilayer::Capture c =
+        uilayer::begin_capture(ctx, saved, ui_copy_excluded(hooks::current_draw_hash()));
+    if (c == uilayer::kNotCaptured) return false;
     draw();
     uilayer::end_capture(ctx, saved);
-    return true;
+    // A mask goes to the game's own target too (uilayer::kCapturedMask).
+    return c != uilayer::kCapturedMask;
 }
 
 // Windscreen splatter: draw it into its own layer INSTEAD of the main target.

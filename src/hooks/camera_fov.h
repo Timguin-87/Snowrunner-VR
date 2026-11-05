@@ -85,6 +85,12 @@ void camera_fov_reassert();
 // says whether the camera was ever found.
 const char* camera_fov_status();
 
+// ON A 2D SCREEN (xr::flat_screen_active) NOTHING IS DECLARED: every camera
+// still holding our FOV gets the game's own back -- the last value the game put
+// there -- and no write or search runs until the screen ends. Opened from a
+// drive, the map runs with the drive camera still ticking, so the writes kept
+// landing in the camera it renders with and the 2D map came up zoomed out.
+
 // THE SMALL-OBJECT CULL, the other thing m_fFOV decides -- and the "forward
 // culling" the note above says was left over.
 //
@@ -109,7 +115,8 @@ const char* camera_fov_status();
 // and touches nothing else: the frustum still comes from m_fFOV, so this moves
 // only how near a small thing has to be to be drawn. 1.0 = the game's own
 // test at the headset's FOV; about 3 = what a monitor shows; 5 by default.
-// Clamped [1, 8].
+// Clamped [1, 8]. Not applied on a 2D screen, which renders at the game's FOV
+// -- see detour_size_cull.
 float small_object_distance();
 void  set_small_object_distance(float k);
 

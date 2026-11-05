@@ -34,7 +34,23 @@
 // accumulates correctly against a transparent target rather than being squared
 // the way ordinary SrcAlpha blending would. The result is a premultiplied
 // layer, which is exactly what an XrCompositionLayerQuad expects when
-// XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT is not set.
+// XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT is not set. Only the alpha is
+// ours: the colour blend and the colour write mask stay the game's, so a
+// Scaleform mask (colour off, stencil only) stays invisible and an additive
+// element stays additive.
+//
+// SCALEFORM MASKS RUN AGAINST A STENCIL OF THE LAYER'S OWN. The game's UI is
+// Scaleform GFx, which clips a masked element by drawing the mask shape into the
+// stencil and testing the element against it. With no stencil bound the element
+// drew whole: the HUD's damage rings (hud_lib.gfx vehicleModuleBar, two masked
+// half rings each) read as full circles above half damage and as exact half
+// circles below it. The game's own stencil state is kept, on our buffer, with
+// the depth test off -- the depth buffer bound at that point describes the 3D
+// frame, not the UI.
+//
+// THE CANVAS ONLY. A UI draw into any other target -- Scaleform's offscreen
+// passes for filters and cached bitmaps -- is left where it was going, so the
+// texture it fills is there when the composite onto the canvas reads it.
 namespace uilayer {
 
 // True once the target exists and the feature is on. Everything -- the
@@ -55,20 +71,38 @@ bool size(uint32_t& w, uint32_t& h);
 // game's own command list, so it has to leave the context exactly as it found
 // it -- the same rule mirror_mask.hpp follows, and for the same reason.
 struct Saved {
-    ID3D11RenderTargetView* rtv[8] = {};
-    UINT                    rtvCount = 0;
-    ID3D11DepthStencilView* dsv = nullptr;
-    ID3D11BlendState*       blend = nullptr;
-    float                   blendFactor[4] = {};
-    UINT                    sampleMask = 0;
-    bool                    valid = false;
+    ID3D11RenderTargetView*  rtv[8] = {};
+    UINT                     rtvCount = 0;
+    ID3D11DepthStencilView*  dsv = nullptr;
+    ID3D11BlendState*        blend = nullptr;
+    float                    blendFactor[4] = {};
+    UINT                     sampleMask = 0;
+    ID3D11DepthStencilState* dss = nullptr;
+    UINT                     stencilRef = 0;
+    bool                     stencil = false;   // ran against the layer's stencil
+    bool                     valid = false;
 };
 
-bool begin_capture(ID3D11DeviceContext* ctx, Saved& saved);
-void end_capture(ID3D11DeviceContext* ctx, Saved& saved);
+// What begin_capture() made of a draw.
+enum Capture {
+    kNotCaptured = 0,   // issue it as it was: the layer is down, or the draw is
+                        // going to a target other than the canvas
+    kCaptured,          // drawn into the layer INSTEAD of the game's target
+    kCapturedMask,      // a mask (stencil only, no colour): drawn into the
+                        // layer's stencil, and the caller issues it to the
+                        // game's target as well, where it draws no colour and
+                        // keeps the game's stencil right for anything masked
+                        // that is still drawn there
+};
 
-// Clears the layer for the next frame. Call from Present AFTER the quad has
-// been built from it.
+// `masksOnly`: capture the draw only if it is a mask -- for the UI shaders
+// whose visible draws stay in the render (ui_hook.cpp's kUiCopyExclude).
+// end_capture() goes with every capture, and only with one.
+Capture begin_capture(ID3D11DeviceContext* ctx, Saved& saved, bool masksOnly);
+void    end_capture(ID3D11DeviceContext* ctx, Saved& saved);
+
+// Clears the layer and its stencil for the next frame. Call from Present AFTER
+// the quad has been built from it. Also writes the periodic "ui layer:" line.
 void clear(ID3D11DeviceContext* ctx);
 
 // The captured UI, or null. Two views of one texture: srv() reads the values

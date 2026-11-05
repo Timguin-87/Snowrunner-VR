@@ -8,7 +8,7 @@
 #include "hooks/ui_hook.h"
 #include "hooks/menu_hook.h"
 #include "hooks/resolution_hook.h"
-#include "hooks/marker_camera.h"    // marker_camera_placing()
+#include "hooks/marker_camera.h"    // marker_camera_available()
 #include "render/dibr.hpp"
 #include "render/reproject.hpp"
 #include "render/rigid_mask.hpp"
@@ -2205,8 +2205,9 @@ void eye_size_for_frame(uint32_t frameW, uint32_t frameH, uint32_t& w, uint32_t&
     if ((int)frameW == rw && (int)frameH == rh) {
         w = (uint32_t)ow;
         h = (uint32_t)oh;
-        VRLOG("XR canvas: %ux%u eye images from a %ux%u game frame -- DLSS %s upscales each eye",
-              w, h, frameW, frameH, dlss::mode_name(hooks::upscale_mode_applied()));
+        VRLOG("XR canvas: %ux%u eye images from a %ux%u game frame -- %s %s upscales each eye",
+              w, h, frameW, frameH, dlss::method_name(dlss::method()),
+              dlss::mode_name(hooks::upscale_mode_applied()));
     } else {
         VRLOG("DLSS upscaling: the game's frame is %ux%u, not the %dx%d its window was sized "
               "to -- no upscaling", frameW, frameH, rw, rh);
@@ -3251,8 +3252,9 @@ Quat level_look(Quat q)
 // own distance. The map's SIZE still tracks that distance (it is derived as
 // 2*d*tan(hh)) so its apparent size never moves -- only the depth it sits at.
 
-// Which eye's UI reaches the plane on the screens where it cannot be both eyes'
-// (build_ui_quad_layer), and the eye a head-locked plane hangs on everywhere.
+// Which eye's UI reaches the plane when it cannot be both eyes' -- a game build
+// without the marker camera (build_ui_quad_layer) -- and the eye a head-locked
+// plane hangs on everywhere.
 // Fixed rather than chosen: any consistent answer removes the alternation, and
 // a stable one keeps UI the game projected itself sitting on a single eye's
 // projection instead of switching between two.
@@ -3522,11 +3524,6 @@ bool build_scene_quad_layer(XrCompositionLayerQuad& quad, XrTime displayTime)
     if (rect.extent.width <= 0 || rect.extent.height <= 0)
         return false;
 
-    float hh = 0.0f, vh = 0.0f;
-    eye_frustum_half_angles(eye, hh, vh);
-    if (hh <= 1.0e-4f || vh <= 1.0e-4f)
-        return false;
-
     quad.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
     // OPAQUE, unlike the two quads above it: this is the background, not an
     // overlay. Blending it against the void would show the void through it.
@@ -3536,8 +3533,12 @@ bool build_scene_quad_layer(XrCompositionLayerQuad& quad, XrTime displayTime)
     quad.subImage.imageRect = rect;
     quad.subImage.imageArrayIndex = 0;
 
+    // THE IMAGE'S OWN SHAPE. A 2D screen is rendered at the game's own FOV for
+    // the canvas (detour_projbuild leaves it alone there), so a pixel of it is
+    // square -- not the eye's declared window, whose vertical can come from the
+    // headset instead (match_headset_vfov) and would stretch the panel.
     const float widthM = g_uiPlaneSizeM.load();
-    quad.size = {widthM, widthM * (std::tan(vh) / std::tan(hh))};
+    quad.size = {widthM, widthM * (float)rect.extent.height / (float)rect.extent.width};
 
     place_ui_plane_quad(quad, displayTime, false);
     return true;
@@ -3602,17 +3603,22 @@ bool build_ui_quad_layer(XrCompositionLayerQuad& quad, XrTime displayTime)
     if (hh <= 1.0e-4f || vh <= 1.0e-4f)
         return false;
 
-    // EVERY FRAME'S UI while the world markers are placed from between the eyes
-    // (hooks::marker_camera_placing()): then nothing in the UI depends on which
-    // eye a frame was rendered for, and either frame's is both eyes' UI.
+    // EVERY FRAME'S UI. The world markers are placed from between the eyes on
+    // every screen whose UI is on this plane (hooks/marker_camera.h), and a 2D
+    // screen has no eye offset at all, so nothing in the UI depends on which eye
+    // a frame was rendered for: either frame's is both eyes' UI. A frame the
+    // marker camera could not place -- a camera that matches no recent build,
+    // for a frame or two -- has its markers drawn for its own eye, and that is
+    // taken as it is: one eye's UI for a frame.
     //
-    // OTHERWISE ONE EYE'S UI, HALF THE RATE -- anything the game projected
-    // itself is in the eye's frame where it was drawn, and two frames would hand
-    // the plane two positions for it. This is where that eye is chosen, on the
-    // finished frame rather than from inside its draws (see redirect_if_ui).
-    // present_route_eye() is what the frame just rendered as, read after all of
-    // it: no race with the parity flip, and no exposure to the ~1% of Presents
-    // that carry no camera build.
+    // ONE EYE'S UI, HALF THE RATE, only without the marker camera: a game build
+    // where its hook was not found. Then everything the game projected is in
+    // the eye's frame where it was drawn, all the time, and two frames would
+    // hand the plane two positions for it. This is where that eye is chosen, on
+    // the finished frame rather than from inside its draws (see
+    // redirect_if_ui). present_route_eye() is what the frame just rendered as,
+    // read after all of it: no race with the parity flip, and no exposure to the
+    // ~1% of Presents that carry no camera build.
     //
     // On the frames whose capture is discarded there is nothing to blit, and
     // the quad simply re-submits the image it last released: an XR swapchain
@@ -3629,7 +3635,7 @@ bool build_ui_quad_layer(XrCompositionLayerQuad& quad, XrTime displayTime)
     // plane instead of leaving the last image up.
     constexpr int kMaxUiQuadIdle = 4;
     const bool haveCapture = uilayer::drew_this_frame();
-    const bool wantEye     = hooks::marker_camera_placing() ||
+    const bool wantEye     = hooks::marker_camera_available() || flat_screen_active() ||
                              present_route_eye() == kUiCaptureEye;
     if (haveCapture && (wantEye || g.uiQuadIdle >= kMaxUiQuadIdle)) {
         if (!refresh_ui_quad_image(src, w, h)) return false;
@@ -3659,7 +3665,8 @@ bool build_ui_quad_layer(XrCompositionLayerQuad& quad, XrTime displayTime)
     // Height follows the capture's own angular aspect rather than its pixel
     // aspect: the texture is the square canvas, but only 2*hh by 2*vh of angle
     // is what the game drew into, so tan(vh)/tan(hh) is the shape that keeps
-    // the UI unstretched.
+    // the UI unstretched. On a 2D screen it is the panel's shape instead, which
+    // is the canvas's own (build_scene_quad_layer).
     //
     // THE MAP IN 3D is the rendered view's own extent, scaled about its centre
     // by the map UI size, and neither slider applies. At 1 it overlays the
@@ -3671,9 +3678,10 @@ bool build_ui_quad_layer(XrCompositionLayerQuad& quad, XrTime displayTime)
     // reasoning is gone -- the scene is on a plane of its own and the UI has to
     // match THAT, so both planes take the UI size and the markers line up on
     // the panel instead.
-    const bool  mapLocked = hooks::in_map_view() && !flat_screen_active();
+    const bool  flat   = flat_screen_active();
+    const bool  mapLocked = hooks::in_map_view() && !flat;
     const float dist   = g_uiPlaneDistM.load();
-    const float shape  = std::tan(vh) / std::tan(hh);
+    const float shape  = flat ? (float)h / (float)w : std::tan(vh) / std::tan(hh);
     const float mapUi  = hooks::marker_camera_available() ? g_mapUiScale.load() : 1.0f;
     const float widthM = mapLocked ? (2.0f * dist * std::tan(hh) * mapUi)
                                    : g_uiPlaneSizeM.load();
@@ -6806,7 +6814,7 @@ constexpr float kUiCameraMatchTolM = 1.0f;
 // is measured from the middle of the two eye poses, and `origin` is that point
 // in the game -- the build's own eye offset taken back off. Both eyes' builds
 // then put every marker in the same place, so the UI of either eye's frame is
-// the UI of both (marker_camera_placing()).
+// the UI of both (build_ui_quad_layer takes every frame's).
 bool ui_plane_in_camera(const float eye[3], const float fwd[3], UiPlaneInCamera& out)
 {
     if (g_failed || !g.running || flat_screen_active()) return false;

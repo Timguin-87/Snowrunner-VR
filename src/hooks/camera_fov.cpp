@@ -32,6 +32,13 @@ std::atomic<int> g_found{0};
 int   g_camCount = 0;               // the sweep's private cursor into g_cams
 char  g_status[160] = "waiting for gameplay";
 
+// PER CAMERA: what the GAME last put in m_fFOV, and what we last put there (0 =
+// nothing of ours in it). A 2D screen gets the game's back -- see
+// restore_game_fov().
+std::atomic<float> g_gameFov[kMaxCams];
+std::atomic<float> g_ourFov[kMaxCams];
+bool  g_flatHeld = false;           // Present thread only: the FOV is the game's
+
 void set_status(const char* fmt, ...)
 {
     va_list ap;
@@ -213,6 +220,8 @@ void scan_slice()
                 // A camera whose FOV field is not a sane angle is not one we can
                 // drive, whatever else it looks like.
                 if (!(fovRad > 0.05f && fovRad < 3.10f)) continue;
+                g_gameFov[g_camCount].store(fovRad, std::memory_order_relaxed);
+                g_ourFov[g_camCount].store(0.0f, std::memory_order_relaxed);
                 g_cams[g_camCount++] = (void*)obj;
                 g_found.store(g_camCount, std::memory_order_release);
                 if (!g_stopAt) g_stopAt = (uintptr_t)obj + kSettleBytes;
@@ -284,10 +293,21 @@ void write_fov()
     bool stale = false;
     for (int i = 0; i < n && !stale; ++i) {
         __try {
-            if (still_a_camera((const float*)g_cams[i]))
-                *(float*)((char*)g_cams[i] + kFovOffset) = rad;
-            else
+            if (still_a_camera((const float*)g_cams[i])) {
+                float* f = (float*)((char*)g_cams[i] + kFovOffset);
+                // Not what we last put there: the game has set its own since --
+                // a camera switch, a screen -- and that is what a 2D screen gets
+                // back. Ours is noted BEFORE it is written, so the projection
+                // builder's thread, writing too, never reads our value as the
+                // game's.
+                const float cur = *f;
+                if (cur != g_ourFov[i].load(std::memory_order_relaxed))
+                    g_gameFov[i].store(cur, std::memory_order_relaxed);
+                g_ourFov[i].store(rad, std::memory_order_relaxed);
+                *f = rad;
+            } else {
                 stale = true;
+            }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             stale = true;      // unmapped outright
         }
@@ -299,6 +319,28 @@ void write_fov()
         if (!g_refind.exchange(true, std::memory_order_relaxed))
             VRLOG("CAMERA FOV: camera object no longer valid -- re-searching");
     }
+}
+
+// THE GAME'S FOV BACK in every camera that still holds ours, which then stops
+// counting as ours -- for a 2D screen, whose camera has to be the game's. A
+// camera the game has set since keeps what the game set. Returns how many were
+// put back.
+int restore_game_fov()
+{
+    const int n = g_found.load(std::memory_order_acquire);
+    int restored = 0;
+    for (int i = 0; i < n && i < kMaxCams; ++i) {
+        const float ours = g_ourFov[i].exchange(0.0f, std::memory_order_relaxed);
+        if (ours == 0.0f) continue;
+        const float game = g_gameFov[i].load(std::memory_order_relaxed);
+        __try {
+            if (still_a_camera((const float*)g_cams[i])) {
+                float* f = (float*)((char*)g_cams[i] + kFovOffset);
+                if (*f == ours && game > 0.05f && game < 3.10f) { *f = game; ++restored; }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    return restored;
 }
 
 // Read on the engine's culling workers for every small object they test, hence
@@ -333,6 +375,24 @@ void set_small_object_distance(float k)
 
 void camera_fov_on_present()
 {
+    // A 2D SCREEN'S CAMERA IS THE GAME'S (xr::flat_screen_active): its FOV goes
+    // back to the game's own, and nothing is written -- or searched for, which
+    // could take that screen's own camera into the set -- until it ends. The map
+    // opened from a drive is why: the drive camera keeps ticking there, so the
+    // writes below kept landing in the camera the map renders with, and the 2D
+    // map came up zoomed out. From the garage the drive camera is idle and they
+    // never did. A sweep in progress waits.
+    if (xr::flat_screen_active()) {
+        if (!g_flatHeld) {
+            g_flatHeld = true;
+            const int n = restore_game_fov();
+            VRLOG("CAMERA FOV: 2D screen -- the game's own FOV, %d camera(s) given back", n);
+        }
+        set_status("2D screen -- the game's own FOV until it ends");
+        return;
+    }
+    g_flatHeld = false;
+
     if (g_sweeping.load(std::memory_order_relaxed)) {
         scan_slice();
         if (g_sweeping.load(std::memory_order_relaxed)) {
@@ -412,10 +472,10 @@ void camera_fov_on_present()
 void camera_fov_reassert()
 {
     if (g_sweeping.load(std::memory_order_relaxed)) return;
-    // Same gate as Present: outside gameplay the object may already be freed,
+    // Same gates as Present: outside gameplay the object may already be freed,
     // and writing through it would only fault its way to a re-search we cannot
-    // satisfy yet.
-    if (!hooks::drive_camera_live()) return;
+    // satisfy yet; on a 2D screen the FOV is the game's.
+    if (!hooks::drive_camera_live() || xr::flat_screen_active()) return;
     write_fov();
 }
 

@@ -1,6 +1,6 @@
 #include "hooks/marker_camera.h"
 #include "hooks/game_addresses.h"
-#include "hooks/cbuffer_hook.h"   // in_gameplay(), in_map_view()
+#include "hooks/cbuffer_hook.h"   // in_map_view(), for the status line
 #include "render/ui_layer.hpp"
 #include "xr/xr_mirror.h"
 #include "common/log.h"
@@ -43,13 +43,6 @@ uintptr_t g_exeBase = 0;
 
 // String literals only, so the menu can read it from any thread.
 std::atomic<const char*> g_status{"not installed"};
-
-// When a camera was last replaced, for marker_camera_placing(). 0 = never.
-std::atomic<ULONGLONG> g_placedTick{0};
-// A few frames: long enough to ride over a frame whose UI update ran early or
-// late, short enough that the UI goes back to one eye before a screen without
-// replaced markers has shown more than a frame or two.
-constexpr ULONGLONG kPlacingWindowMs = 100;
 
 // ONE REPLACEMENT CAMERA PER UI CAMERA OBJECT, so two of them updated on
 // different threads never write one block. STATIC, and that is not a detail:
@@ -221,15 +214,17 @@ bool build_camera(const float* real, const xr::UiPlaneInCamera& pl, float* out)
 
 // WHEN IT APPLIES: null, or why not.
 //   A 2D screen, or a runtime that takes one quad: the UI is on the panel it
-//     belongs to.
-//   The garage and the menus: their cameras come from the menu builder, whose
-//     axis conventions this has not been checked against -- gameplay and the
-//     map only. The map's icons are taken to be screen markers like the HUD's
-//     (the game keeps one marker manager, and it runs there); unconfirmed.
+//     belongs to (and ui_plane_in_camera() has no plane to give on a 2D screen).
+//   Every other screen, the garage and the menus included since 2026-11-05.
+//     They were left out because their cameras come from the menu builder,
+//     whose conventions had not been checked -- but the map is built by that
+//     same builder whichever way it is opened, and its markers were placed
+//     right there from the start. The map's icons are taken to be screen
+//     markers like the HUD's (the game keeps one marker manager, and it runs
+//     there); unconfirmed.
 const char* not_applying()
 {
     if (!uilayer::active() || xr::ui_stays_in_frame()) return "idle -- the UI is not on its own plane";
-    if (!in_gameplay() && !in_map_view()) return "idle -- gameplay and the map only";
     return nullptr;
 }
 
@@ -266,7 +261,6 @@ void retarget(void* self)
             return;
         }
         *ptr = s.cam;
-        g_placedTick.store(GetTickCount64());
         set_status(in_map_view() ? "placing the map's markers"
                    : pl.pinned   ? "placing markers on the pinned plane"
                                  : "placing markers on the head-locked plane");
@@ -313,11 +307,5 @@ void install_marker_camera()
 bool marker_camera_available() { return g_installed.load(); }
 
 const char* marker_camera_status() { return g_status.load(); }
-
-bool marker_camera_placing()
-{
-    const ULONGLONG t = g_placedTick.load();
-    return t && GetTickCount64() - t < kPlacingWindowMs;
-}
 
 } // namespace hooks

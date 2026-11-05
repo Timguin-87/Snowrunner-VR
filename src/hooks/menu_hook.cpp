@@ -472,8 +472,8 @@ void draw_resolution_scale()
             // anyone who did that they were still waiting for it forever.
             const int cfgW = hooks::force_resolution_w();
             const int cfgH = hooks::force_resolution_h();
-            // Under a DLSS upscaling mode the window -- what the game renders --
-            // is that mode's share of this size, and DLSS makes up the rest.
+            // Under an upscaling mode the window -- what the game renders -- is
+            // that mode's share of this size, and the upscaler makes up the rest.
             int winW = (int)e, winH = (int)e, expW = cfgW, expH = cfgH;
             dlss::render_size_for(dlss::mode(), (int)e, (int)e, winW, winH);
             if (cfgW > 0 && cfgH > 0)
@@ -497,7 +497,8 @@ void draw_resolution_scale()
             char dlssNote[96] = "";
             if (dlss::is_upscaling(dlss::mode()))
                 _snprintf_s(dlssNote, sizeof(dlssNote), _TRUNCATE,
-                            " (DLSS %s brings it up to %ux%u)", dlss::mode_name(dlss::mode()),
+                            " (%s %s brings it up to %ux%u)",
+                            dlss::method_name(dlss::method()), dlss::mode_name(dlss::mode()),
                             e, e);
             ImGui::SetTooltip("Headset native: %ux%u per eye (width is what scales).\n"
                               "Game window becomes: %dx%d%s\n"
@@ -634,12 +635,12 @@ void draw_settings_tab()
             ImGui::SetTooltip("Reproject the eye that WAS rendered into the other one.\n"
                               "Off by default: has visual artefacts.\n"
                               "\n"
-                              "Not available while DLSS upscales (DLSS tab).");
+                              "Not available while upscaling (Upscaling tab).");
         {
             uint32_t uw = 0, uh = 0;
             if (shift && xr::upscale_canvas(uw, uh)) {
                 ImGui::SameLine();
-                ImGui::TextDisabled("(off while DLSS upscales)");
+                ImGui::TextDisabled("(off while upscaling)");
             }
         }
 
@@ -771,7 +772,8 @@ void draw_settings_tab()
                 "\n"
                 "2D puts it on a flat panel instead -- one image, both eyes,\n"
                 "placed and sized by the UI plane settings below. Head locked\n"
-                "or pinned, whichever you have set there.\n"
+                "or pinned, whichever you have set there. The camera is the\n"
+                "game's own, as on a monitor: its FOV, no head tracking.\n"
                 "\n"
                 "Map UI size does not apply in 2D: the UI covers the panel.");
 
@@ -980,43 +982,74 @@ void draw_camera_tab()
 // Nothing here is second-guessed elsewhere -- these are the only copies of
 // these controls, moved out of Settings to stop that tab reading like a list
 // of everything the mod can do rather than a list of what you would change.
-// NVIDIA DLSS in place of the game's TAA (render/dlss.cpp): the mode, the
-// model ("preset"), what it needs, and one debug switch.
-void draw_dlss_tab()
+// THE UPSCALING TAB (render/dlss.hpp, render/fsr.hpp): the method -- off,
+// NVIDIA DLSS, AMD FSR 3 or 4 -- then, with one picked, its quality and its own
+// settings, what it needs, and one debug switch. The sharpening is every
+// method's, Off included.
+void draw_upscaling_tab()
 {
     if (!dlss::compiled_in()) {
-        ImGui::TextWrapped("This build of the mod was made without NVIDIA's DLSS SDK, "
-                           "so it has no DLSS.");
+        ImGui::TextWrapped("This build of the mod was made without NVIDIA's DLSS SDK and "
+                           "without AMD's FSR SDK, so it has no upscaler.");
         return;
     }
 
-    const int cur = dlss::mode();
+    // True on the confirm alone -- a click, or A on the pad. Moving through an
+    // open list only moves the highlight, so nothing here runs while browsing,
+    // which matters: both lists can rebuild the game's render targets.
+    const int meth = dlss::method();
     ImGui::SetNextItemWidth(ui_px(230.0f));
-    if (ImGui::BeginCombo("Mode", dlss::mode_name(cur))) {
-        for (int m = 0; m < dlss::kModeCount; ++m) {
-            if (!dlss::mode_available(m)) continue;
-            // True on the confirm alone -- a click, or A on the pad. Moving
-            // through the open list only moves the highlight, so nothing here
-            // runs while browsing, which matters: this can rebuild the game's
-            // render targets.
-            if (ImGui::Selectable(dlss::mode_name(m), m == cur) && m != cur) {
-                dlss::set_mode(m);
+    if (ImGui::BeginCombo("Upscaling method", dlss::method_name(meth))) {
+        for (int m = 0; m < dlss::kMethodCount; ++m) {
+            if (!dlss::method_compiled_in(m)) continue;
+            if (ImGui::Selectable(dlss::method_name(m), m == meth) && m != meth) {
+                dlss::set_method(m);
                 vrcfg::save();
                 hooks::request_resolution_apply();
             }
-            if (m == cur) ImGui::SetItemDefaultFocus();
+            if (m == meth) ImGui::SetItemDefaultFocus();
         }
         ImGui::EndCombo();
     }
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip(
-            "DLAA: DLSS at the game's own resolution, as anti-aliasing.\n"
-            "\n"
-            "Quality, Balanced, Performance, Ultra Performance: the game renders\n"
-            "smaller -- 67%%, 58%%, 50%%, 33%% of the headset image on each side -- and\n"
-            "DLSS brings each eye up to the full size. VR only.\n"
-            "While upscaling, DIBR shift is off.");
-    ImGui::TextDisabled("%s", dlss::status());
+            "What stands in for the game's own TAA:\n"
+            "  Off    the game's TAA, as it is.\n"
+            "  DLSS   NVIDIA DLSS, on an RTX card.\n"
+            "  FSR 3  AMD FSR 3, on any DirectX 12 GPU -- NVIDIA and Intel too.\n"
+            "  FSR 4  AMD FSR 4, on Radeon RX 9000, 7000 and 6000 cards; on any\n"
+            "         other GPU FSR 3 runs instead.\n"
+            "All of them need the game's TAA switched on. None ships with the\n"
+            "mod -- the DLLs each needs are named below.");
+
+    const int cur = dlss::mode();
+    if (meth != dlss::kMethodOff) {
+        // The same five for every method, named its way: DLAA, or Native AA.
+        const int q = dlss::quality();
+        ImGui::SetNextItemWidth(ui_px(230.0f));
+        if (ImGui::BeginCombo("Quality", dlss::mode_name(q))) {
+            for (int m = dlss::kDlaa; m < dlss::kModeCount; ++m) {
+                if (ImGui::Selectable(dlss::mode_name(m), m == q) && m != q) {
+                    dlss::set_quality(m);
+                    vrcfg::save();
+                    hooks::request_resolution_apply();
+                }
+                if (m == q) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "%s: the upscaler at the game's own resolution, as anti-aliasing.\n"
+                "\n"
+                "Quality, Balanced, Performance, Ultra Performance: the game renders\n"
+                "smaller -- 67%%, 58%%, 50%%, 33%% of the headset image on each side --\n"
+                "and the upscaler brings each eye up to the full size. VR only.\n"
+                "While upscaling, DIBR shift is off.", dlss::mode_name(dlss::kDlaa));
+        ImGui::TextDisabled("%s", dlss::status());
+    } else {
+        ImGui::TextDisabled("The game's own TAA, as it is.");
+    }
     if (hooks::resolution_apply_waiting())
         ImGui::TextDisabled("Applying -- waiting for the game to finish loading.");
 
@@ -1035,7 +1068,8 @@ void draw_dlss_tab()
         if (dlss::is_upscaling(cur)) {
             if (ow <= 0 || oh <= 0)
                 ImGui::TextWrapped("Upscaling needs the Render resolution set (Settings "
-                                   "tab): it is the size DLSS brings each eye up to.");
+                                   "tab): it is the size the upscaler brings each eye up "
+                                   "to.");
             else
                 ImGui::TextDisabled("Renders %dx%d, upscaled to %dx%d per eye", rw, rh, ow,
                                     oh);
@@ -1051,32 +1085,35 @@ void draw_dlss_tab()
                                fh);
     }
 
-    // The model. Recreates DLSS, so the image resets for a moment.
-    static const int   kPresetVal[]  = { dlss::kPresetDefault, dlss::kPresetJ, dlss::kPresetK,
-                                         dlss::kPresetL, dlss::kPresetM };
-    static const char* kPresetName[] = { "Default (DLSS decides)", "J", "K", "L", "M" };
-    constexpr int kPresetCount = (int)(sizeof(kPresetVal) / sizeof(kPresetVal[0]));
-    int pi = 0;
-    for (int i = 0; i < kPresetCount; ++i)
-        if (kPresetVal[i] == dlss::preset()) pi = i;
-    ImGui::SetNextItemWidth(ui_px(230.0f));
-    if (ImGui::Combo("Preset", &pi, kPresetName, kPresetCount)) {
-        dlss::set_preset(kPresetVal[pi]);
-        vrcfg::save();
+    // DLSS's own: the model. Recreates DLSS, so the image resets for a moment.
+    if (meth == dlss::kMethodDlss) {
+        static const int   kPresetVal[]  = { dlss::kPresetDefault, dlss::kPresetJ,
+                                             dlss::kPresetK, dlss::kPresetL, dlss::kPresetM };
+        static const char* kPresetName[] = { "Default (DLSS decides)", "J", "K", "L", "M" };
+        constexpr int kPresetCount = (int)(sizeof(kPresetVal) / sizeof(kPresetVal[0]));
+        int pi = 0;
+        for (int i = 0; i < kPresetCount; ++i)
+            if (kPresetVal[i] == dlss::preset()) pi = i;
+        ImGui::SetNextItemWidth(ui_px(230.0f));
+        if (ImGui::Combo("Preset", &pi, kPresetName, kPresetCount)) {
+            dlss::set_preset(kPresetVal[pi]);
+            vrcfg::save();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Which DLSS model runs (NVIDIA calls these presets):\n"
+                "  Default  DLSS's own choice for the mode -- K for DLAA. May change\n"
+                "           with a newer nvngx_dlss.dll.\n"
+                "  J        like K; slightly less ghosting, a little more flicker.\n"
+                "  K        transformer model, the best image; default for DLAA,\n"
+                "           Quality and Balanced.\n"
+                "  L        default for Ultra Performance.\n"
+                "  M        default for Performance.\n"
+                "The others in NVIDIA's list are retired and not offered.");
     }
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip(
-            "Which DLSS model runs (NVIDIA calls these presets):\n"
-            "  Default  DLSS's own choice for the mode -- K for DLAA. May change\n"
-            "           with a newer nvngx_dlss.dll.\n"
-            "  J        like K; slightly less ghosting, a little more flicker.\n"
-            "  K        transformer model, the best image; default for DLAA,\n"
-            "           Quality and Balanced.\n"
-            "  L        default for Ultra Performance.\n"
-            "  M        default for Performance.\n"
-            "The others in NVIDIA's list are retired and not offered.");
 
-    // Sharpening after DLSS (render/sharpen.hpp). Straight away, nothing rebuilt.
+    // Every method's sharpening (render/sharpen.hpp). Straight away, nothing
+    // rebuilt.
     float sharpPct = dlss::sharpness() * 100.0f;
     ImGui::SetNextItemWidth(ui_px(230.0f));
     if (ImGui::SliderFloat("Sharpness", &sharpPct, 0.0f, 100.0f, "%.0f%%")) {
@@ -1085,36 +1122,58 @@ void draw_dlss_tab()
     }
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip(
-            "AMD's contrast adaptive sharpening (CAS) on DLSS's image: after the\n"
-            "upscale, or with DLAA on the finished frame. It lifts detail where\n"
-            "the image is soft and holds back at edges that already have\n"
-            "contrast, so it adds little shimmer. 0%% is off.");
+            "AMD's contrast adaptive sharpening (CAS): on the upscaler's image\n"
+            "after the upscale, natively on the finished frame -- and with the\n"
+            "method Off, on the frame the game's own TAA finished. It lifts\n"
+            "detail where the image is soft and holds back at edges that already\n"
+            "have contrast, so it adds little shimmer. 0%% is off.");
 
-    ImGui::Separator();
-    ImGui::TextWrapped(
-        "Needs an NVIDIA RTX card, and the game's own TAA switched ON in its graphics "
-        "settings");
-    ImGui::TextWrapped(
-        "And nvngx_dlss.dll in the game's folder, next to SnowRunner.exe. The mod does "
-        "not ship it: download it from NVIDIA's DLSS SDK on GitHub "
-        "(github.com/NVIDIA/DLSS, lib/Windows_x86_64/rel/nvngx_dlss.dll).");
+    if (meth == dlss::kMethodDlss) {
+        ImGui::Separator();
+        ImGui::TextWrapped(
+            "Needs an NVIDIA RTX card, and the game's own TAA switched ON in its graphics "
+            "settings.");
+        ImGui::TextWrapped(
+            "And nvngx_dlss.dll in the game's folder, next to SnowRunner.exe. The mod does "
+            "not ship it: download it from NVIDIA's DLSS SDK on GitHub "
+            "(github.com/NVIDIA/DLSS, lib/Windows_x86_64/rel/nvngx_dlss.dll).");
+    } else if (meth == dlss::kMethodFsr3 || meth == dlss::kMethodFsr4) {
+        ImGui::Separator();
+        ImGui::TextWrapped(
+            "Needs a DirectX 12 GPU, and the game's own TAA switched ON in its graphics "
+            "settings. FSR 4 runs on Radeon RX 9000, 7000 and 6000 cards and some Ryzen "
+            "APUs; anywhere else FSR 3 runs instead.");
+        ImGui::TextWrapped(
+            "And amd_fidelityfx_loader_dx12.dll and amd_fidelityfx_upscaler_dx12.dll in "
+            "the game's folder, next to SnowRunner.exe. The mod does not ship them: "
+            "download both from AMD's FSR SDK on GitHub "
+            "(github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK, "
+            "Kits/FidelityFX/signedbin).");
+    }
 
-    ImGui::Separator();
-    bool flip = dlss::jitter_flip_y();
-    if (ImGui::Checkbox("Flip jitter Y (debug)", &flip))
-        dlss::set_jitter_flip_y(flip);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Not saved. If DLAA looks soft or faintly shimmers while standing\n"
-                          "still, the vertical jitter sign handed to DLSS is wrong -- this\n"
-                          "flips it.");
+    if (meth != dlss::kMethodOff) {
+        ImGui::Separator();
+        bool flip = dlss::jitter_flip_y();
+        if (ImGui::Checkbox("Flip jitter Y (debug)", &flip))
+            dlss::set_jitter_flip_y(flip);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Not saved. If the image looks soft or faintly shimmers while\n"
+                              "standing still, the vertical jitter sign handed to the\n"
+                              "upscaler is wrong -- this flips it.");
+    }
 
-    // NVIDIA's attribution, which its SDK license asks for. Only reached by a
-    // build that has the SDK in it (see the early return above).
+    // The attributions, which the SDKs' licenses and trademarks ask for -- each
+    // only in a build that has that SDK in it.
     ImGui::Separator();
     ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-    ImGui::TextWrapped("This mod uses the NVIDIA DLSS SDK. NVIDIA, NVIDIA RTX and DLSS are "
-                       "trademarks of NVIDIA Corporation. This mod is not sponsored or "
-                       "endorsed by NVIDIA.");
+    if (dlss::method_compiled_in(dlss::kMethodDlss))
+        ImGui::TextWrapped("This mod uses the NVIDIA DLSS SDK. NVIDIA, NVIDIA RTX and DLSS are "
+                           "trademarks of NVIDIA Corporation. This mod is not sponsored or "
+                           "endorsed by NVIDIA.");
+    if (dlss::method_compiled_in(dlss::kMethodFsr3))
+        ImGui::TextWrapped("This mod uses the AMD FSR SDK. AMD, FSR, FidelityFX and Radeon "
+                           "are trademarks of Advanced Micro Devices, Inc. This mod is not "
+                           "sponsored or endorsed by AMD.");
     ImGui::PopStyleColor();
 }
 
@@ -1864,7 +1923,7 @@ struct MenuTab { const char* name; void (*draw)(); };
 constexpr MenuTab kTabs[] = {
     { "Settings",    &draw_settings_tab },
     { "Camera",      &draw_camera_tab },
-    { "DLSS",        &draw_dlss_tab },
+    { "Upscaling",   &draw_upscaling_tab },
     { "Advanced",    &draw_advanced_tab },
     { "Shader Cull", &draw_cull_tab },
     { "Rigid",       &draw_rigid_tab },

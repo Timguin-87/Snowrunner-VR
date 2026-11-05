@@ -1510,7 +1510,15 @@ void* detour_projbuild(void* rcx, float fovY, float aspect, float nearZ, float f
                 // Not asked about mirrors at all, or a square one would count as
                 // having seen the main view this frame.
                 const bool mirrorCam = t_mirrorPerspective;
-                const bool lockThis = !mirrorCam && proj_lock_should_lock(p00, p11);
+                const bool mainView = !mirrorCam && proj_lock_should_lock(p00, p11);
+                // A 2D SCREEN KEEPS THE GAME'S OWN FOV. Its frame goes on a flat
+                // panel instead of to the lenses, so the headset's frustum has no
+                // business in it: the map and the garage render as the game
+                // renders them on a monitor (xr::flat_screen_active). Still
+                // asked of the aspect rule above, whose two-frame window has to
+                // keep seeing the main view.
+                const bool flat = xr::flat_screen_active();
+                const bool lockThis = mainView && !flat;
 
                 // CENSUS, sampled every 600 Presents and logged when an
                 // invocation's answer CHANGES. The aspect rule assumes a truck
@@ -1530,6 +1538,7 @@ void* detour_projbuild(void* rcx, float fovY, float aspect, float nearZ, float f
                     // Aspect to 0.001 and FOV to 0.1 deg; the top bit keeps it
                     // from ever equalling the 0 an unseen slot holds.
                     const uint32_t sig = 0x80000000u |
+                        (flat ? (1u << 30) : 0u) |
                         (static_cast<uint32_t>(aspect * 1000.0f + 0.5f) << 12) |
                         (static_cast<uint32_t>(nativeHfov * 10.0f + 0.5f) << 1) |
                         (lockThis ? 1u : 0u);
@@ -1537,8 +1546,9 @@ void* detour_projbuild(void* rcx, float fovY, float aspect, float nearZ, float f
                         VRLOG("PROJ LOCK census: invocation %u  aspect %.4f  native hfov "
                               "%.2f deg  -> %s", invoc, aspect, nativeHfov,
                               lockThis ? "LOCKED to our FOV"
-                                       : (mirrorCam ? "left at the game's FOV (mirror camera)"
-                                                    : "left at the game's FOV"));
+                              : mirrorCam ? "left at the game's FOV (mirror camera)"
+                              : flat      ? "left at the game's FOV (2D screen)"
+                                          : "left at the game's FOV");
                 }
 
                 // RECON probe. Deliberately ABOVE the FOV-lock gate below.
@@ -2026,7 +2036,37 @@ void* detour_fna(void* rcx, void* rdx, void* r8, void* r9){
                 VRLOG("fna caller[%d] exe+0x%llX eye=(%.1f,%.1f,%.1f)", n,
                       (unsigned long long)caller, e[0],e[1],e[2]); }
         }
-        if (isCam && rdx && r8) {
+        // A 2D SCREEN GETS THE GAME'S OWN CAMERA. Its frame goes on a flat panel,
+        // so nothing of the headset belongs in it -- head_look() and
+        // eye_side_offset() already read zero there (xr_mirror.cpp) -- and
+        // neither does anything else this hook does to a camera: the horizon
+        // lock, the rebuild against world up, the cockpit's truck locks, seat
+        // offset and head smoothing, Synched Sequential's camera hold. The
+        // bookkeeping stays: the eye's parity, the game's pose for the screen
+        // classifier, and the record that tells the GPU's camera apart as this
+        // build's -- with the game's camera in it, which is what the GPU gets.
+        const bool flatCam = isCam && rdx && r8 && xr::flat_screen_active();
+        if (flatCam) {
+            const float* eye = reinterpret_cast<const float*>(rdx);
+            const float* tgt = reinterpret_cast<const float*>(r8);
+            xr::advance_aer_parity(camera_fingerprint(eye, tgt, reinterpret_cast<const float*>(r9)),
+                                   !isMenuCam && !hooks::in_map_view());
+            xr::note_camera_active();
+            float fwd[3] = {tgt[0] - eye[0], tgt[1] - eye[1], tgt[2] - eye[2]};
+            if (dot3(fwd, fwd) > 1.0e-8f) {
+                norm3(fwd);
+                for (int i = 0; i < 3; ++i) {
+                    g_gameCamFwd[i].store(fwd[i]);
+                    g_gameCamEye[i].store(eye[i]);
+                }
+                g_gameCamValid.store(true);
+                xr::record_applied_eye_offset(0.0f, xr::kEyeAppliedAsCameraMove);
+                const float noOffset[3] = {0.0f, 0.0f, 0.0f};
+                xr::note_built_camera(fwd, isMenuCam || hooks::in_map_view(), eye,
+                                      isMenuCam ? xr::kBuilderMenu : xr::kBuilderGame, noOffset);
+            }
+        }
+        if (isCam && rdx && r8 && !flatCam) {
             // First main build per frame flips the AER eye -- or, under Synched
             // Sequential, chooses it by the moment this camera shows.
             const bool gameplayCam = !isMenuCam && !hooks::in_map_view();
@@ -2394,9 +2434,19 @@ void* detour_setperspective(void* cam, float fov, float aspect, float nearZ, flo
 
 using PFN_SIZE_CULL = bool (*)(void*, float, const float*, float);
 PFN_SIZE_CULL real_size_cull = nullptr;
+
+// xr::flat_screen_active(), taken once per Present (viewbuild_on_present): the
+// cull below runs for every small object on the culling workers, and the full
+// question reads the screen classifier and a clock.
+std::atomic<bool> g_flatScreen{false};
+
+// A 2D SCREEN keeps the game's own test too. The factor exists for the headset's
+// FOV, and there every camera renders at the game's: the PROJ LOCK stands aside
+// (detour_projbuild) and camera_fov.cpp hands m_fFOV back.
 bool detour_size_cull(void* camera, float fovScale, const float* box, float threshold)
 {
-    return real_size_cull(camera, fovScale * small_object_distance(), box, threshold);
+    if (!g_flatScreen.load(std::memory_order_relaxed)) fovScale *= small_object_distance();
+    return real_size_cull(camera, fovScale, box, threshold);
 }
 
 } // namespace
@@ -2484,6 +2534,7 @@ void set_head_smoothing(float seconds)
 // basis rather than assuming.
 void viewbuild_on_present(){
     update_map_by_pose();
+    g_flatScreen.store(xr::flat_screen_active(), std::memory_order_relaxed);
 
     // What the head smoothing did, every 10 s while it runs (smooth_cab).
     {
