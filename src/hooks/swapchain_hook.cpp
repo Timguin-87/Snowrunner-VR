@@ -20,6 +20,8 @@
 #include "common/log.h"
 
 #include <dxgi1_2.h>
+#include <dxgi1_4.h>
+#include <psapi.h>
 #include <wrl/client.h>
 #include <atomic>
 #include <mutex>
@@ -110,6 +112,40 @@ using PFN_ResizeBuffers = HRESULT(STDMETHODCALLTYPE*)(
 PFN_Present       real_Present = nullptr;
 PFN_ResizeBuffers real_ResizeBuffers = nullptr;
 
+// Once a minute: what the process holds and how full the mod's never-emptied
+// tables are, so a long session's log shows whatever grows.
+void log_health(IDXGISwapChain* sc)
+{
+    static ULONGLONG s_last = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (now - s_last < 60000) return;
+    s_last = now;
+
+    // Held for the process, never released: the device keeps it alive anyway, and
+    // a release at DLL detach would call into an already detached dxgi.
+    static IDXGIAdapter3* s_adapter = nullptr;
+    if (!s_adapter) {
+        Microsoft::WRL::ComPtr<IDXGIDevice>  dxgiDev;
+        Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
+        if (SUCCEEDED(sc->GetDevice(IID_PPV_ARGS(&dxgiDev))) &&
+            SUCCEEDED(dxgiDev->GetAdapter(&adapter)))
+            adapter->QueryInterface(IID_PPV_ARGS(&s_adapter));
+    }
+    DXGI_QUERY_VIDEO_MEMORY_INFO vram{};
+    if (s_adapter) s_adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &vram);
+    PROCESS_MEMORY_COUNTERS_EX pm{};
+    pm.cb = sizeof(pm);
+    GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pm),
+                         sizeof(pm));
+    const hooks::ShaderTableFill st = hooks::shader_table_fill();
+    constexpr double kGB = 1024.0 * 1024.0 * 1024.0;
+    VRLOG("health: VRAM %.2f of %.2f GB budget | process %.2f GB private, %.2f GB working set | "
+          "pixel shaders: %d/%d addresses, %d/%d bound | depth views held %d",
+          vram.CurrentUsage / kGB, vram.Budget / kGB, pm.PrivateUsage / kGB,
+          pm.WorkingSetSize / kGB, st.slots, st.slotCap, st.listed, st.listedCap,
+          hooks::depth_source_view_count());
+}
+
 HRESULT STDMETHODCALLTYPE Detour_Present(IDXGISwapChain* sc, UINT sync, UINT flags)
 {
     // Reentrancy guard. Anything in the hook chain below -- our own XR submit
@@ -134,6 +170,7 @@ HRESULT STDMETHODCALLTYPE Detour_Present(IDXGISwapChain* sc, UINT sync, UINT fla
     hooks::set_self_render(true);
 
     g_lastSwapchain.store(sc);
+    log_health(sc);
 
     // Keeps looking for the game's runtime-loaded XInput DLL; self-disables
     // once found (see input_block.h).

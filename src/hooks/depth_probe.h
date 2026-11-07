@@ -18,6 +18,8 @@ bool install_depth_probe(IDXGISwapChain* swapchain);
 
 // Per-frame: finalises acquisition bookkeeping and reports miss/mixed-eye rates.
 void depth_probe_on_present(IDXGISwapChain* swapchain);
+// Views held on the game's depth targets (each keeps its texture alive).
+int depth_source_view_count();
 
 // DIBR shift Phase 1 -- scene depth acquisition.
 //

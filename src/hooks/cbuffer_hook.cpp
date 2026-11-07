@@ -13,7 +13,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <unordered_set>
 #include <vector>
 
 #include <MinHook.h>
@@ -229,39 +228,21 @@ CamMatch classify_cam(const void* data, UINT byteWidth)
     return m;
 }
 
-// Cache of which resources are 352-byte constant buffers, so the hot Map path
-// avoids a QueryInterface/GetDesc on every call. Buffers are created once and
-// reused, so this warms up in the first frames.
-SRWLOCK g_cacheLock = SRWLOCK_INIT;
-std::unordered_set<void*> g_camBufs;   // confirmed 352-byte CBs
-std::unordered_set<void*> g_notCam;    // confirmed not
-
+// Asked of the resource every time. A cache keyed by address grew with every
+// resource the game ever mapped, and answered for a freed one's successor. A
+// buffer's ID3D11Resource pointer is its ID3D11Buffer pointer (single
+// inheritance), so this is two calls with no QueryInterface or lock.
 bool is_cam352(ID3D11Resource* res)
 {
     if (!res)
         return false;
-    AcquireSRWLockShared(&g_cacheLock);
-    bool inCam = g_camBufs.count(res) != 0;
-    bool inNot = !inCam && g_notCam.count(res) != 0;
-    ReleaseSRWLockShared(&g_cacheLock);
-    if (inCam) return true;
-    if (inNot) return false;
-
-    bool cam = false;
     D3D11_RESOURCE_DIMENSION dim;
     res->GetType(&dim);
-    if (dim == D3D11_RESOURCE_DIMENSION_BUFFER) {
-        ComPtr<ID3D11Buffer> buf;
-        if (SUCCEEDED(res->QueryInterface(__uuidof(ID3D11Buffer), (void**)&buf))) {
-            D3D11_BUFFER_DESC bd{};
-            buf->GetDesc(&bd);
-            cam = (bd.BindFlags & D3D11_BIND_CONSTANT_BUFFER) && bd.ByteWidth == kCamCBSize;
-        }
-    }
-    AcquireSRWLockExclusive(&g_cacheLock);
-    (cam ? g_camBufs : g_notCam).insert(res);
-    ReleaseSRWLockExclusive(&g_cacheLock);
-    return cam;
+    if (dim != D3D11_RESOURCE_DIMENSION_BUFFER)
+        return false;
+    D3D11_BUFFER_DESC bd{};
+    static_cast<ID3D11Buffer*>(res)->GetDesc(&bd);
+    return (bd.BindFlags & D3D11_BIND_CONSTANT_BUFFER) && bd.ByteWidth == kCamCBSize;
 }
 
 // Both our own rotations are OFF: we now inject the HMD look into the game's

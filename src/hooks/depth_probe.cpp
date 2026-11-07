@@ -33,7 +33,9 @@ std::atomic<bool> g_hooked{false};
 // is the largest; shadow cascades and small utility targets also show up here
 // and are worth logging precisely so we can tell them apart.
 struct DepthTex {
-    ComPtr<ID3D11Texture2D> tex;
+    // Identity only, never dereferenced: a reference here kept every depth target
+    // the game ever made alive for the session.
+    const void* tex = nullptr;
     UINT   width = 0, height = 0;
     DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
     UINT   bindFlags = 0, miscFlags = 0, sampleCount = 1;
@@ -84,7 +86,7 @@ void consider_depth(ID3D11Texture2D* tex)
 
     AcquireSRWLockShared(&g_lock);
     bool known = false;
-    for (auto& d : g_depths) if (d.tex.Get() == tex) { known = true; break; }
+    for (auto& d : g_depths) if (d.tex == tex) { known = true; break; }
     ReleaseSRWLockShared(&g_lock);
     if (known) return;
 
@@ -175,19 +177,21 @@ void note_dsv(ID3D11DepthStencilView* dsv)
 thread_local bool t_selfTargets = false;
 
 constexpr int kMaxCtx = 16;
-struct CtxDepth { ID3D11DeviceContext* ctx; ID3D11Texture2D* bound; };
+// The texture is HELD: the game can free its target inside the very bind that
+// replaces it, and the capture reads the replaced one after that call returns.
+struct CtxDepth { ID3D11DeviceContext* ctx = nullptr; ComPtr<ID3D11Texture2D> bound; };
 CtxDepth g_ctxDepth[kMaxCtx] = {};
 SRWLOCK  g_ctxLock = SRWLOCK_INIT;
 
 // Returns the depth previously bound on `ctx` and records the new one.
-ID3D11Texture2D* swap_bound_depth(ID3D11DeviceContext* ctx, ID3D11Texture2D* incoming)
+ComPtr<ID3D11Texture2D> swap_bound_depth(ID3D11DeviceContext* ctx, ID3D11Texture2D* incoming)
 {
-    ID3D11Texture2D* prev = nullptr;
+    ComPtr<ID3D11Texture2D> prev;
     AcquireSRWLockExclusive(&g_ctxLock);
     int free = -1;
     for (int i = 0; i < kMaxCtx; ++i) {
         if (g_ctxDepth[i].ctx == ctx) {
-            prev = g_ctxDepth[i].bound;
+            prev = std::move(g_ctxDepth[i].bound);
             g_ctxDepth[i].bound = incoming;
             ReleaseSRWLockExclusive(&g_ctxLock);
             return prev;
@@ -195,7 +199,8 @@ ID3D11Texture2D* swap_bound_depth(ID3D11DeviceContext* ctx, ID3D11Texture2D* inc
         if (!g_ctxDepth[i].ctx && free < 0) free = i;
     }
     if (free >= 0) {
-        g_ctxDepth[free] = CtxDepth{ctx, incoming};
+        g_ctxDepth[free].ctx = ctx;
+        g_ctxDepth[free].bound = incoming;
     } else {
         // Full: further contexts get no tracking, so they never report a
         // transition and simply never capture. Safe, but worth knowing about --
@@ -352,14 +357,23 @@ ComPtr<ID3D11UnorderedAccessView> g_depthUAV[kDepthSlots];
 std::atomic<int> g_captureSlot{0};
 // The slot the warp reads for the frame being presented.
 std::atomic<int> g_warpSlot{0};
-// SRVs on the game's depth textures, cached by resource pointer.
-std::unordered_map<ID3D11Texture2D*, ComPtr<ID3D11ShaderResourceView>> g_srcDepthSRVs;
+// SRVs on the game's depth textures, cached by resource pointer. Each view holds
+// its texture alive, so views not read for a while are dropped whenever a new
+// target turns up (a resize makes a new set). Capture thread only.
+struct SrcDepthView { ComPtr<ID3D11ShaderResourceView> srv; ULONGLONG lastUse = 0; };
+constexpr ULONGLONG kSrcViewIdleMs = 2000;
+std::unordered_map<ID3D11Texture2D*, SrcDepthView> g_srcDepthSRVs;
+std::atomic<int> g_srcViewCount{0};
 
 ID3D11ShaderResourceView* src_depth_srv(ID3D11Device* dev, ID3D11Texture2D* tex,
                                         const D3D11_TEXTURE2D_DESC& d)
 {
+    const ULONGLONG now = GetTickCount64();
     auto it = g_srcDepthSRVs.find(tex);
-    if (it != g_srcDepthSRVs.end()) return it->second.Get();
+    if (it != g_srcDepthSRVs.end()) {
+        it->second.lastUse = now;
+        return it->second.srv.Get();
+    }
 
     DXGI_FORMAT f = srv_format_for(d.Format);
     if (f == DXGI_FORMAT_UNKNOWN) return nullptr;
@@ -372,7 +386,10 @@ ID3D11ShaderResourceView* src_depth_srv(ID3D11Device* dev, ID3D11Texture2D* tex,
         VRLOG("depth acquire: source SRV creation FAILED (%s)", fmt_name(d.Format));
         return nullptr;
     }
-    g_srcDepthSRVs.emplace(tex, srv);
+    for (auto i = g_srcDepthSRVs.begin(); i != g_srcDepthSRVs.end();)
+        i = (now - i->second.lastUse > kSrcViewIdleMs) ? g_srcDepthSRVs.erase(i) : std::next(i);
+    g_srcDepthSRVs.emplace(tex, SrcDepthView{srv, now});
+    g_srcViewCount.store((int)g_srcDepthSRVs.size(), std::memory_order_relaxed);
     return srv.Get();
 }
 
@@ -911,13 +928,13 @@ void STDMETHODCALLTYPE Detour_OMSetRenderTargets(
 
     note_dsv(dsv);
     ID3D11Texture2D* incoming = dsv_texture(dsv);
-    ID3D11Texture2D* previous = swap_bound_depth(ctx, incoming);
+    const ComPtr<ID3D11Texture2D> previous = swap_bound_depth(ctx, incoming);
 
     if (fn) fn(ctx, n, rtvs, dsv);
 
     // Transition away from the scene depth == the scene pass just finished.
-    if (previous && previous != incoming)
-        capture_if_pass_ended(ctx, previous);
+    if (previous && previous.Get() != incoming)
+        capture_if_pass_ended(ctx, previous.Get());
 }
 
 using PFN_OMSetRTAndUAV = void(STDMETHODCALLTYPE*)(
@@ -940,12 +957,12 @@ void STDMETHODCALLTYPE Detour_OMSetRTAndUAV(
 
     note_dsv(dsv);
     ID3D11Texture2D* incoming = dsv_texture(dsv);
-    ID3D11Texture2D* previous = swap_bound_depth(ctx, incoming);
+    const ComPtr<ID3D11Texture2D> previous = swap_bound_depth(ctx, incoming);
 
     if (fn) fn(ctx, n, rtvs, dsv, uavStart, numUAVs, uavs, counts);
 
-    if (previous && previous != incoming)
-        capture_if_pass_ended(ctx, previous);
+    if (previous && previous.Get() != incoming)
+        capture_if_pass_ended(ctx, previous.Get());
 }
 
 } // namespace
@@ -1211,6 +1228,8 @@ bool scene_depth_diag(ID3D11DeviceContext* ctx, DepthDiag& out)
     slot_coverage(dev.Get(), ctx, other, out.covOther, out.maxOther);
     return a;
 }
+
+int depth_source_view_count() { return g_srcViewCount.load(std::memory_order_relaxed); }
 
 void depth_probe_on_present(IDXGISwapChain* swapchain)
 {

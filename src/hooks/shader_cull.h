@@ -51,6 +51,11 @@ bool install_shader_cull(IDXGISwapChain* swapchain);
 // Rolls the per-frame draw counters shown in the settings UI.
 void shader_cull_on_present();
 
+// How full the pixel-shader tables are: every address ever created, and every
+// shader ever bound. Neither is ever emptied.
+struct ShaderTableFill { int slots, slotCap, listed, listedCap; };
+ShaderTableFill shader_table_fill();
+
 // Which role the pixel shader bound on THIS thread belongs to, or -1. Valid
 // between a PSSetShader and the draws that follow it, so it answers "what is
 // about to be drawn" from inside a draw detour without a PSGetShader call.

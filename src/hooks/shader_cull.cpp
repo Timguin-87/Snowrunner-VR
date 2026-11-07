@@ -86,6 +86,10 @@ struct Slot {
     // The game's TAA resolve (see is_taa_resolve_bytecode()).
     std::atomic<bool>     taa{false};
 };
+// Nothing is ever removed, so the table only fills. A key lives within this
+// many slots of its home, which bounds every lookup: a crowded table refuses new
+// shaders instead of scanning all of itself on each bind.
+constexpr int kMaxProbe = 256;
 Slot g_slots[kSlots];
 std::atomic<int> g_slotCount{0};
 std::atomic<bool> g_slotsFullLogged{false};
@@ -100,7 +104,7 @@ inline size_t slot_of(void* p)
 Slot* find_slot(void* ps)
 {
     size_t i = slot_of(ps);
-    for (int n = 0; n < kSlots; ++n, i = (i + 1) & (kSlots - 1)) {
+    for (int n = 0; n < kMaxProbe; ++n, i = (i + 1) & (kSlots - 1)) {
         void* k = g_slots[i].ps.load(std::memory_order_acquire);
         if (k == ps) return &g_slots[i];
         if (!k) return nullptr;
@@ -113,7 +117,7 @@ Slot* find_slot(void* ps)
 Slot* claim_slot(void* ps)
 {
     size_t i = slot_of(ps);
-    for (int n = 0; n < kSlots; ++n, i = (i + 1) & (kSlots - 1)) {
+    for (int n = 0; n < kMaxProbe; ++n, i = (i + 1) & (kSlots - 1)) {
         void* k = g_slots[i].ps.load(std::memory_order_acquire);
         if (k == ps) return &g_slots[i];
         if (!k) {
@@ -129,8 +133,9 @@ Slot* claim_slot(void* ps)
         }
     }
     if (!g_slotsFullLogged.exchange(true))
-        VRLOG("SHADER-CULL: pointer table full (%d slots) -- shaders seen from "
-              "here on cannot be identified or culled", kSlots);
+        VRLOG("SHADER-CULL: pointer table full (%d of %d slots used) -- some shaders "
+              "seen from here on cannot be identified or culled",
+              g_slotCount.load(std::memory_order_relaxed), kSlots);
     return nullptr;
 }
 
@@ -710,6 +715,12 @@ bool install_shader_cull(IDXGISwapChain* swapchain)
           ok ? "installed" : "FAILED", vtDef ? "+def" : ", NO deferred");
     if (!ok) installed = false;
     return ok;
+}
+
+ShaderTableFill shader_table_fill()
+{
+    return { g_slotCount.load(std::memory_order_relaxed), kSlots,
+             std::min(g_usedCount.load(std::memory_order_relaxed), kMaxUsed), kMaxUsed };
 }
 
 void shader_cull_on_present()
